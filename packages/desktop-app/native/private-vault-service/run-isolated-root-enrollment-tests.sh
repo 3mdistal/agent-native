@@ -8,7 +8,7 @@ trap 'rm -rf "$OUTPUT"' EXIT
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 ARCHITECTURES="${PRIVATE_VAULT_BUILD_ARCHITECTURES:-arm64}"
 if [[ "$ARCHITECTURES" != "arm64" && "$ARCHITECTURES" != "universal" ]]; then
-  echo "H4 architectures must be arm64 or universal" >&2
+  echo "Isolated-root enrollment architectures must be arm64 or universal" >&2
   exit 1
 fi
 

@@ -119,6 +119,7 @@ jobs:
           packages/desktop-app/native/private-vault-service/run-export-archive-tests.sh
           packages/desktop-app/native/private-vault-service/run-rotation-preparation-tests.sh
           packages/desktop-app/native/private-vault-service/run-continuity-coordinator-tests.sh
+          packages/desktop-app/native/private-vault-service/run-isolated-root-enrollment-tests.sh
 
       - name: Build focused native hostile corpus
         env:
@@ -157,6 +158,7 @@ jobs:
             "$build_root/.grant-index-tests/private-vault-grant-index-tests-$architecture"
             "$build_root/.endpoint-request-tests/private-vault-endpoint-request-tests-$architecture"
             "$build_root/.control-log-tests/private-vault-control-log-tests-$architecture"
+            "$build_root/.manifest-checkpoint-tests/private-vault-manifest-checkpoint-tests-$architecture"
             "$build_root/.object-revision-tests/private-vault-object-revision-tests-$architecture"
             "$build_root/.export-archive-tests/private-vault-export-archive-tests-$architecture"
           )

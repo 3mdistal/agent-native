@@ -24,7 +24,7 @@
 #include <unistd.h>
 
 /*
- * H4 is deliberately one executable with several process roles. The parent
+ * This preflight is deliberately one executable with several process roles.
  * launches a fresh child for every candidate/authorizer step. Durable custody
  * is supplied by a tiny file-backed SecItem adapter whose directory is fixed
  * before a role begins. Candidate and authorizer receive different 0700 roots
@@ -599,7 +599,7 @@ static int Parent(NSString *executable) {
     assert([BridgeAllowlist() containsObject:name]);
   assert(![candidateRoot isEqualToString:authorizerRoot]);
   assert([NSFileManager.defaultManager removeItemAtPath:base error:nil]);
-  puts("private-vault H4 genuine two-process isolated-root enrollment passed");
+  puts("private-vault two-process isolated-root enrollment preflight passed");
   return 0;
 }
 
