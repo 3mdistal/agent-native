@@ -5,15 +5,18 @@ import {
   ancV1HexToBytes,
   assertFreshControlLogHead,
   decodeAncV1RotationEpochDestructionAttestation,
+  decodeAncV1ControlLogRotationAppendReceipt,
   decodeAncV1RotationManifestCheckpoint,
   decodeAncV1RotationRecipientAcknowledgement,
   decodeAncV1RotationRecipientOffer,
   encodeAncV1RotationRecipientAcknowledgement,
+  encodeAncV1ControlLogRotationAppendReceipt,
   hashAncV1RotationManifestCheckpoint,
   hashAncV1RotationRecipientOffer,
   hashAncV1RotationRecipientSet,
   verifyAncV1EekWrapEnvelope,
   verifyAncV1RotationEpochDestructionAttestation,
+  verifyAncV1RotationCommittedCompletion,
   verifyAncV1RotationManifestCheckpoint,
   verifyAncV1RotationRecipientOffer,
   type ControlLogState,
@@ -48,6 +51,14 @@ export interface PrivateVaultRotationEvidenceIngressDependencies {
     principal: PrivateVaultRotationEvidencePrincipal,
   ) => Promise<PrivateVaultRotationEvidenceScope | null>;
   readonly store: ReturnType<typeof createPrivateVaultRotationEvidenceStore>;
+  readonly loadCommittedWrapBinding?: (
+    scope: PrivateVaultRotationEvidenceScope,
+    recoveryWrapHash: string,
+  ) => Promise<{
+    controlEntryId: string;
+    recoveryWrapHash: string;
+    recoveryWrapByteLength: number;
+  } | null>;
   readonly now?: () => number;
 }
 
@@ -112,6 +123,98 @@ export function createPrivateVaultRotationEvidenceIngress(
     )
       fail();
     return { state, scope, status, vaultId, checkpoint, signer, signerId };
+  }
+
+  async function postCommitContext(
+    principal: PrivateVaultRotationEvidencePrincipal,
+    ceremonyId: string,
+  ) {
+    const { state, scope } = await context(principal);
+    const vaultId = ancV1HexToBytes(state.vaultId);
+    const status = await dependencies.store.read(scope, ceremonyId);
+    const checkpointPreview = decodeAncV1RotationManifestCheckpoint(
+      status.checkpoint,
+      { expectedVaultId: vaultId },
+    );
+    const signerId = ancV1BytesToHex(checkpointPreview.signerEndpointId);
+    const signer = state.activeMembers.find(
+      (member) => member.endpointId === signerId,
+    );
+    if (!signer || signer.role !== "endpoint" || signer.unattended) fail();
+    const checkpoint = await verifyAncV1RotationManifestCheckpoint(
+      status.checkpoint,
+      {
+        expectedVaultId: vaultId,
+        expectedSignerEndpointId: checkpointPreview.signerEndpointId,
+        signerSigningPublicKey: ancV1HexToBytes(signer.signingPublicKey),
+      },
+    );
+    if (
+      ancV1BytesToHex(checkpoint.ceremonyId) !== ceremonyId ||
+      checkpoint.baseSequence === Number.MAX_SAFE_INTEGER ||
+      state.sequence !== checkpoint.baseSequence + 1 ||
+      state.headHash !== ancV1BytesToHex(checkpoint.controlEntryHash) ||
+      state.epoch !== checkpoint.targetEpoch ||
+      status.expectedRecipientCount !== state.activeMembers.length ||
+      status.recipients.length !== state.activeMembers.length
+    )
+      fail();
+    const checkpointHash = await hashAncV1RotationManifestCheckpoint(
+      status.checkpoint,
+      vaultId,
+    );
+    const roster = state.activeMembers.map((member) => {
+      const evidence = status.recipients.find(
+        (recipient) => recipient.recipientEndpointId === member.endpointId,
+      );
+      if (!evidence) return fail();
+      const offer = decodeAncV1RotationRecipientOffer(evidence.offer, {
+        expectedVaultId: vaultId,
+      });
+      if (
+        ancV1BytesToHex(offer.recipientEndpointId) !== member.endpointId ||
+        !same(offer.ceremonyId, checkpoint.ceremonyId) ||
+        !same(offer.checkpointHash, checkpointHash) ||
+        offer.targetEpoch !== checkpoint.targetEpoch
+      )
+        return fail();
+      return {
+        endpointId: ancV1HexToBytes(member.endpointId),
+        signingPublicKey: ancV1HexToBytes(member.signingPublicKey),
+        keyAgreementPublicKey: ancV1HexToBytes(member.keyAgreementPublicKey),
+        eekWrapHash: offer.eekWrapHash,
+      };
+    });
+    if (
+      !same(
+        await hashAncV1RotationRecipientSet(roster),
+        checkpoint.recipientSetHash,
+      )
+    )
+      fail();
+    const binding = dependencies.loadCommittedWrapBinding
+      ? await dependencies.loadCommittedWrapBinding(
+          scope,
+          state.recoveryWrapHash,
+        )
+      : null;
+    if (
+      !binding ||
+      binding.recoveryWrapHash !== state.recoveryWrapHash ||
+      !Number.isSafeInteger(binding.recoveryWrapByteLength) ||
+      binding.recoveryWrapByteLength < 1
+    )
+      fail();
+    return {
+      state,
+      scope,
+      status,
+      vaultId,
+      checkpoint,
+      signer,
+      signerId,
+      binding,
+    };
   }
 
   function activeRecipient(
@@ -463,9 +566,113 @@ export function createPrivateVaultRotationEvidenceIngress(
       principal: PrivateVaultRotationEvidencePrincipal,
       ceremonyId: string,
     ) {
-      const value = await ceremonyContext(principal, ceremonyId);
+      try {
+        const value = await ceremonyContext(principal, ceremonyId);
+        if (principal.endpointId !== value.signerId) fail();
+        return value.status;
+      } catch {
+        const value = await postCommitContext(principal, ceremonyId);
+        if (principal.endpointId !== value.signerId) fail();
+        return value.status;
+      }
+    },
+
+    async appendHostedReceipt(
+      principal: PrivateVaultRotationEvidencePrincipal,
+      ceremonyId: string,
+      encodedReceipt: Uint8Array,
+    ) {
+      const value = await postCommitContext(principal, ceremonyId);
       if (principal.endpointId !== value.signerId) fail();
-      return value.status;
+      if (value.status.hostedReceipt) {
+        if (same(value.status.hostedReceipt, encodedReceipt))
+          return value.status;
+        fail();
+      }
+      if (
+        value.status.phase !== "awaiting_hosted_receipt" ||
+        value.status.recipients.some(
+          (recipient) =>
+            !recipient.acknowledgement || !recipient.destructionAttestation,
+        )
+      )
+        fail();
+      const receipt =
+        decodeAncV1ControlLogRotationAppendReceipt(encodedReceipt);
+      if (
+        !same(
+          encodeAncV1ControlLogRotationAppendReceipt(receipt),
+          encodedReceipt,
+        ) ||
+        receipt.vaultId !== value.scope.vaultId ||
+        receipt.entryId !== value.binding.controlEntryId ||
+        receipt.sequence !== value.checkpoint.baseSequence + 1 ||
+        receipt.headHash !==
+          ancV1BytesToHex(value.checkpoint.controlEntryHash) ||
+        receipt.recoveryWrapHash !== value.binding.recoveryWrapHash ||
+        receipt.recoveryWrapHash !== value.state.recoveryWrapHash ||
+        receipt.recoveryWrapByteLength !== value.binding.recoveryWrapByteLength
+      )
+        fail();
+      return dependencies.store.putHostedReceipt(value.scope, {
+        ceremonyId,
+        hostedReceipt: encodedReceipt,
+      });
+    },
+
+    async appendCompletionAttestation(
+      principal: PrivateVaultRotationEvidencePrincipal,
+      ceremonyId: string,
+      encodedCompletion: Uint8Array,
+    ) {
+      const value = await postCommitContext(principal, ceremonyId);
+      if (principal.endpointId !== value.signerId) fail();
+      if (value.status.completionAttestation) {
+        if (same(value.status.completionAttestation, encodedCompletion))
+          return value.status;
+        fail();
+      }
+      if (
+        value.status.phase !== "awaiting_completion" ||
+        !value.status.hostedReceipt ||
+        value.status.recipients.some(
+          (recipient) =>
+            !recipient.acknowledgement || !recipient.destructionAttestation,
+        )
+      )
+        fail();
+      const evidenceCreatedAt = value.status.recipients.flatMap((recipient) => [
+        decodeAncV1RotationRecipientAcknowledgement(
+          recipient.acknowledgement!,
+          { expectedVaultId: value.vaultId },
+        ).createdAt,
+        decodeAncV1RotationEpochDestructionAttestation(
+          recipient.destructionAttestation!,
+          { expectedVaultId: value.vaultId },
+        ).createdAt,
+      ]);
+      if (evidenceCreatedAt.length !== value.status.expectedRecipientCount * 2)
+        fail();
+      await verifyAncV1RotationCommittedCompletion({
+        encodedCompletion,
+        encodedCheckpoint: value.status.checkpoint,
+        encodedHostedReceipt: value.status.hostedReceipt,
+        expectedHostedEntryId: value.binding.controlEntryId,
+        expectedHostedVaultId: value.scope.vaultId,
+        expectedRecoveryWrapHash: ancV1HexToBytes(
+          value.binding.recoveryWrapHash,
+        ),
+        expectedRecoveryWrapByteLength: value.binding.recoveryWrapByteLength,
+        expectedVaultId: value.vaultId,
+        expectedSignerEndpointId: value.checkpoint.signerEndpointId,
+        signerSigningPublicKey: ancV1HexToBytes(value.signer.signingPublicKey),
+        notBefore: Math.max(...evidenceCreatedAt),
+        now: now(),
+      });
+      return dependencies.store.putCompletionAttestation(value.scope, {
+        ceremonyId,
+        completionAttestation: encodedCompletion,
+      });
     },
   };
 }

@@ -95,6 +95,26 @@ export async function authenticatePrivateVaultRotationEvidenceRecipient(input: {
 export const privateVaultRotationEvidenceIngress =
   createPrivateVaultRotationEvidenceIngress({
     store: privateVaultRotationEvidenceStore,
+    async loadCommittedWrapBinding(scope, recoveryWrapHash) {
+      const table = schema.contentEncryptedVaultRecoveryWraps;
+      const rows = await getDb()
+        .select({
+          controlEntryId: table.controlEntryId,
+          recoveryWrapHash: table.recoveryWrapHash,
+          recoveryWrapByteLength: table.ciphertextByteLength,
+        })
+        .from(table)
+        .where(
+          and(
+            eq(table.ownerEmail, scope.ownerEmail),
+            eq(table.orgId, scope.orgId),
+            eq(table.vaultId, scope.vaultId),
+            eq(table.recoveryWrapHash, recoveryWrapHash),
+          ),
+        )
+        .limit(2);
+      return rows.length === 1 ? rows[0]! : null;
+    },
     async loadState(principal) {
       const state = await privateVaultControlLogService.loadVerifiedState({
         ownerEmail: principal.ownerEmail,

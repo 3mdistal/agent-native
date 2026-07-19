@@ -1,4 +1,7 @@
-import { ANC_ROTATION_EVIDENCE_SIZE_LIMITS } from "@agent-native/core/e2ee";
+import {
+  ANC_ROTATION_EVIDENCE_SIZE_LIMITS,
+  ANC_V1_CONTROL_LOG_APPEND_RECEIPT_MAX_BYTES,
+} from "@agent-native/core/e2ee";
 import {
   getHeader,
   setResponseHeader,
@@ -27,6 +30,8 @@ export type PrivateVaultRotationEvidenceExchangeRoute =
   | "recipient"
   | "acknowledgement"
   | "destruction"
+  | "hostedReceipt"
+  | "completionAttestation"
   | "status";
 
 const IDENTIFIER = /^[0-9a-f]{32}$/;
@@ -37,9 +42,19 @@ export function privateVaultRotationEvidenceExchangePath(
   recipientEndpointId?: string,
 ) {
   if (!IDENTIFIER.test(ceremonyId)) throw new Error();
-  if (route === "status") {
+  if (
+    route === "status" ||
+    route === "hostedReceipt" ||
+    route === "completionAttestation"
+  ) {
     if (recipientEndpointId !== undefined) throw new Error();
-    return `/api/private-vault/rotation-evidence/${ceremonyId}/status`;
+    const suffix =
+      route === "status"
+        ? "status"
+        : route === "hostedReceipt"
+          ? "hosted-receipt"
+          : "completion-attestation";
+    return `/api/private-vault/rotation-evidence/${ceremonyId}/${suffix}`;
   }
   if (!recipientEndpointId || !IDENTIFIER.test(recipientEndpointId))
     throw new Error();
@@ -160,13 +175,17 @@ export async function handlePrivateVaultRotationEvidenceExchange(
   } catch {
     return fail(event);
   }
-  const bodyRoute = route === "acknowledgement" || route === "destruction";
+  const bodyRoute = route !== "recipient" && route !== "status";
   const maximum =
     route === "acknowledgement"
       ? ANC_ROTATION_EVIDENCE_SIZE_LIMITS.acknowledgementBytes
       : route === "destruction"
         ? ANC_ROTATION_EVIDENCE_SIZE_LIMITS.destructionBytes
-        : 0;
+        : route === "hostedReceipt"
+          ? ANC_V1_CONTROL_LOG_APPEND_RECEIPT_MAX_BYTES
+          : route === "completionAttestation"
+            ? ANC_ROTATION_EVIDENCE_SIZE_LIMITS.completionBytes
+            : 0;
   const rawLength = getHeader(event, "content-length")?.trim() ?? "";
   const length = bodyRoute
     ? boundedLength(rawLength, maximum)
@@ -217,11 +236,41 @@ export async function handlePrivateVaultRotationEvidenceExchange(
         ceremonyId,
         phase: status.phase,
         expectedRecipientCount: status.expectedRecipientCount,
+        hostedReceipt: bytes(status.hostedReceipt),
+        completionAttestation: bytes(status.completionAttestation),
         recipients: status.recipients.map((recipient) => ({
           recipientEndpointId: recipient.recipientEndpointId,
           acknowledgement: bytes(recipient.acknowledgement),
           destructionAttestation: bytes(recipient.destructionAttestation),
         })),
+      };
+    }
+    if (route === "hostedReceipt") {
+      const status =
+        await privateVaultRotationEvidenceIngress.appendHostedReceipt(
+          principal,
+          ceremonyId,
+          body,
+        );
+      return {
+        state: "stored",
+        ceremonyId,
+        phase: status.phase,
+        expectedRecipientCount: status.expectedRecipientCount,
+      };
+    }
+    if (route === "completionAttestation") {
+      const status =
+        await privateVaultRotationEvidenceIngress.appendCompletionAttestation(
+          principal,
+          ceremonyId,
+          body,
+        );
+      return {
+        state: "stored",
+        ceremonyId,
+        phase: status.phase,
+        expectedRecipientCount: status.expectedRecipientCount,
       };
     }
     const status =

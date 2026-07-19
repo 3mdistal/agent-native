@@ -12,6 +12,8 @@ const fetchRecipientEvidence = vi.hoisted(() => vi.fn());
 const appendAcknowledgement = vi.hoisted(() => vi.fn());
 const appendDestruction = vi.hoisted(() => vi.fn());
 const readForInitiator = vi.hoisted(() => vi.fn());
+const appendHostedReceipt = vi.hoisted(() => vi.fn());
+const appendCompletionAttestation = vi.hoisted(() => vi.fn());
 
 vi.mock("h3", () => ({
   getHeader: (event: TestEvent, name: string) => event.headers[name],
@@ -37,6 +39,8 @@ vi.mock("./private-vault-rotation-evidence-runtime.js", () => ({
     appendAcknowledgement,
     appendDestruction,
     readForInitiator,
+    appendHostedReceipt,
+    appendCompletionAttestation,
   },
 }));
 
@@ -110,6 +114,14 @@ beforeEach(() => {
         destructionAttestation: Uint8Array.of(10),
       },
     ],
+  });
+  appendHostedReceipt.mockResolvedValue({
+    ...status,
+    phase: "awaiting_completion",
+  });
+  appendCompletionAttestation.mockResolvedValue({
+    ...status,
+    phase: "completed",
   });
 });
 
@@ -248,5 +260,41 @@ describe("Private Vault rotation evidence routes", () => {
         principal.endpointId,
       ),
     ).resolves.toEqual({ error: "Not found" });
+  });
+
+  it("binds post-commit receipt and completion bytes to initiator-only paths", async () => {
+    const receipt = event(Uint8Array.of(21, 22));
+    await expect(
+      handlePrivateVaultRotationEvidenceExchange(
+        receipt as never,
+        "hostedReceipt",
+        ceremonyId,
+      ),
+    ).resolves.toMatchObject({ phase: "awaiting_completion" });
+    expect(authenticateRecipient).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: `/api/private-vault/rotation-evidence/${ceremonyId}/hosted-receipt`,
+        body: expect.objectContaining({ byteLength: 2 }),
+      }),
+    );
+    expect(appendHostedReceipt).toHaveBeenCalledWith(
+      principal,
+      ceremonyId,
+      expect.objectContaining({ byteLength: 2 }),
+    );
+
+    const completion = event(Uint8Array.of(23));
+    await expect(
+      handlePrivateVaultRotationEvidenceExchange(
+        completion as never,
+        "completionAttestation",
+        ceremonyId,
+      ),
+    ).resolves.toMatchObject({ phase: "completed" });
+    expect(authenticateRecipient).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: `/api/private-vault/rotation-evidence/${ceremonyId}/completion-attestation`,
+      }),
+    );
   });
 });
