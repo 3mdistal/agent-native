@@ -83,9 +83,16 @@ export class PrivateVaultContentEnrollmentRuntime {
     }
     const existing = byOrigin.get(input.origin);
     if (existing) return existing;
+    const objectTransport = new PrivateVaultContentObjectTransport(input);
+    const manifest = new PrivateVaultContentEnrollmentManifestRevisionSource({
+      index: createEncryptedContentIndexStore(),
+      transport: objectTransport,
+      native: this.#native,
+    });
     const coordinator = new PrivateVaultContentEnrollmentCoordinator({
       native: this.#native,
       hosted: new PrivateVaultContentEnrollmentTransport(input),
+      manifest,
     });
     byOrigin.set(input.origin, coordinator);
     return coordinator;

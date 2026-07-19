@@ -14,6 +14,15 @@ const offer = Uint8Array.of(1, 2);
 const challenge = Uint8Array.of(3, 4);
 const sasDecision = Uint8Array.of(7, 8);
 const authorization = Uint8Array.of(5, 6);
+const manifestRevision = Uint8Array.of(9, 10);
+const manifestCheckpoint = Uint8Array.of(11, 12);
+const manifestAuthorization = Uint8Array.of(13, 14);
+
+function manifest() {
+  return {
+    readTrustedCurrentRevision: vi.fn(async () => manifestRevision.slice()),
+  };
+}
 
 function native(
   decision: "confirmed" | "mismatch" = "confirmed",
@@ -48,6 +57,8 @@ function native(
     ),
     buildBrokerEnrollmentAuthorization: vi.fn(async () => ({
       encoded: authorization,
+      manifestCheckpoint,
+      manifestAuthorization,
     })),
     activateBrokerEnrollment: vi.fn(
       async () =>
@@ -78,6 +89,8 @@ function status(
         ? sasDecision
         : null,
     authorization: phase === "committed" ? authorization : null,
+    manifestCheckpoint: phase === "committed" ? manifestCheckpoint : null,
+    manifestAuthorization: phase === "committed" ? manifestAuthorization : null,
     controlEntryId: phase === "committed" ? "44".repeat(16) : null,
     controlEntryHash: phase === "committed" ? "55".repeat(32) : null,
     expiresAt: "2026-07-18T18:10:00.000Z",
@@ -96,6 +109,7 @@ describe("PrivateVaultContentEnrollmentCoordinator", () => {
     const coordinator = new PrivateVaultContentEnrollmentCoordinator({
       native: operator,
       hosted,
+      manifest: manifest(),
     });
     await expect(coordinator.enroll(vaultId)).resolves.toMatchObject({
       state: "active",
@@ -115,7 +129,15 @@ describe("PrivateVaultContentEnrollmentCoordinator", () => {
       offer,
       challenge,
       sasDecision,
+      manifestRevision: new Uint8Array(manifestRevision.byteLength),
     });
+    expect(hosted.publishAuthorization).toHaveBeenCalledWith(
+      offerHash,
+      offer,
+      authorization,
+      manifestCheckpoint,
+      manifestAuthorization,
+    );
     expect(hosted.publishSasDecision).toHaveBeenCalledWith(
       offerHash,
       offer,
@@ -136,6 +158,7 @@ describe("PrivateVaultContentEnrollmentCoordinator", () => {
     const coordinator = new PrivateVaultContentEnrollmentCoordinator({
       native: operator,
       hosted,
+      manifest: manifest(),
     });
     await expect(coordinator.enroll(vaultId)).resolves.toMatchObject({
       state: "active",
@@ -154,6 +177,7 @@ describe("PrivateVaultContentEnrollmentCoordinator", () => {
     const coordinator = new PrivateVaultContentEnrollmentCoordinator({
       native: operator,
       hosted,
+      manifest: manifest(),
     });
     await expect(coordinator.enroll(vaultId)).rejects.toBeInstanceOf(
       PrivateVaultContentEnrollmentRejectedError,
@@ -174,6 +198,7 @@ describe("PrivateVaultContentEnrollmentCoordinator", () => {
     const coordinator = new PrivateVaultContentEnrollmentCoordinator({
       native: operator,
       hosted,
+      manifest: manifest(),
     });
     await expect(coordinator.enroll(vaultId)).rejects.toBeInstanceOf(
       PrivateVaultContentEnrollmentCoordinatorError,

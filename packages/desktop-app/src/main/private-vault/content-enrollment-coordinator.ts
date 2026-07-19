@@ -1,3 +1,4 @@
+import type { PrivateVaultContentEnrollmentManifestRevisionSource } from "./content-enrollment-manifest-revision-source.js";
 import type {
   PrivateVaultContentEnrollmentTransport,
   PrivateVaultHostedEnrollmentStatus,
@@ -10,6 +11,8 @@ import type {
 
 export interface PrivateVaultEnrollmentAuthorizerResult {
   readonly encoded: Uint8Array;
+  readonly manifestCheckpoint?: Uint8Array;
+  readonly manifestAuthorization?: Uint8Array;
 }
 
 export interface PrivateVaultTrustedEnrollmentOperator {
@@ -30,6 +33,7 @@ export interface PrivateVaultTrustedEnrollmentOperator {
     readonly offer: Uint8Array;
     readonly challenge: Uint8Array;
     readonly sasDecision: Uint8Array;
+    readonly manifestRevision?: Uint8Array;
   }): Promise<PrivateVaultEnrollmentAuthorizerResult>;
   activateBrokerEnrollment(
     vaultId: string,
@@ -67,14 +71,23 @@ function same(left: Uint8Array, right: Uint8Array): boolean {
 export class PrivateVaultContentEnrollmentCoordinator {
   readonly #native: PrivateVaultTrustedEnrollmentOperator;
   readonly #hosted: PrivateVaultContentEnrollmentTransport;
+  readonly #manifest: Pick<
+    PrivateVaultContentEnrollmentManifestRevisionSource,
+    "readTrustedCurrentRevision"
+  >;
   #tail: Promise<void> = Promise.resolve();
 
   constructor(input: {
     readonly native: PrivateVaultTrustedEnrollmentOperator;
     readonly hosted: PrivateVaultContentEnrollmentTransport;
+    readonly manifest: Pick<
+      PrivateVaultContentEnrollmentManifestRevisionSource,
+      "readTrustedCurrentRevision"
+    >;
   }) {
     this.#native = input.native;
     this.#hosted = input.hosted;
+    this.#manifest = input.manifest;
   }
 
   enroll(vaultId: string): Promise<NativeActivateEnrollmentResult> {
@@ -115,21 +128,38 @@ export class PrivateVaultContentEnrollmentCoordinator {
           ) {
             throw new Error();
           }
-          const built = await this.#native.buildBrokerEnrollmentAuthorization({
-            vaultId,
-            offer: prepared.offer.slice(),
-            challenge: challenge.slice(),
-            sasDecision: status.sasDecision.slice(),
-          });
+          const manifestRevision =
+            await this.#manifest.readTrustedCurrentRevision(vaultId);
+          let built: PrivateVaultEnrollmentAuthorizerResult;
+          try {
+            built = await this.#native.buildBrokerEnrollmentAuthorization({
+              vaultId,
+              offer: prepared.offer.slice(),
+              challenge: challenge.slice(),
+              sasDecision: status.sasDecision.slice(),
+              manifestRevision,
+            });
+          } finally {
+            manifestRevision.fill(0);
+          }
+          if (!built.manifestCheckpoint || !built.manifestAuthorization) {
+            throw new Error();
+          }
           status = await this.#hosted.publishAuthorization(
             prepared.offerHash,
             prepared.offer.slice(),
             built.encoded.slice(),
+            built.manifestCheckpoint.slice(),
+            built.manifestAuthorization.slice(),
           );
           if (
             status.phase !== "committed" ||
             !status.authorization ||
-            !same(status.authorization, built.encoded)
+            !status.manifestCheckpoint ||
+            !status.manifestAuthorization ||
+            !same(status.authorization, built.encoded) ||
+            !same(status.manifestCheckpoint, built.manifestCheckpoint) ||
+            !same(status.manifestAuthorization, built.manifestAuthorization)
           ) {
             throw new Error();
           }
