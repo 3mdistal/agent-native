@@ -64,6 +64,7 @@ SOURCES=(
   "$SOURCE_ROOT/storage/PrivateVaultRotationPreparationSpool.m"
   "$SOURCE_ROOT/storage/PrivateVaultResultSpool.m"
   "$SOURCE_ROOT/storage/PrivateVaultRotationPreparationStore.m"
+  "$SOURCE_ROOT/storage/PrivateVaultRotationEvidenceStore.m"
   "$SOURCE_ROOT/storage/PrivateVaultGenesisPreparationRecord.m"
   "$SOURCE_ROOT/storage/PrivateVaultGenesisPreparationArtifactStore.m"
   "$SOURCE_ROOT/storage/PrivateVaultGenesisPreparationStore.m"
