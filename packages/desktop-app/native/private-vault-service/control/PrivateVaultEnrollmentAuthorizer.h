@@ -50,6 +50,18 @@ AncPrivateVaultBuildEnrollmentChallenge(
     uint64_t expiresAt,
     AncPrivateVaultEnrollmentAuthorizerStatus *_Nullable status);
 
+FOUNDATION_EXPORT AncPrivateVaultPreparedEnrollmentChallenge *_Nullable
+AncPrivateVaultBuildBrokerReplacementChallenge(
+    NSData *encodedOffer, NSData *candidateKeyProof,
+    AncPrivateVaultControlLogState *authenticatedState,
+    NSData *expectedOldBrokerEndpointId,
+    AncPrivateVaultGuardedMemory *authorizerSigningSeed,
+    AncPrivateVaultGuardedMemory *authorizerAgreementSeed,
+    NSData *challengeEnvelopeId, NSData *sasNonce,
+    uint64_t authenticatedHeadSignedAtSeconds, uint64_t createdAt,
+    uint64_t expiresAt,
+    AncPrivateVaultEnrollmentAuthorizerStatus *_Nullable status);
+
 /* Requires the exact confirmed candidate receipt, then creates the endpoint
  * certificate, recipient-bound EEK wrap, and signed membership edge entirely
  * inside the attended endpoint boundary. */

@@ -202,10 +202,11 @@ static BOOL CloseSecret(AncPrivateVaultGuardedMemory *memory) {
          [memory close] == AncPrivateVaultGuardedMemoryStatusOK;
 }
 
-AncPrivateVaultPreparedEnrollmentChallenge *
-AncPrivateVaultBuildEnrollmentChallenge(
+static AncPrivateVaultPreparedEnrollmentChallenge *
+AncBuildEnrollmentChallengeWithOldBroker(
     NSData *encodedOffer, NSData *candidateKeyProof,
     AncPrivateVaultControlLogState *authenticatedState,
+    NSData *expectedOldBrokerEndpointId,
     AncPrivateVaultGuardedMemory *authorizerSigningSeed,
     AncPrivateVaultGuardedMemory *authorizerAgreementSeed,
     NSData *challengeEnvelopeId, NSData *sasNonce,
@@ -382,9 +383,14 @@ AncPrivateVaultBuildEnrollmentChallenge(
     }
     AncPrivateVaultEnrollmentChallengeStatus verifyStatus;
     AncPrivateVaultEnrollmentChallengeResult *verified =
-        AncPrivateVaultEnrollmentChallengeVerify(
-            encodedOffer, encodedChallenge, state,
-            authenticatedHeadSignedAtSeconds, createdAt, &verifyStatus);
+        expectedOldBrokerEndpointId == nil
+            ? AncPrivateVaultEnrollmentChallengeVerify(
+                  encodedOffer, encodedChallenge, state,
+                  authenticatedHeadSignedAtSeconds, createdAt, &verifyStatus)
+            : AncPrivateVaultBrokerReplacementChallengeVerify(
+                  encodedOffer, encodedChallenge, state,
+                  expectedOldBrokerEndpointId,
+                  authenticatedHeadSignedAtSeconds, createdAt, &verifyStatus);
     if (verified == nil ||
         ![verified.sasTranscriptHash isEqualToData:sasHash]) {
       SetStatus(status, AncPrivateVaultEnrollmentAuthorizerStatusVerification);
@@ -415,6 +421,43 @@ AncPrivateVaultBuildEnrollmentChallenge(
     return nil;
   }
   return result;
+}
+
+AncPrivateVaultPreparedEnrollmentChallenge *
+AncPrivateVaultBuildEnrollmentChallenge(
+    NSData *encodedOffer, NSData *candidateKeyProof,
+    AncPrivateVaultControlLogState *authenticatedState,
+    AncPrivateVaultGuardedMemory *authorizerSigningSeed,
+    AncPrivateVaultGuardedMemory *authorizerAgreementSeed,
+    NSData *challengeEnvelopeId, NSData *sasNonce,
+    uint64_t authenticatedHeadSignedAtSeconds, uint64_t createdAt,
+    uint64_t expiresAt, AncPrivateVaultEnrollmentAuthorizerStatus *status) {
+  return AncBuildEnrollmentChallengeWithOldBroker(
+      encodedOffer, candidateKeyProof, authenticatedState, nil,
+      authorizerSigningSeed, authorizerAgreementSeed, challengeEnvelopeId,
+      sasNonce, authenticatedHeadSignedAtSeconds, createdAt, expiresAt,
+      status);
+}
+
+AncPrivateVaultPreparedEnrollmentChallenge *
+AncPrivateVaultBuildBrokerReplacementChallenge(
+    NSData *encodedOffer, NSData *candidateKeyProof,
+    AncPrivateVaultControlLogState *authenticatedState,
+    NSData *expectedOldBrokerEndpointId,
+    AncPrivateVaultGuardedMemory *authorizerSigningSeed,
+    AncPrivateVaultGuardedMemory *authorizerAgreementSeed,
+    NSData *challengeEnvelopeId, NSData *sasNonce,
+    uint64_t authenticatedHeadSignedAtSeconds, uint64_t createdAt,
+    uint64_t expiresAt, AncPrivateVaultEnrollmentAuthorizerStatus *status) {
+  if (!SnapshotExact(expectedOldBrokerEndpointId, 16)) {
+    SetStatus(status, AncPrivateVaultEnrollmentAuthorizerStatusInvalid);
+    return nil;
+  }
+  return AncBuildEnrollmentChallengeWithOldBroker(
+      encodedOffer, candidateKeyProof, authenticatedState,
+      expectedOldBrokerEndpointId, authorizerSigningSeed,
+      authorizerAgreementSeed, challengeEnvelopeId, sasNonce,
+      authenticatedHeadSignedAtSeconds, createdAt, expiresAt, status);
 }
 
 AncPrivateVaultPreparedEnrollmentAuthorization *

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import {
+  ANC_V1_CONTROL_LOG_APPEND_REQUEST_MAX_BYTES,
   ANC_BROKER_REPLACEMENT_APPROVAL_LIMITS,
   ancV1BytesToHex,
   ancV1Hash,
@@ -9,17 +10,22 @@ import {
   assertFreshControlLogHead,
   decodeAncV1Canonical,
   decodeAncV1BrokerReplacementApproval,
+  decodeAncV1ControlLogRotationAppendReceipt,
+  decodeAncV1ControlLogRotationAppendRequest,
   decodeAncV1EndpointEnrollmentOffer,
+  decodeSignedControlLogEntry,
   E2EE_ENVELOPE_FIELDS,
   encodeAncV1EndpointEnrollmentOffer,
   hashAncV1EndpointEnrollmentOffer,
   hashAncV1EnrollmentChallenge,
   hashAncV1BrokerReplacementFreezeId,
+  hashAncV1RecoveryWrap,
   verifyAncV1BrokerReplacementApproval,
   verifyAncV1BrokerDrainAttestation,
   verifyAncV1BrokerReplacementChallenge,
   verifyAncV1BrokerReplacementSasDecision,
   type ControlLogState,
+  type EndpointRequestProof,
 } from "@agent-native/core/e2ee";
 import { getOrgContext } from "@agent-native/core/org";
 import {
@@ -38,6 +44,10 @@ import {
   type PrivateVaultBrokerReplacementScope,
   type PrivateVaultBrokerReplacementStatus,
 } from "./private-vault-broker-replacement.js";
+import {
+  appendPrivateVaultControlLogRotation,
+  PrivateVaultControlLogAppendError,
+} from "./private-vault-control-log-append.js";
 import { privateVaultControlLogService } from "./private-vault-control-log-runtime.js";
 import { resolvePrivateVaultGenesisAccountScope } from "./private-vault-genesis-account-scope.js";
 import {
@@ -67,6 +77,10 @@ function bytesEqual(left: Uint8Array, right: Uint8Array) {
     left.byteLength === right.byteLength &&
     left.every((byte, index) => byte === right[index])
   );
+}
+
+function sha256(bytes: Uint8Array) {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function mapDrainError(error: unknown): never {
@@ -587,6 +601,403 @@ export function createPrivateVaultBrokerReplacementOrchestration(
       });
     },
 
+    async commitRotation(
+      scope: PrivateVaultBrokerReplacementScope,
+      transcriptId: string,
+      body: Uint8Array,
+      proof: EndpointRequestProof,
+    ) {
+      const at = now();
+      const status = await transcript.read(scope, transcriptId);
+      let request: ReturnType<
+        typeof decodeAncV1ControlLogRotationAppendRequest
+      >;
+      let entry: ReturnType<typeof decodeSignedControlLogEntry>;
+      try {
+        request = decodeAncV1ControlLogRotationAppendRequest(body);
+        entry = decodeSignedControlLogEntry(request.signedEntry);
+      } catch {
+        throw new PrivateVaultBrokerReplacementError("invalid_request");
+      }
+
+      if (status.phase === "rotation_committed") {
+        if (!status.rotationReceipt || !status.rotationControlEntryHash) {
+          throw new PrivateVaultBrokerReplacementError("unavailable");
+        }
+        try {
+          const verifiedReceipt = await appendPrivateVaultControlLogRotation({
+            body,
+            proof,
+            now: at,
+            expectedProofPath: `/api/private-vault/broker-replacement/${transcriptId}/commit`,
+            onVerifiedRotationAppend: async () => {
+              throw new Error("committed retry attempted a second mutation");
+            },
+          });
+          const committed =
+            await privateVaultControlLogService.loadVerifiedEntry(
+              scope,
+              request.signedEntry,
+            );
+          const receipt = decodeAncV1ControlLogRotationAppendReceipt(
+            status.rotationReceipt,
+          );
+          const wrapHash = ancV1BytesToHex(
+            await hashAncV1RecoveryWrap(
+              request.recoveryWrap,
+              ancV1HexToBytes(scope.vaultId),
+            ),
+          );
+          const drain = status.drainId
+            ? await drainService.get(scope, status.drainId)
+            : null;
+          if (
+            !drain ||
+            !bytesEqual(verifiedReceipt, status.rotationReceipt) ||
+            drain.phase !== "committed" ||
+            drain.completionId !== entry.envelopeId ||
+            committed.entryHash !== status.rotationControlEntryHash ||
+            committed.entry.envelopeId !== status.rotationControlEntryId ||
+            committed.state.sequence !== status.rotationControlSequence ||
+            receipt.entryId !== status.rotationControlEntryId ||
+            receipt.sequence !== status.rotationControlSequence ||
+            receipt.headHash !== status.rotationControlEntryHash ||
+            receipt.recoveryWrapHash !== wrapHash ||
+            receipt.recoveryWrapByteLength !== request.recoveryWrap.byteLength
+          ) {
+            throw new Error();
+          }
+          return status;
+        } catch {
+          throw new PrivateVaultBrokerReplacementError("conflict");
+        }
+      }
+
+      if (
+        status.phase !== "drained" ||
+        !status.challenge ||
+        !status.sas ||
+        !status.approval ||
+        !status.drainId ||
+        !status.drainGeneration ||
+        !status.drainDigest ||
+        !status.drainAttestation ||
+        !status.drainAttestationHash
+      ) {
+        throw new PrivateVaultBrokerReplacementError("conflict");
+      }
+      const state = await loadState(scope, at);
+      let drain: PrivateVaultBrokerDrainMetadata;
+      try {
+        drain = await drainService.get(scope, status.drainId);
+      } catch (error) {
+        mapDrainError(error);
+      }
+      try {
+        const offer = exactCanonicalOffer(
+          status.offer,
+          ancV1HexToBytes(scope.vaultId),
+        );
+        const approval = decodeAncV1BrokerReplacementApproval(status.approval);
+        const authorizer = state.activeMembers.find(
+          (member) => member.endpointId === status.authorizerEndpointId,
+        );
+        const rotation = entry.innerEnvelope;
+        const candidate =
+          rotation.type === "membership_commit"
+            ? rotation.activeMembers.find(
+                (member) => member.endpointId === status.newBrokerEndpointId,
+              )
+            : null;
+        if (
+          !authorizer ||
+          authorizer.role !== "endpoint" ||
+          authorizer.unattended ||
+          drain.phase !== "witnessed" ||
+          drain.witnessGeneration !== 1 ||
+          drain.terminalJobsDigest !== status.drainDigest ||
+          drain.totalJobCount !== status.drainTotalCount ||
+          drain.completedJobCount !== status.drainCompletedCount ||
+          drain.failedJobCount !== status.drainFailedCount ||
+          drain.cancelledJobCount !== status.drainCancelledCount ||
+          entry.vaultId !== scope.vaultId ||
+          entry.signerEndpointId !== status.authorizerEndpointId ||
+          entry.sequence !== state.sequence + 1 ||
+          entry.previousHash !== state.headHash ||
+          rotation.type !== "membership_commit" ||
+          rotation.ceremonyKind !== "broker_replacement" ||
+          rotation.epoch !== state.epoch + 1 ||
+          !rotation.rotationCompleted ||
+          !rotation.outstandingJobsResolved ||
+          rotation.removedEndpointIds.length !== 1 ||
+          rotation.removedEndpointIds[0] !== status.oldBrokerEndpointId ||
+          !candidate ||
+          candidate.role !== "broker" ||
+          !candidate.unattended ||
+          candidate.signingPublicKey !==
+            ancV1BytesToHex(offer.signingPublicKey) ||
+          candidate.keyAgreementPublicKey !==
+            ancV1BytesToHex(offer.keyAgreementPublicKey) ||
+          candidate.enrollmentRef !== ancV1BytesToHex(approval.envelopeId)
+        ) {
+          throw new Error();
+        }
+        await verifyAncV1BrokerReplacementApproval(status.approval, {
+          vaultId: ancV1HexToBytes(scope.vaultId),
+          issuerEndpointId: ancV1HexToBytes(status.authorizerEndpointId),
+          oldBrokerEndpointId: ancV1HexToBytes(status.oldBrokerEndpointId),
+          candidateBrokerEndpointId: offer.endpointId,
+          candidateSigningPublicKey: offer.signingPublicKey,
+          candidateKeyAgreementPublicKey: offer.keyAgreementPublicKey,
+          candidateEnrollmentRef: approval.envelopeId,
+          offerHash: await hashAncV1EndpointEnrollmentOffer(status.offer, {
+            expectedVaultId: offer.vaultId,
+          }),
+          challengeHash: await hashAncV1EnrollmentChallenge(
+            status.challenge,
+            offer.vaultId,
+          ),
+          sasDecisionHash: await ancV1Hash(
+            "enrollment-sas-decision",
+            status.sas,
+          ),
+          baseSequence: state.sequence,
+          baseHeadHash: ancV1HexToBytes(state.headHash),
+          baseMembershipHash: ancV1HexToBytes(state.membershipHash),
+          baseEpoch: state.epoch,
+          drainId: approval.drainId,
+          drainGeneration: approval.drainGeneration,
+          deadlineAtSeconds: approval.deadlineAtSeconds,
+          expectedCreatedAtSeconds: approval.createdAtSeconds,
+          nowSeconds: Math.floor(at.getTime() / 1000),
+          issuerSigningPublicKey: ancV1HexToBytes(authorizer.signingPublicKey),
+        });
+        const attestation = await verifyAncV1BrokerDrainAttestation(
+          status.drainAttestation,
+          {
+            vaultId: ancV1HexToBytes(scope.vaultId),
+            issuerEndpointId: ancV1HexToBytes(status.authorizerEndpointId),
+            oldBrokerEndpointId: ancV1HexToBytes(status.oldBrokerEndpointId),
+            candidateBrokerEndpointId: offer.endpointId,
+            candidateSigningPublicKey: offer.signingPublicKey,
+            candidateKeyAgreementPublicKey: offer.keyAgreementPublicKey,
+            candidateEnrollmentRef: approval.envelopeId,
+            baseSequence: state.sequence,
+            baseHeadHash: ancV1HexToBytes(state.headHash),
+            baseEpoch: state.epoch,
+            drainGeneration: approval.drainGeneration,
+            drainedJobCount: drain.totalJobCount!,
+            drainDigest: ancV1HexToBytes(status.drainDigest),
+            expectedCreatedAtSeconds: Math.floor(
+              Date.parse(state.signedAt) / 1000,
+            ),
+            nowSeconds: Math.floor(at.getTime() / 1000),
+            issuerSigningPublicKey: ancV1HexToBytes(
+              authorizer.signingPublicKey,
+            ),
+          },
+        );
+        if (attestation.outstandingJobCount !== 0) throw new Error();
+      } catch {
+        throw new PrivateVaultBrokerReplacementError("invalid_request");
+      }
+
+      try {
+        await appendPrivateVaultControlLogRotation({
+          body,
+          proof,
+          now: at,
+          expectedProofPath: `/api/private-vault/broker-replacement/${transcriptId}/commit`,
+          onVerifiedRotationAppend: async ({
+            tx,
+            entryHash,
+            rotationReceipt,
+            serverReceivedAt,
+          }) => {
+            const [committedDrain] = await tx
+              .update(schema.contentEncryptedVaultBrokerReplacementDrains)
+              .set({
+                phase: "committed",
+                activeKey: null,
+                completionId: entry.envelopeId,
+                completedAt: serverReceivedAt,
+                updatedAt: serverReceivedAt,
+              })
+              .where(
+                and(
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+                    status.drainId!,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementDrains.vaultId,
+                    scope.vaultId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementDrains
+                      .ownerEmail,
+                    scope.ownerEmail,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementDrains.orgId,
+                    scope.orgId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementDrains.phase,
+                    "witnessed",
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementDrains
+                      .oldBrokerEndpointId,
+                    status.oldBrokerEndpointId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementDrains
+                      .replacementBrokerEndpointId,
+                    status.newBrokerEndpointId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementDrains
+                      .authorizerEndpointId,
+                    status.authorizerEndpointId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementDrains
+                      .drainGeneration,
+                    status.drainGeneration!,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementDrains
+                      .witnessGeneration,
+                    1,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementDrains
+                      .terminalJobsDigest,
+                    status.drainDigest!,
+                  ),
+                ),
+              )
+              .returning({
+                drainId:
+                  schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+              });
+            if (!committedDrain) throw new Error("drain changed");
+            const [committedTranscript] = await tx
+              .update(schema.contentEncryptedVaultBrokerReplacementTranscripts)
+              .set({
+                phase: "rotation_committed",
+                rotationControlEntryId: entry.envelopeId,
+                rotationControlEntryHash: entryHash,
+                rotationControlSequence: entry.sequence,
+                rotationReceiptHash: sha256(rotationReceipt),
+                rotationReceiptBytesBase64url:
+                  Buffer.from(rotationReceipt).toString("base64url"),
+                rotationCommittedAt: serverReceivedAt,
+                updatedAt: serverReceivedAt,
+              })
+              .where(
+                and(
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .transcriptId,
+                    transcriptId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .ownerEmail,
+                    scope.ownerEmail,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .accountId,
+                    scope.accountId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .orgId,
+                    scope.orgId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .workspaceId,
+                    scope.workspaceId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .vaultId,
+                    scope.vaultId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .phase,
+                    "drained",
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .oldBrokerEndpointId,
+                    status.oldBrokerEndpointId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .newBrokerEndpointId,
+                    status.newBrokerEndpointId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .authorizerEndpointId,
+                    status.authorizerEndpointId,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .offerHash,
+                    status.offerHash,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .drainId,
+                    status.drainId!,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .drainGeneration,
+                    status.drainGeneration!,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .drainDigest,
+                    status.drainDigest!,
+                  ),
+                  eq(
+                    schema.contentEncryptedVaultBrokerReplacementTranscripts
+                      .drainAttestationHash,
+                    status.drainAttestationHash!,
+                  ),
+                ),
+              )
+              .returning({
+                transcriptId:
+                  schema.contentEncryptedVaultBrokerReplacementTranscripts
+                    .transcriptId,
+              });
+            if (!committedTranscript) throw new Error("transcript changed");
+          },
+        });
+      } catch (error) {
+        if (error instanceof PrivateVaultControlLogAppendError) {
+          if (error.code === "conflict") {
+            throw new PrivateVaultBrokerReplacementError("conflict");
+          }
+          if (error.code === "unavailable") {
+            throw new PrivateVaultBrokerReplacementError("unavailable");
+          }
+          throw new PrivateVaultBrokerReplacementError("invalid_request");
+        }
+        throw error;
+      }
+      return transcript.read(scope, transcriptId);
+    },
+
     async deadline(
       scope: PrivateVaultBrokerReplacementScope,
       transcriptId: string,
@@ -670,6 +1081,7 @@ export const privateVaultBrokerReplacementProtocolLimits = Object.freeze({
   challengeBytes: privateVaultBrokerReplacementLimits.challengeBytes,
   sasDecisionBytes: privateVaultBrokerReplacementLimits.sasBytes,
   approvalBytes: ANC_BROKER_REPLACEMENT_APPROVAL_LIMITS.encodedBytes,
+  rotationAppendBytes: ANC_V1_CONTROL_LOG_APPEND_REQUEST_MAX_BYTES,
   drainAttestationBytes:
     privateVaultBrokerReplacementLimits.drainAttestationBytes,
   deadlineDecisionBytes: Math.max(

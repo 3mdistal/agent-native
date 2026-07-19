@@ -254,10 +254,11 @@ static NSString *SasCode(NSData *transcriptHash) {
   }
 }
 
-AncPrivateVaultEnrollmentChallengeResult *
-AncPrivateVaultEnrollmentChallengeVerify(
+static AncPrivateVaultEnrollmentChallengeResult *
+AncEnrollmentChallengeVerifyWithOldBroker(
     NSData *encodedOffer, NSData *encodedChallenge,
     AncPrivateVaultControlLogState *state,
+    NSData *expectedOldBrokerEndpointId,
     uint64_t authenticatedHeadSignedAtSeconds, uint64_t nowSeconds,
     AncPrivateVaultEnrollmentChallengeStatus *status) {
   SetStatus(status, AncPrivateVaultEnrollmentChallengeStatusInvalid);
@@ -378,17 +379,36 @@ AncPrivateVaultEnrollmentChallengeVerify(
       SetStatus(status, AncPrivateVaultEnrollmentChallengeStatusConflict);
       return nil;
     }
+    BOOL replacement = expectedOldBrokerEndpointId != nil;
+    if (replacement && (!broker || !offer.unattended ||
+                        !Exact(expectedOldBrokerEndpointId, 16))) {
+      SetStatus(status, AncPrivateVaultEnrollmentChallengeStatusConflict);
+      return nil;
+    }
     NSString *candidateId = Hex(offer.endpointId);
     if ([state.removedEndpointIds containsObject:candidateId]) {
       SetStatus(status, AncPrivateVaultEnrollmentChallengeStatusConflict);
       return nil;
     }
+    NSString *expectedOldBroker = Hex(expectedOldBrokerEndpointId);
+    NSUInteger activeBrokerCount = 0;
+    AncPrivateVaultControlLogMember *activeBroker = nil;
     for (AncPrivateVaultControlLogMember *member in state.activeMembers) {
-      if ([member.endpointId isEqualToString:candidateId] ||
-          (broker && [member.role isEqualToString:@"broker"])) {
+      if ([member.endpointId isEqualToString:candidateId]) {
         SetStatus(status, AncPrivateVaultEnrollmentChallengeStatusConflict);
         return nil;
       }
+      if ([member.role isEqualToString:@"broker"]) {
+        activeBrokerCount += 1;
+        activeBroker = member;
+      }
+    }
+    if ((!replacement && broker && activeBrokerCount != 0) ||
+        (replacement &&
+         (activeBrokerCount != 1 ||
+          ![activeBroker.endpointId isEqualToString:expectedOldBroker]))) {
+      SetStatus(status, AncPrivateVaultEnrollmentChallengeStatusConflict);
+      return nil;
     }
     NSString *authorizerHex = Hex(authorizerId.bytesValue);
     AncPrivateVaultControlLogMember *authorizer = nil;
@@ -527,6 +547,32 @@ AncPrivateVaultEnrollmentChallengeVerify(
     SetStatus(status, AncPrivateVaultEnrollmentChallengeStatusInvalid);
     return nil;
   }
+}
+
+AncPrivateVaultEnrollmentChallengeResult *
+AncPrivateVaultEnrollmentChallengeVerify(
+    NSData *encodedOffer, NSData *encodedChallenge,
+    AncPrivateVaultControlLogState *state,
+    uint64_t authenticatedHeadSignedAtSeconds, uint64_t nowSeconds,
+    AncPrivateVaultEnrollmentChallengeStatus *status) {
+  return AncEnrollmentChallengeVerifyWithOldBroker(
+      encodedOffer, encodedChallenge, state, nil,
+      authenticatedHeadSignedAtSeconds, nowSeconds, status);
+}
+
+AncPrivateVaultEnrollmentChallengeResult *
+AncPrivateVaultBrokerReplacementChallengeVerify(
+    NSData *encodedOffer, NSData *encodedChallenge,
+    AncPrivateVaultControlLogState *state, NSData *expectedOldBrokerEndpointId,
+    uint64_t authenticatedHeadSignedAtSeconds, uint64_t nowSeconds,
+    AncPrivateVaultEnrollmentChallengeStatus *status) {
+  if (!Exact(expectedOldBrokerEndpointId, 16)) {
+    SetStatus(status, AncPrivateVaultEnrollmentChallengeStatusInvalid);
+    return nil;
+  }
+  return AncEnrollmentChallengeVerifyWithOldBroker(
+      encodedOffer, encodedChallenge, state, expectedOldBrokerEndpointId,
+      authenticatedHeadSignedAtSeconds, nowSeconds, status);
 }
 
 BOOL AncPrivateVaultEnrollmentChallengeCopyEvidence(

@@ -1,3 +1,4 @@
+import { endpointRequestProofSchema } from "@agent-native/core/e2ee";
 import {
   getHeader,
   setResponseHeader,
@@ -38,6 +39,22 @@ export function privateVaultBrokerReplacementLength(event: H3Event) {
   const value = getHeader(event, "content-length")?.trim() ?? "";
   if (!/^[1-9][0-9]*$/.test(value)) return Number.NaN;
   return Number(value);
+}
+
+export function privateVaultBrokerReplacementEndpointProof(event: H3Event) {
+  const value = getHeader(event, "x-anc-endpoint-request-proof")?.trim() ?? "";
+  if (!value || value.length > 8_192 || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    return null;
+  }
+  try {
+    const bytes = Buffer.from(value, "base64url");
+    if (bytes.toString("base64url") !== value || bytes.byteLength > 6_144) {
+      return null;
+    }
+    return endpointRequestProofSchema.parse(JSON.parse(bytes.toString("utf8")));
+  } catch {
+    return null;
+  }
 }
 
 export function privateVaultBrokerReplacementFailure(
@@ -94,6 +111,12 @@ export function serializePrivateVaultBrokerReplacementStatus(
       cancelledCount: status.drainCancelledCount,
       digest: status.drainDigest,
       signedAttestation: serializeBytes(status.drainAttestation),
+    },
+    rotation: {
+      controlEntryId: status.rotationControlEntryId,
+      controlEntryHash: status.rotationControlEntryHash,
+      controlSequence: status.rotationControlSequence,
+      receipt: serializeBytes(status.rotationReceipt),
     },
     expiresAt: status.expiresAt,
   };

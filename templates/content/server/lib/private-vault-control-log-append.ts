@@ -43,6 +43,7 @@ import {
   privateVaultControlLogService,
   resolveActivePrivateVaultControlScope,
 } from "./private-vault-control-log-runtime.js";
+import type { PrivateVaultVerifiedControlAppend } from "./private-vault-control-log.js";
 import { sqlPrivateVaultEndpointRequestNonceStore } from "./private-vault-endpoint-request-nonces.js";
 
 export const PRIVATE_VAULT_CONTROL_LOG_APPEND_PATH =
@@ -931,6 +932,15 @@ export async function appendPrivateVaultControlLogRotation(input: {
   body: Uint8Array;
   proof: EndpointRequestProof;
   now?: Date;
+  /** Logical route covered by the endpoint request proof. */
+  expectedProofPath?: string;
+  /** Ceremony-specific state that must commit with the rotation edge. */
+  onVerifiedRotationAppend?: (
+    append: PrivateVaultVerifiedControlAppend & {
+      recoveryWrapHash: string;
+      rotationReceipt: Uint8Array;
+    },
+  ) => Promise<void>;
 }): Promise<Uint8Array> {
   let request: ReturnType<typeof decodeAncV1ControlLogRotationAppendRequest>;
   let entry: ReturnType<typeof decodeSignedControlLogEntry>;
@@ -954,7 +964,6 @@ export async function appendPrivateVaultControlLogRotation(input: {
     throw new PrivateVaultControlLogAppendError("invalid_request");
   }
   const rotation = entry.innerEnvelope;
-
   const scope = await resolveActivePrivateVaultControlScope(entry.vaultId);
   if (!scope) throw new PrivateVaultControlLogAppendError("not_found");
   const current = await privateVaultControlLogService.loadVerifiedState(scope);
@@ -967,6 +976,13 @@ export async function appendPrivateVaultControlLogRotation(input: {
       : null;
   if (entry.sequence <= current.sequence && !committed) {
     throw new PrivateVaultControlLogAppendError("conflict");
+  }
+  if (
+    !committed &&
+    rotation.ceremonyKind === "broker_replacement" &&
+    !input.onVerifiedRotationAppend
+  ) {
+    throw new PrivateVaultControlLogAppendError("invalid_request");
   }
   if (
     (!committed && entry.sequence !== current.sequence + 1) ||
@@ -987,7 +1003,8 @@ export async function appendPrivateVaultControlLogRotation(input: {
     const authenticated = await verifyEndpointRequestProofWithIdentity({
       proof: input.proof,
       expectedMethod: "POST",
-      expectedPath: PRIVATE_VAULT_CONTROL_LOG_APPEND_PATH,
+      expectedPath:
+        input.expectedProofPath ?? PRIVATE_VAULT_CONTROL_LOG_APPEND_PATH,
       body: input.body,
       now: input.now ?? new Date(),
       resolveAuthorizedEndpoint: async ({ vaultId, endpointId }) =>
@@ -1160,7 +1177,8 @@ export async function appendPrivateVaultControlLogRotation(input: {
             sequence: entry.sequence - 1,
             hash: entry.previousHash,
           },
-          onVerifiedAppend: async ({ tx, serverReceivedAt }) => {
+          onVerifiedAppend: async (append) => {
+            const { tx, serverReceivedAt } = append;
             await tx.insert(schema.contentEncryptedVaultRecoveryWraps).values({
               bindingId: bindingId(scope.vaultId, entry.envelopeId),
               ...scope,
@@ -1352,6 +1370,21 @@ export async function appendPrivateVaultControlLogRotation(input: {
               stage,
               serverReceivedAt,
             );
+            await input.onVerifiedRotationAppend?.({
+              ...append,
+              recoveryWrapHash,
+              rotationReceipt: encodeAncV1ControlLogRotationAppendReceipt({
+                version: 1,
+                suite: "anc/v1",
+                type: "control-log-rotation-append-receipt",
+                vaultId: scope.vaultId,
+                entryId: entry.envelopeId,
+                sequence: entry.sequence,
+                headHash: append.entryHash,
+                recoveryWrapHash,
+                recoveryWrapByteLength: request.recoveryWrap.byteLength,
+              }),
+            });
           },
         });
       } catch {

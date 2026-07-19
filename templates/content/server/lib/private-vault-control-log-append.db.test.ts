@@ -440,6 +440,7 @@ describe("Private Vault authenticated rotation append", () => {
       signedEntry: Uint8Array.from(encodeSignedControlLogEntry(rotation)),
       recoveryWrap: Uint8Array.from(recoveryWrap),
     });
+    const ceremonyCommit = async () => {};
     const requestTime = new Date(rotation.createdAt);
     const mismatchedTime = new Date(requestTime.getTime() - 1_000);
     const mismatchedProof = await createEndpointRequestProof({
@@ -457,6 +458,7 @@ describe("Private Vault authenticated rotation append", () => {
         body,
         proof: mismatchedProof,
         now: new Date(mismatchedTime.getTime() + 500),
+        onVerifiedRotationAppend: ceremonyCommit,
       }),
     ).rejects.toMatchObject({ code: "invalid_request" });
     expect(
@@ -483,6 +485,7 @@ describe("Private Vault authenticated rotation append", () => {
         body,
         proof,
         now: new Date(requestTime.getTime() + 1_000),
+        onVerifiedRotationAppend: ceremonyCommit,
       }),
     ).rejects.toMatchObject({ code: "conflict" });
     expect(
@@ -513,6 +516,7 @@ describe("Private Vault authenticated rotation append", () => {
         body,
         proof: wrongScopeProof,
         now: new Date(requestTime.getTime() + 2_000),
+        onVerifiedRotationAppend: ceremonyCommit,
       }),
     ).rejects.toMatchObject({ code: "conflict" });
     expect(
@@ -568,6 +572,7 @@ describe("Private Vault authenticated rotation append", () => {
         body,
         proof: collisionProof,
         now: new Date(requestTime.getTime() + 3_000),
+        onVerifiedRotationAppend: ceremonyCommit,
       }),
     ).rejects.toMatchObject({ code: "conflict" });
     expect(
@@ -600,6 +605,81 @@ describe("Private Vault authenticated rotation append", () => {
     await getDb()
       .delete(schema.contentEncryptedVaultEndpoints)
       .where(eq(schema.contentEncryptedVaultEndpoints.endpointId, FOURTH_ID));
+    const genericRouteProof = await createEndpointRequestProof({
+      vaultId: VAULT_ID,
+      endpointId: OWNER_ID,
+      method: "POST",
+      path: "/api/private-vault/control-log/append",
+      body,
+      issuedAt: rotation.createdAt,
+      nonce: "e1".repeat(16),
+      signingPrivateKey: ownerSigning.privateKey,
+    });
+    await expect(
+      appendRotation({
+        body,
+        proof: genericRouteProof,
+        now: new Date(requestTime.getTime() + 4_000),
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(
+      appendRotation({
+        body,
+        proof: genericRouteProof,
+        now: new Date(requestTime.getTime() + 4_000),
+        expectedProofPath:
+          "/api/private-vault/broker-replacement/transcript:test/commit",
+        onVerifiedRotationAppend: ceremonyCommit,
+      }),
+    ).rejects.toMatchObject({ code: "unauthorized" });
+    expect(
+      await controlLog.privateVaultControlLogService.loadVerifiedState(scope),
+    ).toMatchObject({ sequence: 2, epoch: 1 });
+    const failedSeamProof = await createEndpointRequestProof({
+      vaultId: VAULT_ID,
+      endpointId: OWNER_ID,
+      method: "POST",
+      path: "/api/private-vault/control-log/append",
+      body,
+      issuedAt: rotation.createdAt,
+      nonce: "e0".repeat(16),
+      signingPrivateKey: ownerSigning.privateKey,
+    });
+    await expect(
+      appendRotation({
+        body,
+        proof: failedSeamProof,
+        now: new Date(requestTime.getTime() + 4_000),
+        onVerifiedRotationAppend: async ({ entryHash, rotationReceipt }) => {
+          expect(
+            decodeAncV1ControlLogRotationAppendReceipt(rotationReceipt),
+          ).toMatchObject({
+            entryId: rotation.envelopeId,
+            headHash: entryHash,
+            recoveryWrapHash,
+          });
+          throw new Error("ceremony transaction witness failed");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    expect(
+      await controlLog.privateVaultControlLogService.loadVerifiedState(scope),
+    ).toMatchObject({ sequence: 2, epoch: 1 });
+    expect(
+      await getDb().select().from(schema.contentEncryptedVaultRecoveryWraps),
+    ).toHaveLength(0);
+    expect(
+      await getDb()
+        .select()
+        .from(schema.contentEncryptedVaultEndpoints)
+        .where(eq(schema.contentEncryptedVaultEndpoints.endpointId, THIRD_ID)),
+    ).toMatchObject([{ endpointState: "online", healthState: "healthy" }]);
+    expect(
+      await getDb()
+        .select()
+        .from(schema.contentEncryptedVaultEndpoints)
+        .where(eq(schema.contentEncryptedVaultEndpoints.endpointId, FOURTH_ID)),
+    ).toHaveLength(0);
     const committedProof = await createEndpointRequestProof({
       vaultId: VAULT_ID,
       endpointId: OWNER_ID,
@@ -614,6 +694,7 @@ describe("Private Vault authenticated rotation append", () => {
       body,
       proof: committedProof,
       now: new Date(requestTime.getTime() + 5_000),
+      onVerifiedRotationAppend: ceremonyCommit,
     });
     const receipt = decodeAncV1ControlLogRotationAppendReceipt(receiptBytes);
     expect(receipt).toMatchObject({
@@ -668,6 +749,7 @@ describe("Private Vault authenticated rotation append", () => {
         body,
         proof: corruptRevocationRetryProof,
         now: new Date(requestTime.getTime() + 6_000),
+        onVerifiedRotationAppend: ceremonyCommit,
       }),
     ).rejects.toMatchObject({ code: "conflict" });
     await getDb()
@@ -700,6 +782,7 @@ describe("Private Vault authenticated rotation append", () => {
         body,
         proof: corruptReplacementRetryProof,
         now: new Date(requestTime.getTime() + 7_000),
+        onVerifiedRotationAppend: ceremonyCommit,
       }),
     ).rejects.toMatchObject({ code: "conflict" });
     await getDb()

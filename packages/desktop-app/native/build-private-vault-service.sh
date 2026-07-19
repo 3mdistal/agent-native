@@ -12,6 +12,7 @@ SOURCES=(
   "$SOURCE_ROOT/control/PrivateVaultControlLogInternal.m"
   "$SOURCE_ROOT/control/PrivateVaultContinuityBuilder.m"
   "$SOURCE_ROOT/control/PrivateVaultBrokerReplacementBuilder.m"
+  "$SOURCE_ROOT/control/PrivateVaultBrokerReplacementApproval.m"
   "$SOURCE_ROOT/control/PrivateVaultEndpointRequest.m"
   "$SOURCE_ROOT/control/PrivateVaultEndpointRemovalBuilder.m"
   "$SOURCE_ROOT/control/PrivateVaultEnrollmentOffer.m"
@@ -976,6 +977,69 @@ case "${PRIVATE_VAULT_BUILD_ENROLLMENT_AUTHORIZATION_TESTS:-}" in
     build_enrollment_authorization_tests x86_64
   fi
   ;;
+esac
+
+case "${PRIVATE_VAULT_BUILD_BROKER_REPLACEMENT_APPROVAL_TESTS:-}" in
+  "") ;;
+  1 | true | TRUE | yes | YES)
+    BROKER_REPLACEMENT_APPROVAL_TEST_OUTPUT="$OUTPUT_ROOT/.broker-replacement-approval-tests"
+    rm -rf "$BROKER_REPLACEMENT_APPROVAL_TEST_OUTPUT"
+    mkdir -p "$BROKER_REPLACEMENT_APPROVAL_TEST_OUTPUT"
+    build_broker_replacement_approval_tests() {
+      local architecture="$1"
+      local sodium_root
+      if [[ "$architecture" == "arm64" ]]; then sodium_root="$ARM64_SODIUM"; else sodium_root="$X86_64_SODIUM"; fi
+      local output="$BROKER_REPLACEMENT_APPROVAL_TEST_OUTPUT/private-vault-broker-replacement-approval-tests-$architecture"
+      xcrun clang -O1 -fobjc-arc -fblocks -Wall -Wextra -Werror \
+        -isysroot "$SDK" -arch "$architecture" -mmacosx-version-min=13.0 \
+        -I"$SOURCE_ROOT/crypto" -I"$SOURCE_ROOT/control" \
+        -I"$SOURCE_ROOT/storage" -I"$SOURCE_ROOT/recovery" \
+        -I"$SOURCE_ROOT/transport" -I"$sodium_root/include" \
+        -DANC_PRIVATE_VAULT_TESTING=1 \
+        -DANC_PRIVATE_VAULT_ENROLLMENT_AUTHORITY_LINKED=1 \
+        -framework Foundation -framework Security -framework LocalAuthentication \
+        "$SOURCE_ROOT/crypto/PrivateVaultCrypto.c" \
+        "$SOURCE_ROOT/control/PrivateVaultEnrollmentOffer.m" \
+        "$SOURCE_ROOT/control/PrivateVaultEnrollmentChallenge.m" \
+        "$SOURCE_ROOT/control/PrivateVaultEnrollmentAuthorizer.m" \
+        "$SOURCE_ROOT/control/PrivateVaultEekWrap.m" \
+        "$SOURCE_ROOT/control/PrivateVaultEnrollmentAuthorization.m" \
+        "$SOURCE_ROOT/control/PrivateVaultEnrollmentSasReceipt.m" \
+        "$SOURCE_ROOT/control/PrivateVaultAncCanonical.m" \
+        "$SOURCE_ROOT/control/PrivateVaultControlLog.m" \
+        "$SOURCE_ROOT/control/PrivateVaultControlLogInternal.m" \
+        "$SOURCE_ROOT/control/PrivateVaultGenesisBootstrap.m" \
+        "$SOURCE_ROOT/control/PrivateVaultGenesisAuthorization.m" \
+        "$SOURCE_ROOT/control/PrivateVaultGenesisAccountAdmission.m" \
+        "$SOURCE_ROOT/control/PrivateVaultGenesisHostedAppend.m" \
+        "$SOURCE_ROOT/control/PrivateVaultRecoveryWrap.m" \
+        "$SOURCE_ROOT/control/PrivateVaultRecoveryAuthorization.m" \
+        "$SOURCE_ROOT/control/PrivateVaultRecoveryBuilder.m" \
+        "$SOURCE_ROOT/control/PrivateVaultBrokerReplacementApproval.m" \
+        "$SOURCE_ROOT/recovery/PrivateVaultRecoveryAuthority.m" \
+        "$SOURCE_ROOT/storage/PrivateVaultKeychain.m" \
+        "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
+        "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
+        "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
+        "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
+        "$SOURCE_ROOT/storage/PrivateVaultRecoveryPreparationStore.m" \
+        "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
+        "$SOURCE_ROOT/storage/PrivateVaultAuthorityStore.m" \
+        "$SOURCE_ROOT/storage/PrivateVaultEnrollmentOfferArtifactStore.m" \
+        "$SOURCE_ROOT/storage/PrivateVaultEnrollmentSasReceiptStore.m" \
+        "$SOURCE_ROOT/storage/PrivateVaultEnrollmentCoordinator.m" \
+        "$SOURCE_ROOT/transport/PrivateVaultBootstrapFrame.m" \
+        "$SOURCE_ROOT/transport/PrivateVaultBootstrapReplay.m" \
+        "$SOURCE_ROOT/control/PrivateVaultBrokerReplacementApprovalTests.m" \
+        "$sodium_root/lib/libsodium.a" -o "$output"
+      lipo "$output" -verify_arch "$architecture"
+    }
+    build_broker_replacement_approval_tests arm64
+    if [[ "$PRIVATE_VAULT_BUILD_ARCHITECTURES" == "universal" ]]; then
+      build_broker_replacement_approval_tests x86_64
+    fi
+    ;;
+  *) echo "Invalid Private Vault broker-replacement-approval-test build mode" >&2; exit 1 ;;
 esac
 
 case "${PRIVATE_VAULT_BUILD_MANIFEST_CHECKPOINT_TESTS:-}" in

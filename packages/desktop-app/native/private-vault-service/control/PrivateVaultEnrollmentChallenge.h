@@ -49,4 +49,12 @@ FOUNDATION_EXPORT AncPrivateVaultEnrollmentChallengeResult
         uint64_t authenticatedHeadSignedAtSeconds, uint64_t nowSeconds,
         AncPrivateVaultEnrollmentChallengeStatus *_Nullable status);
 
+FOUNDATION_EXPORT AncPrivateVaultEnrollmentChallengeResult
+    *_Nullable AncPrivateVaultBrokerReplacementChallengeVerify(
+        NSData *encodedOffer, NSData *encodedChallenge,
+        AncPrivateVaultControlLogState *controlState,
+        NSData *expectedOldBrokerEndpointId,
+        uint64_t authenticatedHeadSignedAtSeconds, uint64_t nowSeconds,
+        AncPrivateVaultEnrollmentChallengeStatus *_Nullable status);
+
 NS_ASSUME_NONNULL_END
