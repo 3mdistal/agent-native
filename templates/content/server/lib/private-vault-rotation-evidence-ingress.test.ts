@@ -300,10 +300,12 @@ describe("Private Vault verified rotation evidence ingress", () => {
         ],
       })),
     };
+    const freezeRotation = vi.fn(async () => undefined);
     const ingress = createPrivateVaultRotationEvidenceIngress({
       loadState: async () => value.state,
       resolveScope: async () => scope,
       store: store as never,
+      freezeRotation,
       now: () => now,
     });
     await expect(
@@ -316,6 +318,24 @@ describe("Private Vault verified rotation evidence ingress", () => {
       scope,
       expect.objectContaining({ expectedRecipientCount: 1 }),
     );
+    expect(freezeRotation).toHaveBeenCalledWith({
+      principal,
+      ceremonyId: ancV1BytesToHex(ceremonyId),
+      baseEpoch: 1,
+      targetEpoch: 2,
+      manifestObjectId: ancV1BytesToHex(fill(13)),
+      manifestRevisionId: ancV1BytesToHex(fill(14, 32)),
+      manifestGeneration: 2,
+    });
+    expect(freezeRotation.mock.invocationCallOrder[0]).toBeLessThan(
+      store.establish.mock.invocationCallOrder[0]!,
+    );
+
+    freezeRotation.mockRejectedValueOnce(new Error("stale hosted head"));
+    await expect(
+      ingress.appendCheckpoint(principal, value.checkpoint),
+    ).rejects.toThrow("stale hosted head");
+    expect(store.establish).toHaveBeenCalledTimes(1);
   });
 
   it("rejects an EEK-wrap substitution before persistence", async () => {

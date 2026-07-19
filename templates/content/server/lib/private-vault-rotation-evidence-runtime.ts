@@ -14,6 +14,7 @@ import {
   resolveActivePrivateVaultControlScope,
 } from "./private-vault-control-log-runtime.js";
 import { sqlPrivateVaultEndpointRequestNonceStore } from "./private-vault-endpoint-request-nonces.js";
+import { freezePrivateVaultRotation } from "./private-vault-manifest-head.js";
 import { createPrivateVaultRotationEvidenceIngress } from "./private-vault-rotation-evidence-ingress.js";
 import { privateVaultRotationEvidenceStore } from "./private-vault-rotation-evidence.js";
 
@@ -97,6 +98,19 @@ export async function authenticatePrivateVaultRotationEvidenceRecipient(input: {
 export const privateVaultRotationEvidenceIngress =
   createPrivateVaultRotationEvidenceIngress({
     store: privateVaultRotationEvidenceStore,
+    freezeRotation: (input) =>
+      freezePrivateVaultRotation({
+        scope: input.principal,
+        kind: "remove_device",
+        ceremonyId: input.ceremonyId,
+        baseEpoch: input.baseEpoch,
+        targetEpoch: input.targetEpoch,
+        manifest: {
+          objectId: input.manifestObjectId,
+          revisionId: input.manifestRevisionId,
+          generation: input.manifestGeneration,
+        },
+      }),
     async verifyControlBundle(input) {
       const verified = await verifyPrivateVaultControlLogRotationCandidate({
         body: input.body,

@@ -7,6 +7,8 @@ const setResponseHeader = vi.hoisted(() => vi.fn());
 const setResponseStatus = vi.hoisted(() => vi.fn());
 const authorizePut = vi.hoisted(() => vi.fn());
 const putRevision = vi.hoisted(() => vi.fn());
+const authenticateEndpoint = vi.hoisted(() => vi.fn());
+const decodeEndpointProof = vi.hoisted(() => vi.fn());
 
 vi.mock("../../../../lib/private-vault-genesis-account-scope.js", () => ({
   resolveAuthenticatedPrivateVaultScope: (...args: unknown[]) =>
@@ -21,6 +23,12 @@ vi.mock("h3", () => ({
 vi.mock("../../../../lib/private-vault-bounded-body.js", () => ({
   readPrivateVaultBoundedBody: (...args: unknown[]) =>
     readPrivateVaultBoundedBody(...args),
+}));
+vi.mock("../../../../lib/private-vault-endpoint-auth.js", () => ({
+  authenticatePrivateVaultAttendedEndpoint: (...args: unknown[]) =>
+    authenticateEndpoint(...args),
+  decodePrivateVaultEndpointProofHeader: (...args: unknown[]) =>
+    decodeEndpointProof(...args),
 }));
 vi.mock("../../../../lib/private-vault-objects.js", async (importOriginal) => {
   const actual =
@@ -62,6 +70,13 @@ describe("POST /api/private-vault/objects", () => {
     authorizePut.mockResolvedValue(undefined);
     readPrivateVaultBoundedBody.mockResolvedValue(new Uint8Array([1, 2, 3, 4]));
     putRevision.mockResolvedValue({ revisionId: "revision:test-0001" });
+    decodeEndpointProof.mockReturnValue({ proof: true });
+    authenticateEndpoint.mockResolvedValue({
+      ownerEmail: "owner@example.test",
+      orgId: "org:test-0001",
+      vaultId: "vault:test-0001",
+      endpointId: "endpoint:test-0001",
+    });
   });
 
   it("checks same-origin CSRF before session or body access", async () => {
@@ -124,5 +139,50 @@ describe("POST /api/private-vault/objects", () => {
       "Cache-Control",
       "no-store",
     );
+  });
+
+  it("authenticates a manifest write over its exact CAS metadata and ciphertext hash", async () => {
+    getHeader.mockImplementation(
+      (_event, name: string) =>
+        ({
+          ...headers,
+          "x-anc-object-type": "vault-manifest",
+          "x-anc-prior-manifest-generation": "0",
+          "x-anc-endpoint-proof": "proof",
+        })[name],
+    );
+    await expect(handler({} as never)).resolves.toEqual({
+      revisionId: "revision:test-0001",
+    });
+    expect(authenticateEndpoint).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "POST",
+        path: "/api/private-vault/objects",
+        proof: { proof: true },
+        body: expect.any(Uint8Array),
+      }),
+    );
+    expect(putRevision).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ objectType: "vault-manifest" }),
+      {
+        prior: null,
+        next: {
+          objectId: "object:test-0001",
+          revisionId: "revision:test-0001",
+          generation: 1,
+        },
+      },
+    );
+  });
+
+  it("rejects a manifest before persistence when proof or CAS is absent", async () => {
+    getHeader.mockImplementation(
+      (_event, name: string) =>
+        ({ ...headers, "x-anc-object-type": "vault-manifest" })[name],
+    );
+    await expect(handler({} as never)).resolves.toEqual({ error: "Not found" });
+    expect(authenticateEndpoint).not.toHaveBeenCalled();
+    expect(putRevision).not.toHaveBeenCalled();
   });
 });

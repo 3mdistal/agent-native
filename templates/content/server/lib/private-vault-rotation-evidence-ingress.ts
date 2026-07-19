@@ -53,6 +53,15 @@ export interface PrivateVaultRotationEvidenceIngressDependencies {
     principal: PrivateVaultRotationEvidencePrincipal,
   ) => Promise<PrivateVaultRotationEvidenceScope | null>;
   readonly store: ReturnType<typeof createPrivateVaultRotationEvidenceStore>;
+  readonly freezeRotation?: (input: {
+    principal: PrivateVaultRotationEvidencePrincipal;
+    ceremonyId: string;
+    baseEpoch: number;
+    targetEpoch: number;
+    manifestObjectId: string;
+    manifestRevisionId: string;
+    manifestGeneration: number;
+  }) => Promise<unknown>;
   readonly verifyControlBundle?: (input: {
     body: Uint8Array;
     proof: unknown;
@@ -332,8 +341,18 @@ export function createPrivateVaultRotationEvidenceIngress(
         survivors.length > 64
       )
         fail();
+      const ceremonyId = ancV1BytesToHex(checkpoint.ceremonyId);
+      await dependencies.freezeRotation?.({
+        principal,
+        ceremonyId,
+        baseEpoch: checkpoint.baseEpoch,
+        targetEpoch: checkpoint.targetEpoch,
+        manifestObjectId: ancV1BytesToHex(checkpoint.manifestObjectId),
+        manifestRevisionId: ancV1BytesToHex(checkpoint.revisionId),
+        manifestGeneration: checkpoint.generation,
+      });
       return dependencies.store.establish(scope, {
-        ceremonyId: ancV1BytesToHex(checkpoint.ceremonyId),
+        ceremonyId,
         expectedRecipientCount: survivors.length,
         checkpoint: encodedCheckpoint,
       });

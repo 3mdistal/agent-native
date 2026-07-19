@@ -39,6 +39,13 @@ import {
 } from "./private-vault-ciphertext-staging.js";
 import { resolvePrivateVaultScopeForStableIdentity } from "./private-vault-genesis-account-scope.js";
 import {
+  type PrivateVaultManifestHeadCas,
+  type PrivateVaultHostedScope,
+  PrivateVaultManifestHeadConflictError,
+  withPrivateVaultOrdinaryWrite,
+} from "./private-vault-manifest-head.js";
+import type { PrivateVaultMutationTransaction } from "./private-vault-mutation-gate.js";
+import {
   buildPrivateVaultRetentionItem,
   enqueuePrivateVaultRetentionItem,
 } from "./private-vault-retention.js";
@@ -143,6 +150,7 @@ export interface PrivateVaultObjectStore {
     metadata: PrivateVaultRevisionMetadata,
     eventId: string,
     stage: PrivateVaultCiphertextStage,
+    transaction?: PrivateVaultMutationTransaction,
   ): Promise<PrivateVaultRevisionMetadata>;
   listRevisions(
     scope: PrivateVaultScope,
@@ -380,8 +388,8 @@ export const sqlPrivateVaultObjectStore: PrivateVaultObjectStore = {
       .limit(1);
     return row ? rowMetadata(row, object.objectType) : null;
   },
-  persistRevision: async (scope, metadata, eventId, stage) => {
-    return getDb().transaction(async (tx) => {
+  persistRevision: async (scope, metadata, eventId, stage, transaction) => {
+    const persist = async (tx: PrivateVaultMutationTransaction) => {
       const [vault] = await tx
         .select({ vaultId: schema.contentEncryptedVaults.vaultId })
         .from(schema.contentEncryptedVaults)
@@ -589,7 +597,8 @@ export const sqlPrivateVaultObjectStore: PrivateVaultObjectStore = {
         metadata.serverReceivedAt,
       );
       return metadata;
-    });
+    };
+    return transaction ? persist(transaction) : getDb().transaction(persist);
   },
   listRevisions: async (scope, objectId) => {
     const object = await sqlPrivateVaultObjectStore.getObject(scope, objectId);
@@ -846,6 +855,11 @@ export function createPrivateVaultObjectService(
     eventId?: () => string;
     emitSync?: typeof emitObjectSync;
     staging?: PrivateVaultObjectStagingStore;
+    writeGate?: <T>(
+      scope: PrivateVaultHostedScope,
+      manifestCas: PrivateVaultManifestHeadCas | null,
+      run: (transaction?: PrivateVaultMutationTransaction) => Promise<T>,
+    ) => Promise<T>;
   } = {},
 ) {
   const store = options.store ?? sqlPrivateVaultObjectStore;
@@ -854,6 +868,8 @@ export function createPrivateVaultObjectService(
   const eventId = options.eventId ?? randomUUID;
   const emitSync = options.emitSync ?? emitObjectSync;
   const staging = options.staging ?? privateVaultCiphertextStagingService;
+  const writeGate =
+    options.writeGate ?? (async (_scope, _manifestCas, run) => run(undefined));
 
   async function authorizePut(
     scopeInput: PrivateVaultScope,
@@ -880,6 +896,7 @@ export function createPrivateVaultObjectService(
     async putRevision(
       scopeInput: PrivateVaultScope,
       input: PrivateVaultObjectRevisionInput & { ciphertext: Uint8Array },
+      manifestCas: PrivateVaultManifestHeadCas | null = null,
     ) {
       const { ciphertext, ...metadataInput } = input;
       const { scope, parsed } = await authorizePut(scopeInput, metadataInput);
@@ -896,6 +913,20 @@ export function createPrivateVaultObjectService(
         ...parsed,
         serverReceivedAt: receivedAt,
       };
+      if (parsed.objectType === "vault-manifest" && !manifestCas) {
+        throw new PrivateVaultObjectConflictError(
+          "Manifest revisions require an exact prior head",
+        );
+      }
+      if (
+        manifestCas &&
+        (parsed.objectType !== "vault-manifest" ||
+          manifestCas.next.objectId !== parsed.objectId ||
+          manifestCas.next.revisionId !== parsed.revisionId ||
+          manifestCas.next.generation !== parsed.revision)
+      ) {
+        throw new PrivateVaultObjectConflictError();
+      }
       const committed = await store.getRevision(
         scope,
         parsed.objectId,
@@ -905,21 +936,23 @@ export function createPrivateVaultObjectService(
         if (!sameRevision(committed, metadata)) {
           throw new PrivateVaultObjectConflictError();
         }
-        try {
-          // Lost-response retries verify immutable equal bytes at the provider
-          // instead of reopening the terminal staging coordinate.
-          await blobs.put({
-            coordinate: coordinate(metadata),
-            ciphertext,
-            expectedByteLength: parsed.ciphertextByteLength,
-          });
-        } catch (error) {
-          if (error instanceof ProtectedCiphertextCollisionError) {
-            throw new PrivateVaultObjectConflictError();
+        return writeGate(scope, manifestCas, async () => {
+          try {
+            // Lost-response retries verify immutable equal bytes at the
+            // provider while the ordinary-write gate remains open.
+            await blobs.put({
+              coordinate: coordinate(metadata),
+              ciphertext,
+              expectedByteLength: parsed.ciphertextByteLength,
+            });
+          } catch (error) {
+            if (error instanceof ProtectedCiphertextCollisionError) {
+              throw new PrivateVaultObjectConflictError();
+            }
+            throw error;
           }
-          throw error;
-        }
-        return committed;
+          return committed;
+        });
       }
       const staged = await staging.stage(scope, coordinate(metadata));
       let blob: ProtectedCiphertextPutResult;
@@ -936,15 +969,24 @@ export function createPrivateVaultObjectService(
         throw error;
       }
       try {
-        const persisted = await store.persistRevision(
-          scope,
-          metadata,
-          eventId(),
-          staged,
+        const persisted = await writeGate(scope, manifestCas, (transaction) =>
+          transaction
+            ? store.persistRevision(
+                scope,
+                metadata,
+                eventId(),
+                staged,
+                transaction,
+              )
+            : store.persistRevision(scope, metadata, eventId(), staged),
         );
         emitSync(scope, parsed.objectId, "object-revision");
         return persisted;
       } catch (error) {
+        // A freeze or stale manifest CAS is terminal for this request. Do not
+        // turn it into a successful concurrent-write retry after the gate has
+        // closed; the caller must reread the now-authoritative hosted head.
+        if (error instanceof PrivateVaultManifestHeadConflictError) throw error;
         const concurrent = await store
           .getRevision(scope, parsed.objectId, parsed.revisionId)
           .catch(() => null);
@@ -1040,7 +1082,9 @@ export function createPrivateVaultObjectService(
   };
 }
 
-export const privateVaultObjectService = createPrivateVaultObjectService();
+export const privateVaultObjectService = createPrivateVaultObjectService({
+  writeGate: withPrivateVaultOrdinaryWrite,
+});
 
 export function decodePrivateVaultCiphertext(
   value: string,
