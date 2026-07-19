@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   PRIVATE_VAULT_CONTENT_TYPE,
   PRIVATE_VAULT_MANIFEST_CONTENT_TYPE,
@@ -31,13 +33,17 @@ function hostedObjectType(
 export class PrivateVaultContentObjectRuntime {
   readonly #native: Pick<
     PrivateVaultNativeServiceClient,
-    "sealContentObjectRevision" | "openContentObjectRevision"
+    | "sealContentObjectRevision"
+    | "openContentObjectRevision"
+    | "rewrapContentObjectRevision"
   >;
 
   constructor(
     native: Pick<
       PrivateVaultNativeServiceClient,
-      "sealContentObjectRevision" | "openContentObjectRevision"
+      | "sealContentObjectRevision"
+      | "openContentObjectRevision"
+      | "rewrapContentObjectRevision"
     >,
   ) {
     this.#native = native;
@@ -141,6 +147,60 @@ export class PrivateVaultContentObjectRuntime {
       downloaded.ciphertext.fill(0);
     }
   }
+
+  async rewrapRevisionForPreparedRotation(input: {
+    readonly vaultId: string;
+    readonly objectId: string;
+    readonly revision: number;
+    readonly epoch: number;
+    readonly objectType: PrivateVaultContentHostedObjectType;
+    readonly encodedRevision: Uint8Array;
+  }): Promise<{
+    readonly revisionId: string;
+    readonly revision: number;
+    readonly epoch: number;
+    readonly objectType: PrivateVaultContentHostedObjectType;
+    readonly plaintextLength: number;
+    readonly ciphertext: Uint8Array;
+    readonly ciphertextHash: string;
+    readonly ciphertextByteLength: number;
+  }> {
+    if (
+      !Number.isSafeInteger(input.revision) ||
+      input.revision <= 0 ||
+      !Number.isSafeInteger(input.epoch) ||
+      input.epoch <= 0 ||
+      input.epoch >= Number.MAX_SAFE_INTEGER ||
+      (input.objectType !== "document" && input.objectType !== "vault-manifest")
+    )
+      throw new Error("object rewrap binding failed");
+    const rewrapped = await this.#native.rewrapContentObjectRevision({
+      vaultId: input.vaultId,
+      objectId: input.objectId,
+      encodedRevision: input.encodedRevision,
+    });
+    try {
+      if (
+        rewrapped.revision !== input.revision ||
+        rewrapped.epoch !== input.epoch + 1 ||
+        hostedObjectType(rewrapped.contentType) !== input.objectType
+      )
+        throw new Error("object rewrap binding failed");
+      const ciphertext = rewrapped.encodedRevision.slice();
+      return Object.freeze({
+        revisionId: hex(rewrapped.revisionId),
+        revision: rewrapped.revision,
+        epoch: rewrapped.epoch,
+        objectType: hostedObjectType(rewrapped.contentType),
+        plaintextLength: rewrapped.plaintextLength,
+        ciphertext,
+        ciphertextHash: createHash("sha256").update(ciphertext).digest("hex"),
+        ciphertextByteLength: ciphertext.byteLength,
+      });
+    } finally {
+      rewrapped.encodedRevision.fill(0);
+    }
+  }
 }
 
 export function createPrivateVaultContentObjectRuntime() {
@@ -148,4 +208,3 @@ export function createPrivateVaultContentObjectRuntime() {
     createPrivateVaultNativeServiceClient(),
   );
 }
-import { createHash } from "node:crypto";

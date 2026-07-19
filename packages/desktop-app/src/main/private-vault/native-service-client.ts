@@ -36,6 +36,10 @@ const SERVICE_VERSION = 1 as const;
 const XPC_PROTOCOL_VERSION = 3 as const;
 const SERVICE_SUITE = "anc/v1" as const;
 const PACKAGED_ADDON_NAME = "private-vault-xpc-client.node";
+const MAXIMUM_CONTENT_OBJECT_PLAINTEXT_BYTES =
+  E2EE_SIZE_LIMITS.chunkPlaintextBytes;
+const MAXIMUM_CONTENT_OBJECT_REVISION_BYTES =
+  MAXIMUM_CONTENT_OBJECT_PLAINTEXT_BYTES + 64 * 1024;
 
 type RotationAckState =
   | "unavailable"
@@ -84,6 +88,7 @@ type NativeOperation =
   | "open_object"
   | "seal_job_object"
   | "open_job_object"
+  | "rewrap_revision"
   | "seal_export"
   | "open_export";
 
@@ -195,6 +200,9 @@ export interface PrivateVaultNativeServiceClient
   openContentObjectRevision(
     input: NativeOpenContentObjectInput,
   ): Promise<NativeOpenedContentObjectResult>;
+  rewrapContentObjectRevision(
+    input: NativeRewrapContentObjectInput,
+  ): Promise<NativeRewrappedContentObjectResult>;
   sealJobContentObjectRevision(
     input: NativeSealJobContentObjectInput,
   ): Promise<NativeSealedJobContentObjectResult>;
@@ -395,6 +403,12 @@ export interface NativeOpenContentObjectInput {
   readonly encodedRevision: Uint8Array;
 }
 
+export interface NativeRewrapContentObjectInput {
+  readonly vaultId: string;
+  readonly objectId: string;
+  readonly encodedRevision: Uint8Array;
+}
+
 export interface NativeContentObjectJobContext {
   readonly jobId: string;
   readonly jobHash: string;
@@ -433,6 +447,12 @@ export interface NativeOpenedContentObjectResult extends NativeContentObjectResu
   readonly state: "opened";
   readonly writerEndpointId: Uint8Array;
   readonly plaintext: Uint8Array;
+}
+
+export interface NativeRewrappedContentObjectResult extends NativeContentObjectResultBase {
+  readonly operation: "rewrap_revision";
+  readonly state: "rewrapped";
+  readonly encodedRevision: Uint8Array;
 }
 
 export interface NativeSealedJobContentObjectResult extends NativeContentObjectResultBase {
@@ -1000,6 +1020,60 @@ function parseContentObjectResult(
         state: "sealed" as const,
         encodedRevision: objectPayload,
       });
+}
+
+function parseRewrappedContentObjectResult(
+  value: unknown,
+  expected: NativeRewrapContentObjectInput,
+): NativeRewrappedContentObjectResult {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "version",
+      "operation",
+      "state",
+      "vaultId",
+      "objectId",
+      "contentType",
+      "revision",
+      "epoch",
+      "plaintextLength",
+      "revisionId",
+      "objectPayload",
+    ]) ||
+    value.version !== XPC_PROTOCOL_VERSION ||
+    value.operation !== "rewrap_revision" ||
+    value.state !== "rewrapped" ||
+    value.vaultId !== expected.vaultId ||
+    value.objectId !== expected.objectId ||
+    !isLowerHex(value.vaultId, 32) ||
+    !isLowerHex(value.objectId, 32) ||
+    !isContentObjectType(value.contentType) ||
+    !isSafeInteger(value.revision, true) ||
+    !isSafeInteger(value.epoch, true) ||
+    !isSafeInteger(value.plaintextLength, true) ||
+    value.plaintextLength > MAXIMUM_CONTENT_OBJECT_PLAINTEXT_BYTES ||
+    !(value.revisionId instanceof Uint8Array) ||
+    value.revisionId.byteLength !== 32
+  )
+    throw new PrivateVaultNativeServiceClientError();
+  return Object.freeze({
+    version: SERVICE_VERSION,
+    suite: SERVICE_SUITE,
+    operation: "rewrap_revision",
+    state: "rewrapped",
+    vaultId: value.vaultId,
+    objectId: value.objectId,
+    revision: value.revision,
+    epoch: value.epoch,
+    revisionId: copyBoundedBytes(value.revisionId, 32),
+    contentType: value.contentType,
+    plaintextLength: value.plaintextLength,
+    encodedRevision: copyBoundedBytes(
+      value.objectPayload,
+      MAXIMUM_CONTENT_OBJECT_REVISION_BYTES,
+    ),
+  });
 }
 
 function parseCommitGenesis(value: unknown): NativeCommitGenesisResult {
@@ -2855,7 +2929,12 @@ class NativeServiceClient implements PrivateVaultNativeServiceClient {
       return Promise.reject(new PrivateVaultNativeServiceClientError());
     let plaintext: Buffer;
     try {
-      plaintext = Buffer.from(copyBoundedBytes(input.plaintext, 1024 * 1024));
+      plaintext = Buffer.from(
+        copyBoundedBytes(
+          input.plaintext,
+          MAXIMUM_CONTENT_OBJECT_PLAINTEXT_BYTES,
+        ),
+      );
     } catch {
       return Promise.reject(new PrivateVaultNativeServiceClientError());
     }
@@ -2894,7 +2973,10 @@ class NativeServiceClient implements PrivateVaultNativeServiceClient {
     let encoded: Buffer;
     try {
       encoded = Buffer.from(
-        copyBoundedBytes(input.encodedRevision, 1024 * 1024 + 64 * 1024),
+        copyBoundedBytes(
+          input.encodedRevision,
+          MAXIMUM_CONTENT_OBJECT_REVISION_BYTES,
+        ),
       );
     } catch {
       return Promise.reject(new PrivateVaultNativeServiceClientError());
@@ -2913,6 +2995,42 @@ class NativeServiceClient implements PrivateVaultNativeServiceClient {
           "open_object",
           input,
         ) as NativeOpenedContentObjectResult;
+      } catch {
+        throw new PrivateVaultNativeServiceClientError();
+      } finally {
+        encoded.fill(0);
+      }
+    });
+  }
+
+  rewrapContentObjectRevision(
+    input: NativeRewrapContentObjectInput,
+  ): Promise<NativeRewrappedContentObjectResult> {
+    if (!isLowerHex(input.vaultId, 32) || !isLowerHex(input.objectId, 32))
+      return Promise.reject(new PrivateVaultNativeServiceClientError());
+    let encoded: Buffer;
+    try {
+      encoded = Buffer.from(
+        copyBoundedBytes(
+          input.encodedRevision,
+          MAXIMUM_CONTENT_OBJECT_REVISION_BYTES,
+        ),
+      );
+    } catch {
+      return Promise.reject(new PrivateVaultNativeServiceClientError());
+    }
+    return this.#enqueue(async () => {
+      try {
+        const addon = await this.#addon;
+        return parseRewrappedContentObjectResult(
+          await addon.request(
+            "rewrap_revision",
+            input.vaultId,
+            input.objectId,
+            encoded,
+          ),
+          input,
+        );
       } catch {
         throw new PrivateVaultNativeServiceClientError();
       } finally {

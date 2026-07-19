@@ -62,6 +62,7 @@ static AncPrivateVaultGenesisCoordinator *gGenesisCoordinator = nil;
 static AncPrivateVaultBootstrapReplay *gBootstrapReplay = nil;
 static NSLock *gBootstrapReplayLock = nil;
 static AncPrivateVaultRotationCoordinator *gRotationCoordinator = nil;
+static AncPrivateVaultRotationPreparationStore *gRotationPreparationStore = nil;
 static AncPrivateVaultHostedAppendTransport *gHostedAppendTransport = nil;
 static AncPrivateVaultHostedAppendCandidateIndex *gHostedAppendCandidates = nil;
 static AncPrivateVaultHostedAppendRetryCoordinator *gHostedAppendRetry = nil;
@@ -1907,14 +1908,13 @@ static void PVRefreshAuthority(xpc_connection_t peer, xpc_object_t message,
 static void PVRemoveEndpoint(xpc_connection_t peer, xpc_object_t message,
                              const PVRequest *request) {
     uint8_t vaultID[16] = {0}, targetEndpointID[16] = {0};
-    if (gRotationCoordinator == nil || gHostedAppendCandidates == nil ||
-        gHostedAppendRetry == nil || !PVDecodeVaultID(request->vaultID, vaultID) ||
+    if (gRotationCoordinator == nil ||
+        !PVDecodeVaultID(request->vaultID, vaultID) ||
         !PVDecodeVaultID(request->targetEndpointID, targetEndpointID)) {
         anc_pv_zeroize(vaultID, sizeof vaultID);
         anc_pv_zeroize(targetEndpointID, sizeof targetEndpointID);
         PVSendError(peer, message, "endpoint_removal_unavailable"); return;
     }
-    NSData *vaultBytes = [NSData dataWithBytes:vaultID length:sizeof vaultID];
     NSData *targetBytes = [NSData dataWithBytes:targetEndpointID length:sizeof targetEndpointID];
     AncPrivateVaultPreparedEndpointRemoval *prepared = nil;
     AncPrivateVaultRotationPreparationCheckpoint *checkpoint = nil;
@@ -1926,11 +1926,9 @@ static void PVRemoveEndpoint(xpc_connection_t peer, xpc_object_t message,
     anc_pv_zeroize(vaultID, sizeof vaultID);
     anc_pv_zeroize(targetEndpointID, sizeof targetEndpointID);
     if (status != AncPrivateVaultRotationCoordinatorStatusOK || prepared == nil ||
-        checkpoint == nil || [gHostedAppendCandidates markPendingVaultId:vaultBytes] !=
-            AncPrivateVaultHostedAppendCandidateStatusOK) {
+        checkpoint == nil) {
         PVSendError(peer, message, "endpoint_removal_failed"); return;
     }
-    [gHostedAppendRetry enqueueVaultId:vaultBytes];
     xpc_object_t reply = PVCreateReply(message, request);
     if (reply == NULL) return;
     xpc_dictionary_set_string(reply, "state", "pending");
@@ -2776,6 +2774,171 @@ static void PVOpenObject(xpc_connection_t peer, xpc_object_t message,
     }
 }
 
+static BOOL PVDeriveRotationRevisionBytes(uint8_t *output, size_t length,
+                                          const char *label,
+                                          NSData *encodedRevision,
+                                          const uint8_t pendingKey[32]) {
+    if (output == NULL || length == 0 || length > 32 || label == NULL ||
+        encodedRevision.length == 0 || pendingKey == NULL)
+        return NO;
+    uint8_t revisionHash[32] = {0}, digest[32] = {0};
+    BOOL okay =
+        anc_pv_blake2b_256(revisionHash, encodedRevision.bytes,
+                           encodedRevision.length) == ANC_PV_CRYPTO_OK;
+    NSMutableData *binding =
+        okay ? [NSMutableData dataWithBytes:label length:strlen(label) + 1]
+             : nil;
+    [binding appendBytes:revisionHash length:sizeof revisionHash];
+    okay = binding != nil &&
+        anc_pv_blake2b_256_keyed(digest, binding.bytes, binding.length,
+                                 pendingKey) == ANC_PV_CRYPTO_OK;
+    if (okay)
+        memcpy(output, digest, length);
+    anc_pv_zeroize(revisionHash, sizeof revisionHash);
+    anc_pv_zeroize(digest, sizeof digest);
+    anc_pv_zeroize(binding.mutableBytes, binding.length);
+    return okay;
+}
+
+static void PVRewrapRotationRevision(xpc_connection_t peer,
+                                     xpc_object_t message,
+                                     const PVRequest *request) {
+    @autoreleasepool {
+        NSString *vaultId = [NSString stringWithUTF8String:request->vaultID];
+        NSData *vaultBytes = PVLookupIDData(request->vaultID);
+        NSData *objectId = PVLookupIDData(request->objectID);
+        NSData *encoded =
+            request->objectPayload == NULL
+                ? nil
+                : [NSData dataWithBytes:request->objectPayload
+                                 length:request->objectPayloadLength];
+        AncPrivateVaultControlLogState *state = nil;
+        NSData *writerEndpointId = nil;
+        AncPrivateVaultGuardedMemory *signing = nil;
+        AncPrivateVaultGuardedMemory *baseEpochKey = nil;
+        BOOL endpointContext = vaultBytes != nil && objectId != nil &&
+            encoded != nil && gRotationPreparationStore != nil &&
+            PVObjectEndpointContext(vaultId, &state, &writerEndpointId,
+                                    &signing, &baseEpochKey);
+
+        AncPrivateVaultRotationPreparationCheckpoint *checkpoint = nil;
+        AncPrivateVaultRotationPreparationKeyHandle *preparationHandle = nil;
+        AncPrivateVaultRotationPreparationStoreStatus preparationStatus =
+            endpointContext
+                ? [gRotationPreparationStore readVaultId:vaultBytes.bytes
+                                              checkpoint:&checkpoint
+                                                  handle:&preparationHandle]
+                : AncPrivateVaultRotationPreparationStoreStatusInvalid;
+        AncPrivateVaultRotationPreparationSnapshot snapshot =
+            checkpoint == nil
+                ? (AncPrivateVaultRotationPreparationSnapshot){0}
+                : checkpoint.snapshot;
+        BOOL tupleValid =
+            preparationStatus == AncPrivateVaultRotationPreparationStoreStatusOK &&
+            preparationHandle != nil &&
+            snapshot.phase == ANC_PV_ROTATION_PREPARATION_PHASE_PREPARED &&
+            snapshot.role == ANC_PV_ROTATION_PREPARATION_ROLE_ENDPOINT &&
+            snapshot.base_sequence == state.sequence &&
+            snapshot.base_epoch == state.epoch &&
+            snapshot.pending_epoch == state.epoch + 1 &&
+            anc_pv_memcmp(snapshot.vault_id, vaultBytes.bytes, 16) ==
+                ANC_PV_CRYPTO_OK &&
+            anc_pv_memcmp(snapshot.endpoint_id, writerEndpointId.bytes, 16) ==
+                ANC_PV_CRYPTO_OK &&
+            anc_pv_memcmp(snapshot.base_head, state.headHash.bytes, 32) ==
+                ANC_PV_CRYPTO_OK &&
+            anc_pv_memcmp(snapshot.base_membership,
+                          state.membershipHash.bytes, 32) == ANC_PV_CRYPTO_OK;
+
+        AncPrivateVaultGuardedMemoryStatus memoryStatus;
+        AncPrivateVaultGuardedMemory *targetEpochKey =
+            tupleValid
+                ? [AncPrivateVaultGuardedMemory memoryWithLength:32
+                                                          status:&memoryStatus]
+                : nil;
+        __block BOOL copied = NO;
+        NSMutableData *dekEnvelopeBytes = [NSMutableData dataWithLength:16];
+        NSMutableData *headerEnvelopeBytes =
+            [NSMutableData dataWithLength:16];
+        NSMutableData *dekNonceBytes = [NSMutableData dataWithLength:24];
+        if (targetEpochKey != nil) {
+            preparationStatus = [preparationHandle borrow:^BOOL(
+                const uint8_t *pendingKey) {
+                BOOL derived =
+                    PVDeriveRotationRevisionBytes(
+                        dekEnvelopeBytes.mutableBytes, dekEnvelopeBytes.length,
+                        "rotation/rewrap/dek-envelope", encoded, pendingKey) &&
+                    PVDeriveRotationRevisionBytes(
+                        headerEnvelopeBytes.mutableBytes,
+                        headerEnvelopeBytes.length,
+                        "rotation/rewrap/header-envelope", encoded,
+                        pendingKey) &&
+                    PVDeriveRotationRevisionBytes(
+                        dekNonceBytes.mutableBytes, dekNonceBytes.length,
+                        "rotation/rewrap/dek-nonce", encoded, pendingKey);
+                return derived &&
+                    [targetEpochKey borrow:^BOOL(uint8_t *bytes,
+                                                 size_t length) {
+                        if (length != 32) return NO;
+                        memcpy(bytes, pendingKey, 32);
+                        copied = YES;
+                        return YES;
+                    }] == AncPrivateVaultGuardedMemoryStatusOK && copied;
+            }];
+        }
+        AncPrivateVaultObjectRevisionStatus objectStatus;
+        AncPrivateVaultSealedObjectRevision *rewrapped =
+            copied && preparationStatus ==
+                          AncPrivateVaultRotationPreparationStoreStatusOK
+                ? AncPrivateVaultRewrapObjectRevision(
+                      encoded, vaultBytes, objectId, writerEndpointId,
+                      snapshot.pending_epoch, dekEnvelopeBytes,
+                      headerEnvelopeBytes, dekNonceBytes, state, signing,
+                      baseEpochKey, targetEpochKey, &objectStatus)
+                : nil;
+        anc_pv_zeroize(dekEnvelopeBytes.mutableBytes, dekEnvelopeBytes.length);
+        anc_pv_zeroize(headerEnvelopeBytes.mutableBytes,
+                       headerEnvelopeBytes.length);
+        anc_pv_zeroize(dekNonceBytes.mutableBytes, dekNonceBytes.length);
+        AncPrivateVaultRotationPreparationStoreStatus preparationClosed =
+            preparationHandle == nil
+                ? AncPrivateVaultRotationPreparationStoreStatusInvalid
+                : [preparationHandle close];
+        BOOL signingClosed = signing != nil &&
+            [signing close] == AncPrivateVaultGuardedMemoryStatusOK;
+        BOOL baseClosed = baseEpochKey != nil &&
+            [baseEpochKey close] == AncPrivateVaultGuardedMemoryStatusOK;
+        BOOL targetClosed = targetEpochKey != nil &&
+            [targetEpochKey close] == AncPrivateVaultGuardedMemoryStatusOK;
+        anc_pv_rotation_preparation_snapshot_zero(&snapshot);
+        if (rewrapped == nil ||
+            preparationClosed !=
+                AncPrivateVaultRotationPreparationStoreStatusOK ||
+            !signingClosed || !baseClosed || !targetClosed) {
+            PVSendError(peer, message, "rotation_rewrap_failed");
+            return;
+        }
+        xpc_object_t reply = PVCreateReply(message, request);
+        if (reply == NULL) return;
+        xpc_dictionary_set_string(reply, "state", "rewrapped");
+        xpc_dictionary_set_string(reply, "vaultId", request->vaultID);
+        xpc_dictionary_set_string(reply, "objectId", request->objectID);
+        xpc_dictionary_set_uint64(reply, "revision", rewrapped.revision);
+        xpc_dictionary_set_uint64(reply, "epoch", rewrapped.epoch);
+        xpc_dictionary_set_data(reply, "revisionId",
+                                rewrapped.revisionId.bytes,
+                                rewrapped.revisionId.length);
+        xpc_dictionary_set_string(reply, "contentType",
+                                  rewrapped.contentType.UTF8String);
+        xpc_dictionary_set_uint64(reply, "plaintextLength",
+                                  rewrapped.plaintextLength);
+        xpc_dictionary_set_data(reply, "objectPayload",
+                                rewrapped.encodedRevision.bytes,
+                                rewrapped.encodedRevision.length);
+        xpc_connection_send_message(peer, reply);
+    }
+}
+
 static void PVChallengeEnrollment(xpc_connection_t peer, xpc_object_t message,
                                   const PVRequest *request) {
     @autoreleasepool {
@@ -3513,6 +3676,10 @@ static void PVHandleMessage(xpc_connection_t peer, xpc_object_t message) {
                 PVOpenObject(peer, message, &request);
                 return;
             }
+            if (strcmp(request.operation, "rewrap_revision") == 0) {
+                PVRewrapRotationRevision(peer, message, &request);
+                return;
+            }
             if (strcmp(request.operation, "accept_bootstrap") == 0) {
                 PVAcceptBootstrap(peer, message, &request);
                 return;
@@ -3662,6 +3829,7 @@ int main(void) {
             [[AncPrivateVaultRotationPreparationStore alloc]
                 initWithKeychain:keychain
                            spool:spool];
+        gRotationPreparationStore = preparation;
         AncPrivateVaultAuthorityStore *authority =
             [[AncPrivateVaultAuthorityStore alloc]
                 initWithStateRootURL:stateRoot

@@ -55,6 +55,7 @@ describe("Private Vault Content object runtime", () => {
         encodedRevision,
       })),
       openContentObjectRevision: vi.fn(),
+      rewrapContentObjectRevision: vi.fn(),
     };
     const hosted = transport();
     const runtime = new PrivateVaultContentObjectRuntime(native);
@@ -95,6 +96,7 @@ describe("Private Vault Content object runtime", () => {
         encodedRevision,
       })),
       openContentObjectRevision: vi.fn(),
+      rewrapContentObjectRevision: vi.fn(),
     };
     const hosted = transport();
     let uploaded = new Uint8Array();
@@ -163,6 +165,7 @@ describe("Private Vault Content object runtime", () => {
     const native = {
       sealContentObjectRevision: vi.fn(),
       openContentObjectRevision: vi.fn(async () => opened),
+      rewrapContentObjectRevision: vi.fn(),
     };
     const hosted = transport();
     const runtime = new PrivateVaultContentObjectRuntime(native);
@@ -195,5 +198,122 @@ describe("Private Vault Content object runtime", () => {
       }),
     ).rejects.toThrow("object binding failed");
     expect(rejectedBytes).toEqual(new Uint8Array(rejectedBytes.byteLength));
+  });
+
+  it("returns one rewrapped encrypted revision only after metadata binding", async () => {
+    const encodedRevision = Uint8Array.of(0xa4, 4, 5, 6);
+    const native = {
+      sealContentObjectRevision: vi.fn(),
+      openContentObjectRevision: vi.fn(),
+      rewrapContentObjectRevision: vi.fn(async () => ({
+        version: 1 as const,
+        suite: "anc/v1" as const,
+        operation: "rewrap_revision" as const,
+        state: "rewrapped" as const,
+        vaultId,
+        objectId,
+        revision: 3,
+        epoch: 8,
+        revisionId: Buffer.from(revisionId, "hex"),
+        contentType:
+          "application/vnd.agent-native.content-document+json" as const,
+        plaintextLength: 16,
+        encodedRevision,
+      })),
+    };
+    const runtime = new PrivateVaultContentObjectRuntime(native);
+    const source = Uint8Array.of(0xa4, 1, 2, 3);
+
+    const result = await runtime.rewrapRevisionForPreparedRotation({
+      vaultId,
+      objectId,
+      revision: 3,
+      epoch: 7,
+      objectType: "document",
+      encodedRevision: source,
+    });
+    expect(native.rewrapContentObjectRevision).toHaveBeenCalledWith({
+      vaultId,
+      objectId,
+      encodedRevision: source,
+    });
+    expect(result).toEqual({
+      revisionId,
+      revision: 3,
+      epoch: 8,
+      objectType: "document",
+      plaintextLength: 16,
+      ciphertext: Uint8Array.of(0xa4, 4, 5, 6),
+      ciphertextHash: createHash("sha256")
+        .update(Uint8Array.of(0xa4, 4, 5, 6))
+        .digest("hex"),
+      ciphertextByteLength: 4,
+    });
+    expect(encodedRevision).toEqual(new Uint8Array(4));
+  });
+
+  it("fails closed when native rewrap metadata does not match the source", async () => {
+    const base = {
+      version: 1 as const,
+      suite: "anc/v1" as const,
+      operation: "rewrap_revision" as const,
+      state: "rewrapped" as const,
+      vaultId,
+      objectId,
+      revision: 3,
+      epoch: 8,
+      revisionId: Buffer.from(revisionId, "hex"),
+      contentType:
+        "application/vnd.agent-native.content-document+json" as const,
+      plaintextLength: 16,
+    };
+    for (const mutation of [
+      { revision: 4 },
+      { epoch: 7 },
+      {
+        contentType:
+          "application/vnd.agent-native.content-vault-manifest+json" as const,
+      },
+    ]) {
+      const encodedRevision = Uint8Array.of(0xa4, 4, 5, 6);
+      const runtime = new PrivateVaultContentObjectRuntime({
+        sealContentObjectRevision: vi.fn(),
+        openContentObjectRevision: vi.fn(),
+        rewrapContentObjectRevision: vi.fn(async () => ({
+          ...base,
+          ...mutation,
+          encodedRevision,
+        })),
+      });
+      await expect(
+        runtime.rewrapRevisionForPreparedRotation({
+          vaultId,
+          objectId,
+          revision: 3,
+          epoch: 7,
+          objectType: "document",
+          encodedRevision: Uint8Array.of(0xa4, 1, 2, 3),
+        }),
+      ).rejects.toThrow("object rewrap binding failed");
+      expect(encodedRevision).toEqual(new Uint8Array(4));
+    }
+
+    const native = {
+      sealContentObjectRevision: vi.fn(),
+      openContentObjectRevision: vi.fn(),
+      rewrapContentObjectRevision: vi.fn(),
+    };
+    const runtime = new PrivateVaultContentObjectRuntime(native);
+    await expect(
+      runtime.rewrapRevisionForPreparedRotation({
+        vaultId,
+        objectId,
+        revision: 3,
+        epoch: 0,
+        objectType: "document",
+        encodedRevision: Uint8Array.of(1),
+      }),
+    ).rejects.toThrow("object rewrap binding failed");
+    expect(native.rewrapContentObjectRevision).not.toHaveBeenCalled();
   });
 });

@@ -47,6 +47,8 @@ describe("Private Vault native service client", () => {
     expect(webviewPreloadSource).not.toContain("openObject");
     expect(webviewPreloadSource).not.toContain("SEAL_OBJECT");
     expect(webviewPreloadSource).not.toContain("OPEN_OBJECT");
+    expect(webviewPreloadSource).not.toContain("rewrapContentObjectRevision");
+    expect(webviewPreloadSource).not.toContain("rewrap_revision");
   });
 
   it("normalizes the exact health, lock, and unlock service contracts", async () => {
@@ -624,6 +626,125 @@ describe("Private Vault native service client", () => {
       }),
     ).rejects.toEqual(new PrivateVaultNativeServiceClientError());
     expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("rewraps one sealed revision through the exact native rotation boundary", async () => {
+    const vaultId = "00112233445566778899aabbccddeeff";
+    const objectId = "11223344556677889900aabbccddeeff";
+    const source = Uint8Array.from([0xa4, 1, 2, 3]);
+    const resultBytes = Buffer.from([0xa4, 4, 5, 6]);
+    let transferred: Buffer | undefined;
+    const request = vi.fn(async (...arguments_: unknown[]) => {
+      transferred = arguments_[3] as Buffer;
+      return {
+        version: 3,
+        operation: "rewrap_revision",
+        state: "rewrapped",
+        vaultId,
+        objectId,
+        contentType: "application/vnd.agent-native.content-document+json",
+        revision: 3,
+        epoch: 8,
+        plaintextLength: 16,
+        revisionId: Buffer.alloc(32, 9),
+        objectPayload: resultBytes,
+      };
+    });
+    const client = createPrivateVaultNativeServiceClientForTest(async () => ({
+      request,
+    }));
+
+    const rewrapped = await client.rewrapContentObjectRevision({
+      vaultId,
+      objectId,
+      encodedRevision: source,
+    });
+    expect(rewrapped).toMatchObject({
+      operation: "rewrap_revision",
+      state: "rewrapped",
+      vaultId,
+      objectId,
+      revision: 3,
+      epoch: 8,
+      plaintextLength: 16,
+    });
+    expect(rewrapped.encodedRevision).toEqual(Uint8Array.from(resultBytes));
+    expect(request).toHaveBeenCalledWith(
+      "rewrap_revision",
+      vaultId,
+      objectId,
+      expect.any(Buffer),
+    );
+    expect(source).toEqual(Uint8Array.from([0xa4, 1, 2, 3]));
+    expect(transferred).toEqual(Buffer.alloc(4));
+
+    await expect(
+      client.rewrapContentObjectRevision({
+        vaultId: vaultId.toUpperCase(),
+        objectId,
+        encodedRevision: source,
+      }),
+    ).rejects.toEqual(new PrivateVaultNativeServiceClientError());
+    await expect(
+      client.rewrapContentObjectRevision({
+        vaultId,
+        objectId,
+        encodedRevision: new Uint8Array(1024 * 1024 + 64 * 1024 + 1),
+      }),
+    ).rejects.toEqual(new PrivateVaultNativeServiceClientError());
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it("rejects substituted or malformed native rewrap replies", async () => {
+    const vaultId = "00112233445566778899aabbccddeeff";
+    const objectId = "11223344556677889900aabbccddeeff";
+    const reply = {
+      version: 3,
+      operation: "rewrap_revision",
+      state: "rewrapped",
+      vaultId,
+      objectId,
+      contentType: "application/vnd.agent-native.content-document+json",
+      revision: 3,
+      epoch: 8,
+      plaintextLength: 16,
+      revisionId: Buffer.alloc(32, 9),
+      objectPayload: Buffer.from([0xa4, 4, 5, 6]),
+    };
+    const mutations = [
+      { vaultId: "ff".repeat(16) },
+      { objectId: "ee".repeat(16) },
+      { revision: 0 },
+      { epoch: 0 },
+      { contentType: "text/plain" },
+      { plaintextLength: 1024 * 1024 + 1 },
+      { revisionId: Buffer.alloc(31) },
+      { objectPayload: new Uint8Array() },
+      { plaintext: Buffer.from("forbidden") },
+    ];
+    for (const mutation of mutations) {
+      const client = clientFor({ ...reply, ...mutation });
+      await expect(
+        client.rewrapContentObjectRevision({
+          vaultId,
+          objectId,
+          encodedRevision: Uint8Array.of(1),
+        }),
+      ).rejects.toEqual(new PrivateVaultNativeServiceClientError());
+    }
+
+    const unavailable = createPrivateVaultNativeServiceClientForTest(
+      async () => {
+        throw new Error("transport detail");
+      },
+    );
+    await expect(
+      unavailable.rewrapContentObjectRevision({
+        vaultId,
+        objectId,
+        encodedRevision: Uint8Array.of(1),
+      }),
+    ).rejects.toEqual(new PrivateVaultNativeServiceClientError());
   });
 
   it("issues requester grants only through the native vault boundary", async () => {

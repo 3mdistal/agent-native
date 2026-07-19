@@ -226,6 +226,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
     bool enrollmentBootstrap = strcmp(operation, "enroll_page") == 0;
     bool sealObject = strcmp(operation, "seal_object") == 0;
     bool openObject = strcmp(operation, "open_object") == 0;
+    bool rewrapRevision = strcmp(operation, "rewrap_revision") == 0;
     bool sealJobObject = strcmp(operation, "seal_job_object") == 0;
     bool openJobObject = strcmp(operation, "open_job_object") == 0;
     bool sealExport = strcmp(operation, "seal_export") == 0;
@@ -242,7 +243,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
         !inspectEnrollment && !decideEnrollment && !authorizeEnrollment &&
         !activateEnrollment && !verifyManifest && !enrollmentBootstrap && !sealObject &&
         !openObject && !sealJobObject &&
-        !openJobObject && !sealExport && !openExport) {
+        !openJobObject && !rewrapRevision && !sealExport && !openExport) {
         return PVRequestUnsupportedOperation;
     }
 
@@ -433,6 +434,25 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
         request->grantRef = grantRef;
         request->recipientEndpointID = recipient;
         request->expiresAt = (uint64_t)expires;
+    } else if (rewrapRevision) {
+        xpc_object_t objectIDValue =
+            xpc_dictionary_get_value(message, "objectId");
+        const char *objectID =
+            objectIDValue != NULL &&
+                    xpc_get_type(objectIDValue) == XPC_TYPE_STRING
+                ? xpc_dictionary_get_string(message, "objectId")
+                : NULL;
+        if (fieldCount != 6 || vaultIDValue == NULL ||
+            xpc_get_type(vaultIDValue) != XPC_TYPE_STRING ||
+            !PVIsVaultID(xpc_dictionary_get_string(message, "vaultId")) ||
+            !PVIsLowerHex(objectID, 32) ||
+            !PVReadBoundedData(message, "objectPayload",
+                               PV_OBJECT_REVISION_MAXIMUM_BYTES,
+                               &request->objectPayload,
+                               &request->objectPayloadLength)) {
+            return PVRequestInvalid;
+        }
+        request->objectID = objectID;
     } else if (sealObject || openObject || sealJobObject || openJobObject) {
         bool sealing = sealObject || sealJobObject;
         bool jobBound = sealJobObject || openJobObject;

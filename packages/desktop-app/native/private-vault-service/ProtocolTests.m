@@ -695,6 +695,28 @@ int main(void) {
          parsed.objectPayloadLength == sizeof objectCiphertext);
   xpc_release(openObject);
 
+  xpc_object_t rewrapRevision = PVMakeRequest(
+      PV_PROTOCOL_VERSION, "rewrap_revision", "request-rewrap-revision");
+  xpc_dictionary_set_string(rewrapRevision, "vaultId", enrollmentVault);
+  xpc_dictionary_set_string(rewrapRevision, "objectId", objectID);
+  xpc_dictionary_set_data(rewrapRevision, "objectPayload", objectCiphertext,
+                          sizeof objectCiphertext);
+  assert(PVParseRequest(rewrapRevision, &parsed) == PVRequestValid &&
+         strcmp(parsed.objectID, objectID) == 0 &&
+         parsed.objectRevision == 0 && parsed.objectContentType == NULL &&
+         parsed.objectPayloadLength == sizeof objectCiphertext);
+  xpc_release(rewrapRevision);
+
+  xpc_object_t forgedRewrap = PVMakeRequest(
+      PV_PROTOCOL_VERSION, "rewrap_revision", "request-forged-rewrap");
+  xpc_dictionary_set_string(forgedRewrap, "vaultId", enrollmentVault);
+  xpc_dictionary_set_string(forgedRewrap, "objectId", objectID);
+  xpc_dictionary_set_int64(forgedRewrap, "revision", 4);
+  xpc_dictionary_set_data(forgedRewrap, "objectPayload", objectCiphertext,
+                          sizeof objectCiphertext);
+  assert(PVParseRequest(forgedRewrap, &parsed) == PVRequestInvalid);
+  xpc_release(forgedRewrap);
+
   const char *objectJobID = "ffeeddccbbaa99887766554433221100";
   const char *objectJobHash =
       "abababababababababababababababababababababababababababababababab";
