@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 
 import {
   ANC_ROTATION_EVIDENCE_SIZE_LIMITS,
+  ANC_V1_CONTROL_LOG_APPEND_RECEIPT_MAX_BYTES,
   ancV1BytesToHex,
   ancV1Hash,
   encodeEndpointRequestUnsignedProof,
@@ -44,6 +45,8 @@ export interface PrivateVaultRotationEvidenceCollection {
   readonly ceremonyId: string;
   readonly phase: RotationEvidencePhase;
   readonly expectedRecipientCount: number;
+  readonly hostedReceipt: Uint8Array | null;
+  readonly completionAttestation: Uint8Array | null;
   readonly recipients: readonly Readonly<{
     recipientEndpointId: string;
     acknowledgement: Uint8Array | null;
@@ -191,6 +194,7 @@ export class PrivateVaultContentRotationEvidenceTransport {
       "/api/private-vault/rotation-evidence/checkpoint",
       bytes(checkpoint, ANC_ROTATION_EVIDENCE_SIZE_LIMITS.checkpointBytes),
       "endpoint",
+      ["collecting_offers"],
     );
   }
 
@@ -201,6 +205,7 @@ export class PrivateVaultContentRotationEvidenceTransport {
       "/api/private-vault/rotation-evidence/offer",
       bytes(offer, ANC_ROTATION_EVIDENCE_SIZE_LIMITS.offerBytes),
       "endpoint",
+      ["collecting_offers", "awaiting_acknowledgements"],
       wrap,
     ).finally(() => wrap.fill(0));
   }
@@ -256,6 +261,7 @@ export class PrivateVaultContentRotationEvidenceTransport {
         ANC_ROTATION_EVIDENCE_SIZE_LIMITS.acknowledgementBytes,
       ),
       "either",
+      ["awaiting_acknowledgements", "awaiting_destructions"],
     );
   }
 
@@ -270,6 +276,40 @@ export class PrivateVaultContentRotationEvidenceTransport {
       this.#recipientPath(ceremonyId, recipientEndpointId, "destruction"),
       bytes(destruction, ANC_ROTATION_EVIDENCE_SIZE_LIMITS.destructionBytes),
       "either",
+      ["awaiting_destructions", "awaiting_hosted_receipt"],
+    );
+  }
+
+  appendHostedReceipt(
+    vaultId: string,
+    ceremonyId: string,
+    hostedReceipt: Uint8Array,
+  ) {
+    identifier(ceremonyId);
+    return this.#write(
+      vaultId,
+      `/api/private-vault/rotation-evidence/${ceremonyId}/hosted-receipt`,
+      bytes(hostedReceipt, ANC_V1_CONTROL_LOG_APPEND_RECEIPT_MAX_BYTES),
+      "endpoint",
+      ["awaiting_completion", "completed"],
+    );
+  }
+
+  appendCompletionAttestation(
+    vaultId: string,
+    ceremonyId: string,
+    completionAttestation: Uint8Array,
+  ) {
+    identifier(ceremonyId);
+    return this.#write(
+      vaultId,
+      `/api/private-vault/rotation-evidence/${ceremonyId}/completion-attestation`,
+      bytes(
+        completionAttestation,
+        ANC_ROTATION_EVIDENCE_SIZE_LIMITS.completionBytes,
+      ),
+      "endpoint",
+      ["completed"],
     );
   }
 
@@ -289,6 +329,8 @@ export class PrivateVaultContentRotationEvidenceTransport {
         "ceremonyId",
         "phase",
         "expectedRecipientCount",
+        "hostedReceipt",
+        "completionAttestation",
         "recipients",
       ]) ||
       value.ceremonyId !== ceremonyId ||
@@ -297,6 +339,14 @@ export class PrivateVaultContentRotationEvidenceTransport {
       throw new PrivateVaultRotationEvidenceTransportError();
     const expectedRecipientCount = count(value.expectedRecipientCount);
     const evidencePhase = phase(value.phase);
+    const hostedReceipt = decoded(
+      value.hostedReceipt,
+      ANC_V1_CONTROL_LOG_APPEND_RECEIPT_MAX_BYTES,
+    );
+    const completionAttestation = decoded(
+      value.completionAttestation,
+      ANC_ROTATION_EVIDENCE_SIZE_LIMITS.completionBytes,
+    );
     if (value.recipients.length > expectedRecipientCount)
       throw new PrivateVaultRotationEvidenceTransportError();
     const seen = new Set<string>();
@@ -359,13 +409,24 @@ export class PrivateVaultContentRotationEvidenceTransport {
       ((evidencePhase === "awaiting_hosted_receipt" ||
         evidencePhase === "awaiting_completion" ||
         evidencePhase === "completed") &&
-        (!allAcknowledged || !allDestroyed))
+        (!allAcknowledged || !allDestroyed)) ||
+      ((evidencePhase === "collecting_offers" ||
+        evidencePhase === "awaiting_acknowledgements" ||
+        evidencePhase === "awaiting_destructions" ||
+        evidencePhase === "awaiting_hosted_receipt") &&
+        (hostedReceipt !== null || completionAttestation !== null)) ||
+      (evidencePhase === "awaiting_completion" &&
+        (hostedReceipt === null || completionAttestation !== null)) ||
+      (evidencePhase === "completed" &&
+        (hostedReceipt === null || completionAttestation === null))
     )
       throw new PrivateVaultRotationEvidenceTransportError();
     return Object.freeze({
       ceremonyId,
       phase: evidencePhase,
       expectedRecipientCount,
+      hostedReceipt,
+      completionAttestation,
       recipients: Object.freeze(recipients),
     });
   }
@@ -385,9 +446,15 @@ export class PrivateVaultContentRotationEvidenceTransport {
     path: string,
     body: Uint8Array,
     role: "endpoint" | "either",
+    allowedPhases: readonly RotationEvidencePhase[],
     eekWrap?: Uint8Array,
   ) {
-    return writeStatus(await this.#request(vaultId, path, body, role, eekWrap));
+    const status = writeStatus(
+      await this.#request(vaultId, path, body, role, eekWrap),
+    );
+    if (!allowedPhases.includes(status.phase))
+      throw new PrivateVaultRotationEvidenceTransportError();
+    return status;
   }
 
   async #request(

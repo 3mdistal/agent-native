@@ -141,6 +141,8 @@ describe("signed Desktop rotation evidence transport", () => {
             ceremonyId,
             phase: "awaiting_hosted_receipt",
             expectedRecipientCount: 1,
+            hostedReceipt: null,
+            completionAttestation: null,
             recipients: [
               {
                 recipientEndpointId,
@@ -157,6 +159,8 @@ describe("signed Desktop rotation evidence transport", () => {
     ).resolves.toMatchObject({
       ceremonyId,
       phase: "awaiting_hosted_receipt",
+      hostedReceipt: null,
+      completionAttestation: null,
       recipients: [
         {
           recipientEndpointId,
@@ -165,6 +169,43 @@ describe("signed Desktop rotation evidence transport", () => {
         },
       ],
     });
+  });
+
+  it("uploads the exact hosted receipt and completion on their post-commit paths", async () => {
+    const source = fixture({
+      response: (url) =>
+        json(
+          {
+            state: "stored",
+            ceremonyId,
+            phase: url.endsWith("/completion-attestation")
+              ? "completed"
+              : "awaiting_completion",
+            expectedRecipientCount: 1,
+          },
+          url,
+        ),
+    });
+    await source.transport.appendHostedReceipt(
+      vaultId,
+      ceremonyId,
+      Uint8Array.of(9),
+    );
+    await source.transport.appendCompletionAttestation(
+      vaultId,
+      ceremonyId,
+      Uint8Array.of(10),
+    );
+    expect(proof(source.fetch.mock.calls[0]!).path).toBe(
+      `/api/private-vault/rotation-evidence/${ceremonyId}/hosted-receipt`,
+    );
+    expect(proof(source.fetch.mock.calls[1]!).path).toBe(
+      `/api/private-vault/rotation-evidence/${ceremonyId}/completion-attestation`,
+    );
+    expect(source.capturedBodies).toEqual([
+      Uint8Array.of(9),
+      Uint8Array.of(10),
+    ]);
   });
 
   it("rejects role confusion, duplicate recipients, and redirected responses", async () => {
@@ -180,6 +221,8 @@ describe("signed Desktop rotation evidence transport", () => {
             ceremonyId,
             phase: "awaiting_acknowledgements",
             expectedRecipientCount: 2,
+            hostedReceipt: null,
+            completionAttestation: null,
             recipients: [
               {
                 recipientEndpointId,
