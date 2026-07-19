@@ -15,6 +15,7 @@ SOURCES=(
   "$SOURCE_ROOT/control/PrivateVaultBrokerReplacementApproval.m"
   "$SOURCE_ROOT/control/PrivateVaultEndpointRequest.m"
   "$SOURCE_ROOT/control/PrivateVaultEndpointRemovalBuilder.m"
+  "$SOURCE_ROOT/control/PrivateVaultRotationEvidence.m"
   "$SOURCE_ROOT/control/PrivateVaultEnrollmentOffer.m"
   "$SOURCE_ROOT/control/PrivateVaultEnrollmentChallenge.m"
   "$SOURCE_ROOT/control/PrivateVaultEnrollmentAuthorizer.m"

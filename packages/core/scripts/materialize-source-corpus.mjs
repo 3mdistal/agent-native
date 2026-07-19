@@ -136,6 +136,9 @@ function shouldSkipFile(name) {
 function isNativeTestVectorArtifact(relativePath) {
   const normalized = relativePath.split("\\").join("/");
   return (
+    /(?:^|\/)materialize-rotation-evidence-native-fixture\.ts$/.test(
+      normalized,
+    ) ||
     /(?:^|\/)native-(?:control-log|authority-store|recovery-wrap|genesis-bootstrap|genesis-authorization|rotation-preparation)-vectors\.ts$/.test(
       normalized,
     ) ||
