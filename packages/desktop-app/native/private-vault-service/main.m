@@ -16,6 +16,7 @@
 #import "PrivateVaultEnrollmentChallenge.h"
 #import "PrivateVaultEnrollmentAuthorizer.h"
 #import "PrivateVaultEnrollmentAuthorization.h"
+#import "PrivateVaultManifestCheckpoint.h"
 #import "PrivateVaultGenesisBootstrap.h"
 #import "PrivateVaultGenesisAccountAdmission.h"
 #import "PrivateVaultKeychain.h"
@@ -1264,6 +1265,21 @@ static NSData *PVEnrollmentRandom(NSUInteger length) {
         return nil;
     }
     return [NSData dataWithData:value];
+}
+
+static NSData *PVManifestCiphertextHash(NSData *encodedRevision) {
+    if (encodedRevision.length == 0 ||
+        encodedRevision.length > PV_OBJECT_REVISION_MAXIMUM_BYTES)
+        return nil;
+    static const uint8_t empty = 0;
+    uint8_t digest[32] = {0};
+    int result = anc_pv_blake2b_256_two_part(
+        digest, &empty, 0, encodedRevision.bytes, encodedRevision.length);
+    NSData *value = result == ANC_PV_CRYPTO_OK
+                        ? [NSData dataWithBytes:digest length:sizeof digest]
+                        : nil;
+    anc_pv_zeroize(digest, sizeof digest);
+    return value;
 }
 
 static BOOL PVEnrollmentEndpointSecrets(
@@ -2857,6 +2873,11 @@ static void PVAuthorizeEnrollment(xpc_connection_t peer, xpc_object_t message,
                 ? nil
                 : [NSData dataWithBytes:request->enrollmentSasDecision
                                   length:request->enrollmentSasDecisionLength];
+        NSData *manifestRevision =
+            request->objectPayload == NULL
+                ? nil
+                : [NSData dataWithBytes:request->objectPayload
+                                  length:request->objectPayloadLength];
         AncPrivateVaultControlLogState *state = nil;
         uint64_t signedAt = 0;
         uint64_t now = (uint64_t)floor(NSDate.date.timeIntervalSince1970);
@@ -2907,13 +2928,44 @@ static void PVAuthorizeEnrollment(xpc_connection_t peer, xpc_object_t message,
                       offerBytes, challenge, receipt, state, signing,
                       agreement, epoch, authorizationId, endpointId, wrapId,
                       wrapNonce, entryId, now, signedAt, now, expires, &status);
+        AncPrivateVaultObjectRevisionStatus objectStatus;
+        AncPrivateVaultOpenedObjectRevision *openedManifest =
+            prepared == nil || manifestRevision == nil
+                ? nil
+                : AncPrivateVaultOpenObjectRevision(
+                      manifestRevision, PVLookupIDData(request->vaultID), nil,
+                      state, epoch, &objectStatus);
+        NSData *ciphertextHash = PVManifestCiphertextHash(manifestRevision);
+        NSData *checkpointId = PVEnrollmentRandom(16);
+        NSData *bindingId = PVEnrollmentRandom(16);
+        __block AncPrivateVaultManifestCheckpointBundle *manifestBundle = nil;
+        __block AncPrivateVaultManifestCheckpointStatus manifestStatus =
+            AncPrivateVaultManifestCheckpointStatusInvalid;
+        AncPrivateVaultGuardedMemoryStatus borrowed =
+            openedManifest == nil ||
+                    ![openedManifest.contentType
+                        isEqualToString:@"application/vnd.agent-native.content-vault-manifest+json"] ||
+                    ciphertextHash == nil || checkpointId == nil ||
+                    bindingId == nil
+                ? AncPrivateVaultGuardedMemoryStatusInvalid
+                : [signing borrow:^BOOL(uint8_t *seed, size_t length) {
+                    if (length != 32) return NO;
+                    manifestBundle = AncPrivateVaultBuildManifestCheckpoint(
+                        prepared.verifiedAuthorization, state,
+                        openedManifest.objectId, openedManifest.revisionId,
+                        openedManifest.revision, ciphertextHash, checkpointId,
+                        bindingId, now, now, expires, seed, &manifestStatus);
+                    return manifestBundle != nil;
+                }];
         BOOL signingClosed =
             [signing close] == AncPrivateVaultGuardedMemoryStatusOK;
         BOOL agreementClosed =
             [agreement close] == AncPrivateVaultGuardedMemoryStatusOK;
         BOOL epochClosed = [epoch close] == AncPrivateVaultGuardedMemoryStatusOK;
         BOOL closed = signingClosed && agreementClosed && epochClosed;
-        if (prepared == nil || !closed) {
+        if (prepared == nil || openedManifest == nil ||
+            manifestBundle == nil ||
+            borrowed != AncPrivateVaultGuardedMemoryStatusOK || !closed) {
             PVSendError(peer, message, "enrollment_failed");
             return;
         }
@@ -2924,6 +2976,12 @@ static void PVAuthorizeEnrollment(xpc_connection_t peer, xpc_object_t message,
         xpc_dictionary_set_data(reply, "authorization",
                                 prepared.encodedAuthorization.bytes,
                                 prepared.encodedAuthorization.length);
+        xpc_dictionary_set_data(reply, "manifestCheckpoint",
+                                manifestBundle.encodedCheckpoint.bytes,
+                                manifestBundle.encodedCheckpoint.length);
+        xpc_dictionary_set_data(reply, "manifestAuthorization",
+                                manifestBundle.encodedAuthorization.bytes,
+                                manifestBundle.encodedAuthorization.length);
         xpc_connection_send_message(peer, reply);
     }
 }
@@ -3092,6 +3150,114 @@ static void PVDecideEnrollment(xpc_connection_t peer, xpc_object_t message,
                                   confirmed ? "confirmed" : "mismatch");
         xpc_dictionary_set_data(reply, "sasDecision", receipt.encodedReceipt.bytes,
                                 receipt.encodedReceipt.length);
+        xpc_connection_send_message(peer, reply);
+    }
+}
+
+static void PVVerifyEnrollmentManifest(xpc_connection_t peer,
+                                       xpc_object_t message,
+                                       const PVRequest *request) {
+    @autoreleasepool {
+        NSString *vaultId = [NSString stringWithUTF8String:request->vaultID];
+        AncPrivateVaultEnrollmentOfferArtifact *artifact = nil;
+        AncPrivateVaultControlLogState *state = nil;
+        uint64_t signedAt = 0;
+        uint64_t now = (uint64_t)floor(NSDate.date.timeIntervalSince1970);
+        NSData *challenge = [NSData dataWithBytes:request->enrollmentChallenge
+                                          length:request->enrollmentChallengeLength];
+        NSData *authorization = [NSData dataWithBytes:request->enrollmentAuthorization
+                                              length:request->enrollmentAuthorizationLength];
+        NSData *checkpoint = [NSData dataWithBytes:request->manifestCheckpoint
+                                           length:request->manifestCheckpointLength];
+        NSData *binding = [NSData dataWithBytes:request->manifestAuthorization
+                                        length:request->manifestAuthorizationLength];
+        NSData *manifestRevision = [NSData dataWithBytes:request->objectPayload
+                                                 length:request->objectPayloadLength];
+        if (now == 0 ||
+            !PVEnrollmentContext(vaultId, &artifact, &state, &signedAt)) {
+            PVSendError(peer, message, "manifest_verification_failed");
+            return;
+        }
+        AncPrivateVaultEnrollmentAuthorizationStatus authorizationStatus;
+        AncPrivateVaultEnrollmentAuthorizationResult *verifiedAuthorization =
+            AncPrivateVaultEnrollmentAuthorizationVerify(
+                artifact.encodedOffer, challenge, authorization, state,
+                signedAt, now, gControlLog, &authorizationStatus);
+        AncPrivateVaultCustodySnapshot snapshot = {0};
+        AncPrivateVaultCustodyHandle *handle = nil;
+        AncPrivateVaultGuardedMemoryStatus memoryStatus;
+        AncPrivateVaultGuardedMemory *epoch =
+            [AncPrivateVaultGuardedMemory memoryWithLength:32
+                                                    status:&memoryStatus];
+        __block BOOL openedEpoch = NO;
+        AncPrivateVaultCustodyRepositoryStatus readStatus =
+            verifiedAuthorization == nil || epoch == nil
+                ? AncPrivateVaultCustodyRepositoryStatusFailed
+                : [gBrokerCustodyRepository readVaultId:vaultId
+                                                snapshot:&snapshot
+                                                  handle:&handle];
+        AncPrivateVaultCustodyRepositoryStatus borrowed =
+            readStatus != AncPrivateVaultCustodyRepositoryStatusOK ||
+                    handle == nil
+                ? AncPrivateVaultCustodyRepositoryStatusFailed
+                : [handle borrow:^BOOL(
+                              const AncPrivateVaultCustodySecretInputs *secrets) {
+                    return [epoch borrow:^BOOL(uint8_t *epochKey,
+                                               size_t length) {
+                        if (length != 32) return NO;
+                        AncPrivateVaultEekWrapStatus openStatus =
+                            [verifiedAuthorization
+                                openEEKWithRecipientBoxSeed:secrets->box_seed
+                                                   consumer:^BOOL(
+                                                       const uint8_t *value) {
+                            memcpy(epochKey, value, 32);
+                            openedEpoch = YES;
+                            return YES;
+                        }];
+                        return openStatus == AncPrivateVaultEekWrapStatusOK &&
+                               openedEpoch;
+                    }] == AncPrivateVaultGuardedMemoryStatusOK && openedEpoch;
+                }];
+        AncPrivateVaultCustodyRepositoryStatus handleClosed =
+            handle == nil ? AncPrivateVaultCustodyRepositoryStatusFailed
+                          : [handle close];
+        anc_pv_custody_snapshot_zero(&snapshot);
+        AncPrivateVaultObjectRevisionStatus objectStatus;
+        AncPrivateVaultOpenedObjectRevision *openedManifest =
+            borrowed == AncPrivateVaultCustodyRepositoryStatusOK && openedEpoch
+                ? AncPrivateVaultOpenObjectRevision(
+                      manifestRevision, PVLookupIDData(request->vaultID), nil,
+                      state, epoch, &objectStatus)
+                : nil;
+        NSData *ciphertextHash = PVManifestCiphertextHash(manifestRevision);
+        AncPrivateVaultManifestCheckpointStatus manifestStatus;
+        AncPrivateVaultManifestCheckpointBundle *verifiedBundle =
+            openedManifest == nil ||
+                    ![openedManifest.contentType
+                        isEqualToString:@"application/vnd.agent-native.content-vault-manifest+json"] ||
+                    ciphertextHash == nil
+                ? nil
+                : AncPrivateVaultVerifyManifestCheckpoint(
+                      authorization, checkpoint, binding, state,
+                      openedManifest.objectId, openedManifest.revisionId,
+                      openedManifest.revision, ciphertextHash, now,
+                      &manifestStatus);
+        AncPrivateVaultGuardedMemoryStatus epochClosed =
+            epoch == nil ? AncPrivateVaultGuardedMemoryStatusInvalid
+                         : [epoch close];
+        if (verifiedBundle == nil ||
+            handleClosed != AncPrivateVaultCustodyRepositoryStatusOK ||
+            epochClosed != AncPrivateVaultGuardedMemoryStatusOK) {
+            PVSendError(peer, message, "manifest_verification_failed");
+            return;
+        }
+        xpc_object_t reply = PVCreateReply(message, request);
+        if (reply == NULL) return;
+        xpc_dictionary_set_string(reply, "state", "verified");
+        xpc_dictionary_set_string(reply, "vaultId", request->vaultID);
+        xpc_dictionary_set_data(reply, "checkpointDigest",
+                                verifiedBundle.checkpointDigest.bytes,
+                                verifiedBundle.checkpointDigest.length);
         xpc_connection_send_message(peer, reply);
     }
 }
@@ -3321,6 +3487,10 @@ static void PVHandleMessage(xpc_connection_t peer, xpc_object_t message) {
             }
             if (strcmp(request.operation, "activate_enroll") == 0) {
                 PVActivateEnrollment(peer, message, &request);
+                return;
+            }
+            if (strcmp(request.operation, "verify_manifest") == 0) {
+                PVVerifyEnrollmentManifest(peer, message, &request);
                 return;
             }
             if (strcmp(request.operation, "enroll_page") == 0) {

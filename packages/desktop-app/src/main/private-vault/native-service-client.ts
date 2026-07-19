@@ -77,6 +77,7 @@ type NativeOperation =
   | "challenge_enroll"
   | "confirm_enroll"
   | "authorize_enroll"
+  | "verify_manifest"
   | "activate_enroll"
   | "enroll_page"
   | "seal_object"
@@ -169,7 +170,16 @@ export interface PrivateVaultNativeServiceClient
     readonly offer: Uint8Array;
     readonly challenge: Uint8Array;
     readonly sasDecision: Uint8Array;
+    readonly manifestRevision?: Uint8Array;
   }): Promise<NativeEnrollmentAuthorizerResult>;
+  verifyBrokerEnrollmentManifest(input: {
+    readonly vaultId: string;
+    readonly challenge: Uint8Array;
+    readonly authorization: Uint8Array;
+    readonly manifestCheckpoint: Uint8Array;
+    readonly manifestAuthorization: Uint8Array;
+    readonly manifestRevision: Uint8Array;
+  }): Promise<NativeVerifyEnrollmentManifestResult>;
   activateBrokerEnrollment(
     vaultId: string,
     challenge: Uint8Array,
@@ -440,6 +450,17 @@ export interface NativeOpenedJobContentObjectResult extends NativeContentObjectR
 
 export interface NativeEnrollmentAuthorizerResult {
   readonly encoded: Uint8Array;
+  readonly manifestCheckpoint?: Uint8Array;
+  readonly manifestAuthorization?: Uint8Array;
+}
+
+export interface NativeVerifyEnrollmentManifestResult {
+  readonly version: typeof SERVICE_VERSION;
+  readonly suite: typeof SERVICE_SUITE;
+  readonly operation: "verify_manifest";
+  readonly state: "verified";
+  readonly vaultId: string;
+  readonly checkpointDigest: Uint8Array;
 }
 
 export interface NativePrepareEnrollmentResult {
@@ -764,9 +785,21 @@ function parseEnrollmentAuthorizerResult(
   const field =
     operation === "challenge_enroll" ? "challenge" : "authorization";
   const state = operation === "challenge_enroll" ? "challenged" : "authorized";
+  const expectedKeys =
+    operation === "challenge_enroll"
+      ? ["version", "operation", "state", "vaultId", field]
+      : [
+          "version",
+          "operation",
+          "state",
+          "vaultId",
+          field,
+          "manifestCheckpoint",
+          "manifestAuthorization",
+        ];
   if (
     !isRecord(value) ||
-    !hasExactKeys(value, ["version", "operation", "state", "vaultId", field]) ||
+    !hasExactKeys(value, expectedKeys) ||
     value.version !== XPC_PROTOCOL_VERSION ||
     value.operation !== operation ||
     value.state !== state ||
@@ -775,11 +808,54 @@ function parseEnrollmentAuthorizerResult(
   ) {
     throw new PrivateVaultNativeServiceClientError();
   }
+  const encoded = copyBoundedBytes(
+    value[field],
+    operation === "challenge_enroll" ? 64 * 1024 : 256 * 1024,
+  );
+  return Object.freeze(
+    operation === "challenge_enroll"
+      ? { encoded }
+      : {
+          encoded,
+          manifestCheckpoint: copyBoundedBytes(value.manifestCheckpoint, 1024),
+          manifestAuthorization: copyBoundedBytes(
+            value.manifestAuthorization,
+            1024,
+          ),
+        },
+  );
+}
+
+function parseVerifyEnrollmentManifest(
+  value: unknown,
+  expectedVaultId: string,
+): NativeVerifyEnrollmentManifestResult {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "version",
+      "operation",
+      "state",
+      "vaultId",
+      "checkpointDigest",
+    ]) ||
+    value.version !== XPC_PROTOCOL_VERSION ||
+    value.operation !== "verify_manifest" ||
+    value.state !== "verified" ||
+    value.vaultId !== expectedVaultId ||
+    !isLowerHex(value.vaultId, 32)
+  )
+    throw new PrivateVaultNativeServiceClientError();
+  const checkpointDigest = copyBoundedBytes(value.checkpointDigest, 32);
+  if (checkpointDigest.byteLength !== 32)
+    throw new PrivateVaultNativeServiceClientError();
   return Object.freeze({
-    encoded: copyBoundedBytes(
-      value[field],
-      operation === "challenge_enroll" ? 64 * 1024 : 256 * 1024,
-    ),
+    version: SERVICE_VERSION,
+    suite: SERVICE_SUITE,
+    operation: "verify_manifest",
+    state: "verified",
+    vaultId: value.vaultId,
+    checkpointDigest,
   });
 }
 
@@ -2641,17 +2717,22 @@ class NativeServiceClient implements PrivateVaultNativeServiceClient {
     readonly offer: Uint8Array;
     readonly challenge: Uint8Array;
     readonly sasDecision: Uint8Array;
+    readonly manifestRevision?: Uint8Array;
   }): Promise<NativeEnrollmentAuthorizerResult> {
     if (!isLowerHex(input.vaultId, 32))
       return Promise.reject(new PrivateVaultNativeServiceClientError());
     let offerCopy: Buffer;
     let challengeCopy: Buffer;
     let sasDecisionCopy: Buffer;
+    let manifestRevisionCopy: Buffer;
     try {
       offerCopy = Buffer.from(copyBoundedBytes(input.offer, 1024));
       challengeCopy = Buffer.from(copyBoundedBytes(input.challenge, 64 * 1024));
       sasDecisionCopy = Buffer.from(
         copyBoundedBytes(input.sasDecision, 2 * 1024),
+      );
+      manifestRevisionCopy = Buffer.from(
+        copyBoundedBytes(input.manifestRevision, 1024 * 1024 + 64 * 1024),
       );
     } catch {
       return Promise.reject(new PrivateVaultNativeServiceClientError());
@@ -2666,6 +2747,7 @@ class NativeServiceClient implements PrivateVaultNativeServiceClient {
             offerCopy,
             challengeCopy,
             sasDecisionCopy,
+            manifestRevisionCopy,
           ),
           "authorize_enroll",
           input.vaultId,
@@ -2676,6 +2758,46 @@ class NativeServiceClient implements PrivateVaultNativeServiceClient {
         offerCopy.fill(0);
         challengeCopy.fill(0);
         sasDecisionCopy.fill(0);
+        manifestRevisionCopy.fill(0);
+      }
+    });
+  }
+
+  verifyBrokerEnrollmentManifest(input: {
+    readonly vaultId: string;
+    readonly challenge: Uint8Array;
+    readonly authorization: Uint8Array;
+    readonly manifestCheckpoint: Uint8Array;
+    readonly manifestAuthorization: Uint8Array;
+    readonly manifestRevision: Uint8Array;
+  }): Promise<NativeVerifyEnrollmentManifestResult> {
+    if (!isLowerHex(input.vaultId, 32))
+      return Promise.reject(new PrivateVaultNativeServiceClientError());
+    let values: Buffer[];
+    try {
+      values = [
+        Buffer.from(copyBoundedBytes(input.challenge, 64 * 1024)),
+        Buffer.from(copyBoundedBytes(input.authorization, 256 * 1024)),
+        Buffer.from(copyBoundedBytes(input.manifestCheckpoint, 1024)),
+        Buffer.from(copyBoundedBytes(input.manifestAuthorization, 1024)),
+        Buffer.from(
+          copyBoundedBytes(input.manifestRevision, 1024 * 1024 + 64 * 1024),
+        ),
+      ];
+    } catch {
+      return Promise.reject(new PrivateVaultNativeServiceClientError());
+    }
+    return this.#enqueue(async () => {
+      try {
+        const addon = await this.#addon;
+        return parseVerifyEnrollmentManifest(
+          await addon.request("verify_manifest", input.vaultId, ...values),
+          input.vaultId,
+        );
+      } catch {
+        throw new PrivateVaultNativeServiceClientError();
+      } finally {
+        for (const value of values) value.fill(0);
       }
     });
   }

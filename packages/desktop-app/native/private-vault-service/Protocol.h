@@ -24,6 +24,8 @@
 #define PV_ENROLLMENT_CHALLENGE_MAXIMUM_BYTES (64 * 1024)
 #define PV_ENROLLMENT_SAS_DECISION_MAXIMUM_BYTES 2048
 #define PV_ENROLLMENT_AUTHORIZATION_MAXIMUM_BYTES (256 * 1024)
+#define PV_MANIFEST_CHECKPOINT_MAXIMUM_BYTES 1024
+#define PV_MANIFEST_AUTHORIZATION_MAXIMUM_BYTES 1024
 #define PV_OBJECT_PLAINTEXT_MAXIMUM_BYTES (1024 * 1024)
 #define PV_OBJECT_REVISION_MAXIMUM_BYTES (1024 * 1024 + 64 * 1024)
 #define PV_EXPORT_PLAINTEXT_MAXIMUM_BYTES (256 * 1024 * 1024)
@@ -93,6 +95,10 @@ typedef struct {
     size_t enrollmentSasDecisionLength;
     const void *enrollmentAuthorization;
     size_t enrollmentAuthorizationLength;
+    const void *manifestCheckpoint;
+    size_t manifestCheckpointLength;
+    const void *manifestAuthorization;
+    size_t manifestAuthorizationLength;
     const void *objectPayload;
     size_t objectPayloadLength;
     const void *exportPlaintext;

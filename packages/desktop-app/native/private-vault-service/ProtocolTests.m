@@ -517,6 +517,9 @@ int main(void) {
   const uint8_t enrollmentChallenge[] = {0xa1, 0x01, 0x03};
   const uint8_t enrollmentSasDecision[] = {0xa1, 0x01, 0x05};
   const uint8_t enrollmentAuthorization[] = {0xa1, 0x01, 0x04};
+  const uint8_t manifestRevision[] = {0xa1, 0x01, 0x06};
+  const uint8_t manifestCheckpoint[] = {0xa1, 0x01, 0x07};
+  const uint8_t manifestAuthorization[] = {0xa1, 0x01, 0x08};
   xpc_object_t prepareEnrollment = PVMakeRequest(
       PV_PROTOCOL_VERSION, "prepare_enroll", "request-prepare-enroll");
   xpc_dictionary_set_string(prepareEnrollment, "vaultId", enrollmentVault);
@@ -573,10 +576,50 @@ int main(void) {
   xpc_dictionary_set_data(authorizeEnrollment, "sasDecision",
                           enrollmentSasDecision,
                           sizeof enrollmentSasDecision);
+  xpc_dictionary_set_data(authorizeEnrollment, "objectPayload",
+                          manifestRevision, sizeof manifestRevision);
   assert(PVParseRequest(authorizeEnrollment, &parsed) == PVRequestValid &&
          parsed.enrollmentChallengeLength == sizeof enrollmentChallenge &&
          parsed.enrollmentSasDecisionLength == sizeof enrollmentSasDecision);
   xpc_release(authorizeEnrollment);
+
+  xpc_object_t verifyManifest = PVMakeRequest(
+      PV_PROTOCOL_VERSION, "verify_manifest", "request-verify-manifest");
+  xpc_dictionary_set_string(verifyManifest, "vaultId", enrollmentVault);
+  xpc_dictionary_set_data(verifyManifest, "challenge", enrollmentChallenge,
+                          sizeof enrollmentChallenge);
+  xpc_dictionary_set_data(verifyManifest, "authorization",
+                          enrollmentAuthorization,
+                          sizeof enrollmentAuthorization);
+  xpc_dictionary_set_data(verifyManifest, "manifestCheckpoint",
+                          manifestCheckpoint, sizeof manifestCheckpoint);
+  xpc_dictionary_set_data(verifyManifest, "manifestAuthorization",
+                          manifestAuthorization,
+                          sizeof manifestAuthorization);
+  xpc_dictionary_set_data(verifyManifest, "objectPayload", manifestRevision,
+                          sizeof manifestRevision);
+  assert(PVParseRequest(verifyManifest, &parsed) == PVRequestValid &&
+         parsed.manifestCheckpointLength == sizeof manifestCheckpoint &&
+         parsed.manifestAuthorizationLength == sizeof manifestAuthorization &&
+         parsed.objectPayloadLength == sizeof manifestRevision);
+  xpc_dictionary_set_string(verifyManifest, "authorizerKey", "host-forgery");
+  assert(PVParseRequest(verifyManifest, &parsed) == PVRequestInvalid);
+  xpc_release(verifyManifest);
+
+  xpc_object_t incompleteManifest = PVMakeRequest(
+      PV_PROTOCOL_VERSION, "verify_manifest", "request-incomplete-manifest");
+  xpc_dictionary_set_string(incompleteManifest, "vaultId", enrollmentVault);
+  xpc_dictionary_set_data(incompleteManifest, "challenge", enrollmentChallenge,
+                          sizeof enrollmentChallenge);
+  xpc_dictionary_set_data(incompleteManifest, "authorization",
+                          enrollmentAuthorization,
+                          sizeof enrollmentAuthorization);
+  xpc_dictionary_set_data(incompleteManifest, "manifestCheckpoint",
+                          manifestCheckpoint, sizeof manifestCheckpoint);
+  xpc_dictionary_set_data(incompleteManifest, "objectPayload", manifestRevision,
+                          sizeof manifestRevision);
+  assert(PVParseRequest(incompleteManifest, &parsed) == PVRequestInvalid);
+  xpc_release(incompleteManifest);
 
   for (size_t index = 0; index < 2; index += 1) {
     xpc_object_t decideEnrollment = PVMakeRequest(

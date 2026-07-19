@@ -163,6 +163,9 @@ describe("Private Vault native service client", () => {
     const challenge = new Uint8Array([0xa1, 0x01, 0x03]);
     const sasDecision = new Uint8Array([0xa1, 0x01, 0x05]);
     const authorization = new Uint8Array([0xa1, 0x01, 0x04]);
+    const manifestRevision = new Uint8Array([0xa1, 0x01, 0x06]);
+    const manifestCheckpoint = new Uint8Array([0xa1, 0x01, 0x07]);
+    const manifestAuthorization = new Uint8Array([0xa1, 0x01, 0x08]);
     const request = vi.fn(async (operation: string) => {
       if (operation === "prepare_enroll") {
         return {
@@ -200,6 +203,17 @@ describe("Private Vault native service client", () => {
           state: "authorized",
           vaultId,
           authorization: Buffer.from(authorization),
+          manifestCheckpoint: Buffer.from(manifestCheckpoint),
+          manifestAuthorization: Buffer.from(manifestAuthorization),
+        };
+      }
+      if (operation === "verify_manifest") {
+        return {
+          version: 3,
+          operation,
+          state: "verified",
+          vaultId,
+          checkpointDigest: Buffer.alloc(32, 9),
         };
       }
       return {
@@ -246,8 +260,27 @@ describe("Private Vault native service client", () => {
         offer: new Uint8Array([0xa1, 0x01, 0x01]),
         challenge,
         sasDecision,
+        manifestRevision,
       }),
-    ).resolves.toEqual({ encoded: authorization });
+    ).resolves.toEqual({
+      encoded: authorization,
+      manifestCheckpoint,
+      manifestAuthorization,
+    });
+    await expect(
+      client.verifyBrokerEnrollmentManifest({
+        vaultId,
+        challenge,
+        authorization,
+        manifestCheckpoint,
+        manifestAuthorization,
+        manifestRevision,
+      }),
+    ).resolves.toMatchObject({
+      operation: "verify_manifest",
+      state: "verified",
+      vaultId,
+    });
     await expect(
       client.activateBrokerEnrollment(vaultId, challenge, authorization),
     ).resolves.toMatchObject({
@@ -261,6 +294,7 @@ describe("Private Vault native service client", () => {
       "challenge_enroll",
       "confirm_enroll",
       "authorize_enroll",
+      "verify_manifest",
       "activate_enroll",
     ]);
     expect(nativeSource).toContain('"inspect_enroll"');
@@ -294,6 +328,46 @@ describe("Private Vault native service client", () => {
         candidateKeyProof: new Uint8Array(64).fill(1),
       }),
     ).rejects.toBeInstanceOf(PrivateVaultNativeServiceClientError);
+
+    const manifestInput = {
+      vaultId,
+      challenge,
+      authorization,
+      manifestCheckpoint,
+      manifestAuthorization,
+      manifestRevision,
+    };
+    for (const malformedReply of [
+      {
+        version: 3,
+        operation: "verify_manifest",
+        state: "verified",
+        vaultId,
+        checkpointDigest: Buffer.alloc(31, 9),
+      },
+      {
+        version: 3,
+        operation: "verify_manifest",
+        state: "verified",
+        vaultId,
+        checkpointDigest: Buffer.alloc(32, 9),
+        authorizerKey: Buffer.alloc(32, 1),
+      },
+      {
+        version: 3,
+        operation: "verify_manifest",
+        state: "verified",
+        vaultId: "ff".repeat(16),
+        checkpointDigest: Buffer.alloc(32, 9),
+      },
+    ]) {
+      const malformedClient = createPrivateVaultNativeServiceClientForTest(
+        async () => ({ request: vi.fn(async () => malformedReply) }),
+      );
+      await expect(
+        malformedClient.verifyBrokerEnrollmentManifest(manifestInput),
+      ).rejects.toBeInstanceOf(PrivateVaultNativeServiceClientError);
+    }
   });
 
   it("seals and opens Content revisions only through the native endpoint boundary", async () => {

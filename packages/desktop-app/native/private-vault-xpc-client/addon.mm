@@ -90,6 +90,7 @@ enum class PVOperation {
   ChallengeEnrollment,
   ConfirmEnrollment,
   AuthorizeEnrollment,
+  VerifyManifest,
   ActivateEnrollment,
   SealObject,
   OpenObject,
@@ -194,6 +195,9 @@ struct PVParsedReply {
   std::vector<uint8_t> writerEndpointID;
   std::vector<uint8_t> revisionID;
   std::vector<uint8_t> sasTranscriptHash;
+  std::vector<uint8_t> manifestCheckpoint;
+  std::vector<uint8_t> manifestAuthorization;
+  std::vector<uint8_t> checkpointDigest;
   std::vector<PVCandidate> candidates;
   std::vector<PVGrantSummary> grants;
   std::vector<PVMemberSummary> members;
@@ -335,6 +339,8 @@ struct PVAsyncRequest {
   std::vector<uint8_t> enrollmentOffer;
   std::vector<uint8_t> enrollmentCandidateKeyProof;
   std::vector<uint8_t> enrollmentSasDecision;
+  std::vector<uint8_t> manifestCheckpoint;
+  std::vector<uint8_t> manifestAuthorization;
   std::vector<uint8_t> receipt;
   std::vector<uint8_t> body;
   std::vector<uint8_t> grantID;
@@ -352,6 +358,7 @@ struct PVAsyncRequest {
   std::vector<uint8_t> writerEndpointID;
   std::vector<uint8_t> revisionID;
   std::vector<uint8_t> sasTranscriptHash;
+  std::vector<uint8_t> checkpointDigest;
   std::vector<PVCandidate> candidates;
   std::vector<PVGrantSummary> grants;
   std::vector<PVMemberSummary> members;
@@ -373,6 +380,10 @@ struct PVAsyncRequest {
       PVClearBytes(enrollmentCandidateKeyProof);
     if (!enrollmentSasDecision.empty())
       PVClearBytes(enrollmentSasDecision);
+    if (!manifestCheckpoint.empty())
+      PVClearBytes(manifestCheckpoint);
+    if (!manifestAuthorization.empty())
+      PVClearBytes(manifestAuthorization);
     if (!receipt.empty())
       PVClearBytes(receipt);
     if (!body.empty())
@@ -1377,6 +1388,7 @@ PVParsedReply PVParseReply(xpc_object_t reply, PVOperation operation,
     };
     const char *const authorizationKeys[] = {
         "version", "ok", "requestId", "state", "vaultId", "authorization",
+        "manifestCheckpoint", "manifestAuthorization",
     };
     const char *state = PVGetString(reply, "state");
     const char *vaultID = PVGetString(reply, "vaultId");
@@ -1385,7 +1397,7 @@ PVParsedReply PVParseReply(xpc_object_t reply, PVOperation operation,
         challenge ? PVGetString(reply, "candidateEndpointId") : nullptr;
     if (!PVHasExactKeys(reply,
                         challenge ? challengeKeys : authorizationKeys,
-                        challenge ? 9 : 6) ||
+                        challenge ? 9 : 8) ||
         !PVRequestIDMatches(reply, requestID) || state == nullptr ||
         strcmp(state, challenge ? "challenged" : "authorized") != 0 ||
         !PVIsLowerHex(vaultID, 32) || expectedVaultID == nullptr ||
@@ -1395,6 +1407,11 @@ PVParsedReply PVParseReply(xpc_object_t reply, PVOperation operation,
                            challenge ? PV_ENROLLMENT_CHALLENGE_MAXIMUM_BYTES
                                      : PV_ENROLLMENT_AUTHORIZATION_MAXIMUM_BYTES,
                            parsed.body) ||
+        (!challenge &&
+         (!PVCopyBoundedData(reply, "manifestCheckpoint", 1024,
+                             parsed.manifestCheckpoint) ||
+          !PVCopyBoundedData(reply, "manifestAuthorization", 1024,
+                             parsed.manifestAuthorization))) ||
         (challenge &&
          (!PVCopyBoundedData(reply, "sasTranscriptHash", 32,
                              parsed.sasTranscriptHash) ||
@@ -1413,6 +1430,29 @@ PVParsedReply PVParseReply(xpc_object_t reply, PVOperation operation,
       memcpy(parsed.candidateEndpointID, candidate,
              sizeof(parsed.candidateEndpointID));
     }
+    parsed.failure = PVFailure::None;
+    return parsed;
+  }
+
+  if (operation == PVOperation::VerifyManifest) {
+    const char *const keys[] = {
+        "version", "ok", "requestId", "state", "vaultId",
+        "checkpointDigest",
+    };
+    const char *state = PVGetString(reply, "state");
+    const char *vaultID = PVGetString(reply, "vaultId");
+    if (!PVHasExactKeys(reply, keys, 6) ||
+        !PVRequestIDMatches(reply, requestID) || state == nullptr ||
+        strcmp(state, "verified") != 0 || !PVIsLowerHex(vaultID, 32) ||
+        expectedVaultID == nullptr || strcmp(vaultID, expectedVaultID) != 0 ||
+        !PVCopyBoundedData(reply, "checkpointDigest", 32,
+                           parsed.checkpointDigest) ||
+        parsed.checkpointDigest.size() != 32) {
+      parsed.failure = PVFailure::MalformedReply;
+      return parsed;
+    }
+    memcpy(parsed.state, state, strlen(state) + 1);
+    memcpy(parsed.vaultID, vaultID, 33);
     parsed.failure = PVFailure::None;
     return parsed;
   }
@@ -2072,6 +2112,8 @@ void PVExecute(napi_env env, void *data) {
                               ? "challenge_enroll"
                           : request->operation == PVOperation::AuthorizeEnrollment
                               ? "authorize_enroll"
+                          : request->operation == PVOperation::VerifyManifest
+                              ? "verify_manifest"
                           : request->operation == PVOperation::ActivateEnrollment
                               ? "activate_enroll"
                           : request->operation == PVOperation::SealObject
@@ -2242,6 +2284,7 @@ void PVExecute(napi_env env, void *data) {
                             request->enrollmentCandidateKeyProof.size());
   }
   if (request->operation == PVOperation::AuthorizeEnrollment ||
+      request->operation == PVOperation::VerifyManifest ||
       request->operation == PVOperation::ActivateEnrollment) {
     xpc_dictionary_set_data(message, "challenge", request->challenge.data(),
                             request->challenge.size());
@@ -2250,11 +2293,26 @@ void PVExecute(napi_env env, void *data) {
     xpc_dictionary_set_data(message, "sasDecision",
                             request->enrollmentSasDecision.data(),
                             request->enrollmentSasDecision.size());
+    xpc_dictionary_set_data(message, "objectPayload",
+                            request->objectPayload.data(),
+                            request->objectPayload.size());
   }
-  if (request->operation == PVOperation::ActivateEnrollment) {
+  if (request->operation == PVOperation::VerifyManifest ||
+      request->operation == PVOperation::ActivateEnrollment) {
     xpc_dictionary_set_data(message, "authorization",
                             request->authorization.data(),
                             request->authorization.size());
+  }
+  if (request->operation == PVOperation::VerifyManifest) {
+    xpc_dictionary_set_data(message, "manifestCheckpoint",
+                            request->manifestCheckpoint.data(),
+                            request->manifestCheckpoint.size());
+    xpc_dictionary_set_data(message, "manifestAuthorization",
+                            request->manifestAuthorization.data(),
+                            request->manifestAuthorization.size());
+    xpc_dictionary_set_data(message, "objectPayload",
+                            request->objectPayload.data(),
+                            request->objectPayload.size());
   }
   if (request->operation == PVOperation::OpenJob) {
     xpc_dictionary_set_string(message, "jobId", request->jobID);
@@ -2367,6 +2425,7 @@ void PVExecute(napi_env env, void *data) {
         : request->operation == PVOperation::PrepareEnrollment ||
                 request->operation == PVOperation::ChallengeEnrollment ||
                 request->operation == PVOperation::AuthorizeEnrollment ||
+                request->operation == PVOperation::VerifyManifest ||
                 request->operation == PVOperation::ActivateEnrollment ||
                 request->operation == PVOperation::EnrollmentBootstrap ||
                 request->operation == PVOperation::SealObject ||
@@ -2505,6 +2564,9 @@ void PVExecute(napi_env env, void *data) {
     request->grants = std::move(parsed.grants);
     request->members = std::move(parsed.members);
     request->sasTranscriptHash = std::move(parsed.sasTranscriptHash);
+    request->manifestCheckpoint = std::move(parsed.manifestCheckpoint);
+    request->manifestAuthorization = std::move(parsed.manifestAuthorization);
+    request->checkpointDigest = std::move(parsed.checkpointDigest);
     request->writerEndpointID = std::move(parsed.writerEndpointID);
     request->candidates = std::move(parsed.candidates);
   }
@@ -2638,6 +2700,8 @@ void PVComplete(napi_env env, napi_status status, void *data) {
                     ? "confirm_enroll"
                 : request->operation == PVOperation::AuthorizeEnrollment
                     ? "authorize_enroll"
+                : request->operation == PVOperation::VerifyManifest
+                    ? "verify_manifest"
                 : request->operation == PVOperation::ActivateEnrollment
                     ? "activate_enroll"
                 : request->operation == PVOperation::SealObject
@@ -2892,7 +2956,26 @@ void PVComplete(napi_env env, napi_status status, void *data) {
                        request->operation == PVOperation::ChallengeEnrollment
                            ? "challenge"
                            : "authorization",
-                       request->body)) {
+                       request->body) ||
+          (request->operation == PVOperation::AuthorizeEnrollment &&
+           (!PVSetBuffer(env, result, "manifestCheckpoint",
+                         request->manifestCheckpoint) ||
+            !PVSetBuffer(env, result, "manifestAuthorization",
+                         request->manifestAuthorization)))) {
+        napi_value message;
+        napi_value error;
+        PVCreateString(env, "Private Vault native service request failed",
+                       &message);
+        napi_create_error(env, nullptr, message, &error);
+        napi_reject_deferred(env, request->deferred, error);
+        napi_delete_async_work(env, request->work);
+        delete request;
+        return;
+      }
+    } else if (request->operation == PVOperation::VerifyManifest) {
+      PVSetString(env, result, "vaultId", request->vaultID);
+      if (!PVSetBuffer(env, result, "checkpointDigest",
+                       request->checkpointDigest)) {
         napi_value message;
         napi_value error;
         PVCreateString(env, "Private Vault native service request failed",
@@ -3228,6 +3311,8 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
     request->operation = PVOperation::ConfirmEnrollment;
   } else if (strcmp(operation, "authorize_enroll") == 0) {
     request->operation = PVOperation::AuthorizeEnrollment;
+  } else if (strcmp(operation, "verify_manifest") == 0) {
+    request->operation = PVOperation::VerifyManifest;
   } else if (strcmp(operation, "activate_enroll") == 0) {
     request->operation = PVOperation::ActivateEnrollment;
   } else if (strcmp(operation, "seal_object") == 0) {
@@ -3280,7 +3365,8 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
       : request->operation == PVOperation::PrepareEnrollment ? 2
       : request->operation == PVOperation::ChallengeEnrollment ? 4
       : request->operation == PVOperation::ConfirmEnrollment ? 3
-      : request->operation == PVOperation::AuthorizeEnrollment ? 5
+      : request->operation == PVOperation::AuthorizeEnrollment ? 6
+      : request->operation == PVOperation::VerifyManifest ? 7
       : request->operation == PVOperation::ActivateEnrollment ? 4
       : request->operation == PVOperation::SealObject ? 6
       : request->operation == PVOperation::OpenObject ? 5
@@ -3316,6 +3402,7 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
       request->operation == PVOperation::ChallengeEnrollment ||
       request->operation == PVOperation::ConfirmEnrollment ||
       request->operation == PVOperation::AuthorizeEnrollment ||
+      request->operation == PVOperation::VerifyManifest ||
       request->operation == PVOperation::ActivateEnrollment ||
       request->operation == PVOperation::SealObject ||
       request->operation == PVOperation::OpenObject ||
@@ -3516,7 +3603,25 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
   }
   const uint8_t *objectPayload = nullptr;
   size_t objectPayloadLength = 0;
-  if (request->operation == PVOperation::SealObject ||
+  if (request->operation == PVOperation::AuthorizeEnrollment ||
+      request->operation == PVOperation::VerifyManifest) {
+    const size_t payloadIndex =
+        request->operation == PVOperation::AuthorizeEnrollment ? 5 : 6;
+    void *bytes = nullptr;
+    bool isBuffer = false;
+    if (napi_is_buffer(env, argv[payloadIndex], &isBuffer) != napi_ok ||
+        !isBuffer ||
+        napi_get_buffer_info(env, argv[payloadIndex], &bytes,
+                             &objectPayloadLength) != napi_ok ||
+        bytes == nullptr || objectPayloadLength == 0 ||
+        objectPayloadLength > PV_OBJECT_REVISION_MAXIMUM_BYTES) {
+      delete request;
+      napi_throw_type_error(env, nullptr,
+                            "Private Vault native service request failed");
+      return nullptr;
+    }
+    objectPayload = static_cast<const uint8_t *>(bytes);
+  } else if (request->operation == PVOperation::SealObject ||
       request->operation == PVOperation::OpenObject ||
       request->operation == PVOperation::SealJobObject ||
       request->operation == PVOperation::OpenJobObject) {
@@ -3725,6 +3830,7 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
   }
   if (request->operation == PVOperation::ConfirmEnrollment ||
       request->operation == PVOperation::AuthorizeEnrollment ||
+      request->operation == PVOperation::VerifyManifest ||
       request->operation == PVOperation::ActivateEnrollment) {
     const size_t challengeIndex =
         request->operation == PVOperation::AuthorizeEnrollment ? 3 : 2;
@@ -3759,11 +3865,13 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
     }
     enrollmentSasDecision = static_cast<const uint8_t *>(decisionBytes);
   }
-  if (request->operation == PVOperation::ActivateEnrollment) {
+  if (request->operation == PVOperation::VerifyManifest ||
+      request->operation == PVOperation::ActivateEnrollment) {
     void *bytes = nullptr;
     bool isBuffer = false;
-    if (napi_is_buffer(env, argv[3], &isBuffer) != napi_ok || !isBuffer ||
-        napi_get_buffer_info(env, argv[3], &bytes,
+    const size_t authorizationIndex = 3;
+    if (napi_is_buffer(env, argv[authorizationIndex], &isBuffer) != napi_ok || !isBuffer ||
+        napi_get_buffer_info(env, argv[authorizationIndex], &bytes,
                              &enrollmentAuthorizationLength) != napi_ok ||
         bytes == nullptr || enrollmentAuthorizationLength == 0 ||
         enrollmentAuthorizationLength >
@@ -3774,6 +3882,35 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
       return nullptr;
     }
     enrollmentAuthorization = static_cast<const uint8_t *>(bytes);
+  }
+  const uint8_t *manifestCheckpoint = nullptr;
+  size_t manifestCheckpointLength = 0;
+  const uint8_t *manifestAuthorization = nullptr;
+  size_t manifestAuthorizationLength = 0;
+  if (request->operation == PVOperation::VerifyManifest) {
+    void *checkpointBytes = nullptr;
+    void *authorizationBytes = nullptr;
+    bool checkpointIsBuffer = false;
+    bool authorizationIsBuffer = false;
+    if (napi_is_buffer(env, argv[4], &checkpointIsBuffer) != napi_ok ||
+        !checkpointIsBuffer ||
+        napi_get_buffer_info(env, argv[4], &checkpointBytes,
+                             &manifestCheckpointLength) != napi_ok ||
+        checkpointBytes == nullptr || manifestCheckpointLength == 0 ||
+        manifestCheckpointLength > 1024 ||
+        napi_is_buffer(env, argv[5], &authorizationIsBuffer) != napi_ok ||
+        !authorizationIsBuffer ||
+        napi_get_buffer_info(env, argv[5], &authorizationBytes,
+                             &manifestAuthorizationLength) != napi_ok ||
+        authorizationBytes == nullptr || manifestAuthorizationLength == 0 ||
+        manifestAuthorizationLength > 1024) {
+      delete request;
+      napi_throw_type_error(env, nullptr,
+                            "Private Vault native service request failed");
+      return nullptr;
+    }
+    manifestCheckpoint = static_cast<const uint8_t *>(checkpointBytes);
+    manifestAuthorization = static_cast<const uint8_t *>(authorizationBytes);
   }
   if (request->operation == PVOperation::SignRequest) {
     void *bytes = nullptr;
@@ -3947,7 +4084,9 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
     return promise;
   }
 
-  if (request->operation == PVOperation::SealObject ||
+  if (request->operation == PVOperation::AuthorizeEnrollment ||
+      request->operation == PVOperation::VerifyManifest ||
+      request->operation == PVOperation::SealObject ||
       request->operation == PVOperation::OpenObject ||
       request->operation == PVOperation::SealJobObject ||
       request->operation == PVOperation::OpenJobObject) {
@@ -4020,6 +4159,7 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
   if (request->operation == PVOperation::ChallengeEnrollment ||
       request->operation == PVOperation::ConfirmEnrollment ||
       request->operation == PVOperation::AuthorizeEnrollment ||
+      request->operation == PVOperation::VerifyManifest ||
       request->operation == PVOperation::ActivateEnrollment) {
     try {
       if (request->operation == PVOperation::ChallengeEnrollment ||
@@ -4042,6 +4182,17 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
         request->authorization.assign(
             enrollmentAuthorization,
             enrollmentAuthorization + enrollmentAuthorizationLength);
+      if (request->operation == PVOperation::VerifyManifest) {
+        request->authorization.assign(
+            enrollmentAuthorization,
+            enrollmentAuthorization + enrollmentAuthorizationLength);
+        request->manifestCheckpoint.assign(
+            manifestCheckpoint,
+            manifestCheckpoint + manifestCheckpointLength);
+        request->manifestAuthorization.assign(
+            manifestAuthorization,
+            manifestAuthorization + manifestAuthorizationLength);
+      }
     } catch (...) {
       gRequestGate.release();
       delete request;

@@ -85,6 +85,9 @@ static bool PVHasOnlyProtocolKeys(xpc_object_t message,
                 return true;
             }
             if (strcmp(key, "unsignedProof") == 0) return true;
+            if (strcmp(key, "manifestCheckpoint") == 0 ||
+                strcmp(key, "manifestAuthorization") == 0)
+                return true;
             if (strcmp(key, "offer") == 0 ||
                 strcmp(key, "candidateKeyProof") == 0 ||
                 strcmp(key, "sasDecision") == 0)
@@ -219,6 +222,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
     bool decideEnrollment = strcmp(operation, "decide_enroll") == 0;
     bool authorizeEnrollment = strcmp(operation, "authorize_enroll") == 0;
     bool activateEnrollment = strcmp(operation, "activate_enroll") == 0;
+    bool verifyManifest = strcmp(operation, "verify_manifest") == 0;
     bool enrollmentBootstrap = strcmp(operation, "enroll_page") == 0;
     bool sealObject = strcmp(operation, "seal_object") == 0;
     bool openObject = strcmp(operation, "open_object") == 0;
@@ -236,7 +240,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
         !completeResult && !pendingResult &&
         !signRequest && !prepareEnrollment && !challengeEnrollment &&
         !inspectEnrollment && !decideEnrollment && !authorizeEnrollment &&
-        !activateEnrollment && !enrollmentBootstrap && !sealObject &&
+        !activateEnrollment && !verifyManifest && !enrollmentBootstrap && !sealObject &&
         !openObject && !sealJobObject &&
         !openJobObject && !sealExport && !openExport) {
         return PVRequestUnsupportedOperation;
@@ -523,7 +527,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
             return PVRequestInvalid;
         }
     } else if (authorizeEnrollment) {
-        if (fieldCount != 7 || vaultIDValue == NULL ||
+        if (fieldCount != 8 || vaultIDValue == NULL ||
             xpc_get_type(vaultIDValue) != XPC_TYPE_STRING ||
             !PVIsVaultID(xpc_dictionary_get_string(message, "vaultId")) ||
             !PVReadBoundedData(message, "offer",
@@ -537,7 +541,11 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
             !PVReadBoundedData(message, "sasDecision",
                                PV_ENROLLMENT_SAS_DECISION_MAXIMUM_BYTES,
                                &request->enrollmentSasDecision,
-                               &request->enrollmentSasDecisionLength)) {
+                               &request->enrollmentSasDecisionLength) ||
+            !PVReadBoundedData(message, "objectPayload",
+                               PV_OBJECT_REVISION_MAXIMUM_BYTES,
+                               &request->objectPayload,
+                               &request->objectPayloadLength)) {
             return PVRequestInvalid;
         }
     } else if (decideEnrollment) {
@@ -562,6 +570,32 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
         }
         request->ceremonyToken = token;
         request->decision = decision;
+    } else if (verifyManifest) {
+        if (fieldCount != 9 || vaultIDValue == NULL ||
+            xpc_get_type(vaultIDValue) != XPC_TYPE_STRING ||
+            !PVIsVaultID(xpc_dictionary_get_string(message, "vaultId")) ||
+            !PVReadBoundedData(message, "challenge",
+                               PV_ENROLLMENT_CHALLENGE_MAXIMUM_BYTES,
+                               &request->enrollmentChallenge,
+                               &request->enrollmentChallengeLength) ||
+            !PVReadBoundedData(message, "authorization",
+                               PV_ENROLLMENT_AUTHORIZATION_MAXIMUM_BYTES,
+                               &request->enrollmentAuthorization,
+                               &request->enrollmentAuthorizationLength) ||
+            !PVReadBoundedData(message, "manifestCheckpoint",
+                               PV_MANIFEST_CHECKPOINT_MAXIMUM_BYTES,
+                               &request->manifestCheckpoint,
+                               &request->manifestCheckpointLength) ||
+            !PVReadBoundedData(message, "manifestAuthorization",
+                               PV_MANIFEST_AUTHORIZATION_MAXIMUM_BYTES,
+                               &request->manifestAuthorization,
+                               &request->manifestAuthorizationLength) ||
+            !PVReadBoundedData(message, "objectPayload",
+                               PV_OBJECT_REVISION_MAXIMUM_BYTES,
+                               &request->objectPayload,
+                               &request->objectPayloadLength)) {
+            return PVRequestInvalid;
+        }
     } else if (activateEnrollment) {
         if (fieldCount != 6 || vaultIDValue == NULL ||
             xpc_get_type(vaultIDValue) != XPC_TYPE_STRING ||
@@ -765,7 +799,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
                 sealJob || openResult || sealResult ||
                 completeResult || pendingResult || prepareEnrollment ||
                 challengeEnrollment || inspectEnrollment ||
-                authorizeEnrollment || activateEnrollment ||
+                authorizeEnrollment || verifyManifest || activateEnrollment ||
                 enrollmentBootstrap || listGrants || listMembers || brokerKey ||
                 revokeGrant || removeEndpoint || refreshAuthority || sealObject ||
                 openObject || sealExport || openExport

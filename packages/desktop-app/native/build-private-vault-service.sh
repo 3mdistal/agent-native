@@ -17,6 +17,7 @@ SOURCES=(
   "$SOURCE_ROOT/control/PrivateVaultEnrollmentChallenge.m"
   "$SOURCE_ROOT/control/PrivateVaultEnrollmentAuthorizer.m"
   "$SOURCE_ROOT/control/PrivateVaultEnrollmentAuthorization.m"
+  "$SOURCE_ROOT/control/PrivateVaultManifestCheckpoint.m"
   "$SOURCE_ROOT/control/PrivateVaultEnrollmentSasReceipt.m"
   "$SOURCE_ROOT/control/PrivateVaultEekWrap.m"
   "$SOURCE_ROOT/control/PrivateVaultDisclosureCodec.m"
@@ -972,6 +973,46 @@ case "${PRIVATE_VAULT_BUILD_ENROLLMENT_AUTHORIZATION_TESTS:-}" in
   build_enrollment_authorization_tests arm64
   if [[ "$PRIVATE_VAULT_BUILD_ARCHITECTURES" == "universal" ]]; then
     build_enrollment_authorization_tests x86_64
+  fi
+  ;;
+esac
+
+case "${PRIVATE_VAULT_BUILD_MANIFEST_CHECKPOINT_TESTS:-}" in
+1 | true | TRUE | yes | YES)
+  MANIFEST_CHECKPOINT_TEST_OUTPUT="$OUTPUT_ROOT/.manifest-checkpoint-tests"
+  rm -rf "$MANIFEST_CHECKPOINT_TEST_OUTPUT"
+  mkdir -p "$MANIFEST_CHECKPOINT_TEST_OUTPUT"
+  build_manifest_checkpoint_tests() {
+    local architecture="$1"
+    local sodium_root
+    if [[ "$architecture" == "arm64" ]]; then sodium_root="$ARM64_SODIUM"; else sodium_root="$X86_64_SODIUM"; fi
+    local output="$MANIFEST_CHECKPOINT_TEST_OUTPUT/private-vault-manifest-checkpoint-tests-$architecture"
+    xcrun clang -O1 -fobjc-arc -fblocks -Wall -Wextra -Werror \
+      -isysroot "$SDK" -arch "$architecture" -mmacosx-version-min=13.0 \
+      -I"$SOURCE_ROOT/crypto" -I"$SOURCE_ROOT/control" \
+      -I"$SOURCE_ROOT/storage" -I"$SOURCE_ROOT/recovery" \
+      -I"$SOURCE_ROOT/transport" -I"$sodium_root/include" \
+      -DANC_PRIVATE_VAULT_TESTING=1 \
+      -DANC_PRIVATE_VAULT_ENROLLMENT_AUTHORITY_LINKED=1 \
+      -framework Foundation -framework Security -framework LocalAuthentication \
+      "$SOURCE_ROOT/crypto/PrivateVaultCrypto.c" \
+      "$SOURCE_ROOT/control/PrivateVaultAncCanonical.m" \
+      "$SOURCE_ROOT/control/PrivateVaultControlLog.m" \
+      "$SOURCE_ROOT/control/PrivateVaultControlLogInternal.m" \
+      "$SOURCE_ROOT/control/PrivateVaultEekWrap.m" \
+      "$SOURCE_ROOT/control/PrivateVaultEnrollmentOffer.m" \
+      "$SOURCE_ROOT/control/PrivateVaultEnrollmentChallenge.m" \
+      "$SOURCE_ROOT/control/PrivateVaultEnrollmentAuthorization.m" \
+      "$SOURCE_ROOT/control/PrivateVaultManifestCheckpoint.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
+      "$SOURCE_ROOT/control/PrivateVaultManifestCheckpointTests.m" \
+      "$sodium_root/lib/libsodium.a" -o "$output"
+    "$output"
+    lipo "$output" -verify_arch "$architecture"
+  }
+  build_manifest_checkpoint_tests arm64
+  if [[ "$PRIVATE_VAULT_BUILD_ARCHITECTURES" == "universal" ]]; then
+    build_manifest_checkpoint_tests x86_64
   fi
   ;;
 esac
