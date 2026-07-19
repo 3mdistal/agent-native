@@ -140,6 +140,25 @@ function nullable(value: unknown, pattern: RegExp) {
   return value;
 }
 
+const STATUS_KEYS = [
+  "version",
+  "suite",
+  "transcriptId",
+  "phase",
+  "oldBrokerEndpointId",
+  "newBrokerEndpointId",
+  "authorizerEndpointId",
+  "offer",
+  "challenge",
+  "sasDecision",
+  "replacementApproval",
+  "drainId",
+  "drainGeneration",
+  "drain",
+  "rotation",
+  "expiresAt",
+];
+
 function parseStatus(
   value: unknown,
 ): PrivateVaultBrokerReplacementTransportStatus {
@@ -147,24 +166,7 @@ function parseStatus(
     throw new PrivateVaultBrokerReplacementTransportError();
   const input = value as Record<string, unknown>;
   if (
-    !exactKeys(input, [
-      "version",
-      "suite",
-      "transcriptId",
-      "phase",
-      "oldBrokerEndpointId",
-      "newBrokerEndpointId",
-      "authorizerEndpointId",
-      "offer",
-      "challenge",
-      "sasDecision",
-      "replacementApproval",
-      "drainId",
-      "drainGeneration",
-      "drain",
-      "rotation",
-      "expiresAt",
-    ]) ||
+    !exactKeys(input, STATUS_KEYS) ||
     input.version !== 1 ||
     input.suite !== "anc/v1" ||
     typeof input.transcriptId !== "string" ||
@@ -309,6 +311,88 @@ function parseStatus(
     rotation,
     expiresAt: input.expiresAt,
   });
+}
+
+function validateWitnessProgress(
+  value: unknown,
+  status: PrivateVaultBrokerReplacementTransportStatus,
+) {
+  if (value === null) {
+    if (status.drainId !== null)
+      throw new PrivateVaultBrokerReplacementTransportError();
+    return;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new PrivateVaultBrokerReplacementTransportError();
+  const input = value as Record<string, unknown>;
+  nullable(input.deadlineDecisionId, HEX_HASH);
+  nullable(input.terminalJobsDigest, HEX_HASH);
+  nullable(input.completionId, HEX_ID);
+  if (
+    !exactKeys(input, [
+      "drainId",
+      "vaultId",
+      "oldBrokerEndpointId",
+      "replacementBrokerEndpointId",
+      "authorizerEndpointId",
+      "authorizerApprovalId",
+      "authorizerApprovalHash",
+      "drainGeneration",
+      "phase",
+      "deadlineAt",
+      "frozenAt",
+      "deadlineDecisionId",
+      "deadlineDecision",
+      "deadlineDecidedAt",
+      "witnessGeneration",
+      "totalJobCount",
+      "completedJobCount",
+      "failedJobCount",
+      "cancelledJobCount",
+      "terminalJobsDigest",
+      "witnessedAt",
+      "completionId",
+      "completedAt",
+    ]) ||
+    input.drainId !== status.drainId ||
+    input.oldBrokerEndpointId !== status.oldBrokerEndpointId ||
+    input.replacementBrokerEndpointId !== status.newBrokerEndpointId ||
+    input.authorizerEndpointId !== status.authorizerEndpointId ||
+    input.authorizerApprovalId !== status.drainId ||
+    typeof input.vaultId !== "string" ||
+    !HEX_ID.test(input.vaultId) ||
+    typeof input.authorizerApprovalHash !== "string" ||
+    !HEX_HASH.test(input.authorizerApprovalHash) ||
+    input.drainGeneration !== status.drainGeneration ||
+    !["draining", "witnessed", "committed", "aborted"].includes(
+      input.phase as string,
+    ) ||
+    typeof input.deadlineAt !== "string" ||
+    !ISO_TIME.test(input.deadlineAt) ||
+    typeof input.frozenAt !== "string" ||
+    !ISO_TIME.test(input.frozenAt) ||
+    ![null, "abort", "cancel_nonterminal", "expire_nonterminal"].includes(
+      input.deadlineDecision as never,
+    ) ||
+    (input.deadlineDecidedAt !== null &&
+      (typeof input.deadlineDecidedAt !== "string" ||
+        !ISO_TIME.test(input.deadlineDecidedAt))) ||
+    (input.witnessedAt !== null &&
+      (typeof input.witnessedAt !== "string" ||
+        !ISO_TIME.test(input.witnessedAt))) ||
+    (input.completedAt !== null &&
+      (typeof input.completedAt !== "string" ||
+        !ISO_TIME.test(input.completedAt)))
+  )
+    throw new PrivateVaultBrokerReplacementTransportError();
+  for (const key of [
+    "witnessGeneration",
+    "totalJobCount",
+    "completedJobCount",
+    "failedJobCount",
+    "cancelledJobCount",
+  ])
+    nullableCount(input[key]);
 }
 
 export class PrivateVaultContentBrokerReplacementTransport {
@@ -503,7 +587,27 @@ export class PrivateVaultContentBrokerReplacementTransport {
           throw new Error();
         return null;
       }
-      const status = parseStatus(value);
+      let statusValue = value;
+      let witnessedProgress: unknown = undefined;
+      if (path.endsWith("/status")) {
+        if (
+          !value ||
+          typeof value !== "object" ||
+          Array.isArray(value) ||
+          !exactKeys(value as Record<string, unknown>, [
+            ...STATUS_KEYS,
+            "witnessedProgress",
+          ])
+        )
+          throw new Error();
+        const { witnessedProgress: progress, ...withoutProgress } =
+          value as Record<string, unknown>;
+        witnessedProgress = progress;
+        statusValue = withoutProgress;
+      }
+      const status = parseStatus(statusValue);
+      if (witnessedProgress !== undefined)
+        validateWitnessProgress(witnessedProgress, status);
       const expectedTranscript = path.match(
         /broker-replacement\/([0-9a-f]{64})\//,
       )?.[1];

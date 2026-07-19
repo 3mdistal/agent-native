@@ -80,6 +80,34 @@ function response(path: string, body: unknown): Response {
   } as unknown as Response;
 }
 
+function progressBody() {
+  return {
+    drainId: "55".repeat(16),
+    vaultId: "99".repeat(16),
+    oldBrokerEndpointId,
+    replacementBrokerEndpointId: newBrokerEndpointId,
+    authorizerEndpointId,
+    authorizerApprovalId: "55".repeat(16),
+    authorizerApprovalHash: "aa".repeat(32),
+    drainGeneration: "00000001",
+    phase: "witnessed",
+    deadlineAt: "2026-07-19T13:00:00.000Z",
+    frozenAt: "2026-07-19T12:00:00.000Z",
+    deadlineDecisionId: null,
+    deadlineDecision: null,
+    deadlineDecidedAt: null,
+    witnessGeneration: 1,
+    totalJobCount: 2,
+    completedJobCount: 2,
+    failedJobCount: 0,
+    cancelledJobCount: 0,
+    terminalJobsDigest: "66".repeat(32),
+    witnessedAt: "2026-07-19T12:01:00.000Z",
+    completionId: null,
+    completedAt: null,
+  };
+}
+
 function transport(fetch: PrivateVaultContentSession["fetch"]) {
   return new PrivateVaultContentBrokerReplacementTransport({
     origin: "https://content-fork.example",
@@ -204,11 +232,31 @@ describe("PrivateVaultContentBrokerReplacementTransport", () => {
     for (const value of [substituted, extra, partial]) {
       const fetch = vi
         .fn<PrivateVaultContentSession["fetch"]>()
-        .mockResolvedValue(response(path, value));
+        .mockResolvedValue(
+          response(path, { ...value, witnessedProgress: null }),
+        );
       await expect(
         transport(fetch).readStatus(transcriptId),
       ).rejects.toBeInstanceOf(PrivateVaultBrokerReplacementTransportError);
     }
+  });
+
+  it("strictly reads witnessed drain progress without accepting it as authority", async () => {
+    const path = `/api/private-vault/broker-replacement/${transcriptId}/status`;
+    const fetch = vi
+      .fn<PrivateVaultContentSession["fetch"]>()
+      .mockResolvedValue(
+        response(path, {
+          ...statusBody("drained"),
+          witnessedProgress: progressBody(),
+        }),
+      );
+    await expect(
+      transport(fetch).readStatus(transcriptId),
+    ).resolves.toMatchObject({
+      phase: "drained",
+      drain: { signedAttestation: attestation },
+    });
   });
 
   it("rejects non-HTTPS origins and malformed coordinates before transport", async () => {
