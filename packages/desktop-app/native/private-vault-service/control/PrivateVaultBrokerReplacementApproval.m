@@ -114,9 +114,82 @@ static NSData *DomainHash(const uint8_t *domain, size_t domainLength,
 
 NSData *AncPrivateVaultBrokerReplacementApprovalFreezeId(
     NSData *encodedApproval) {
-  NSData *hash = encodedApproval.length > 0 && encodedApproval.length <= 1024
-      ? DomainHash(kFreezeDomain, sizeof kFreezeDomain, encodedApproval)
-      : nil;
+  AncPrivateVaultCanonicalStatus canonicalStatus;
+  AncPrivateVaultCanonicalValue *root =
+      AncPrivateVaultCanonicalDecode(encodedApproval, 1024, &canonicalStatus);
+  NSDictionary<NSNumber *, AncPrivateVaultCanonicalValue *> *map =
+      root.type == AncPrivateVaultCanonicalTypeMap ? root.mapValue : nil;
+  NSArray<NSNumber *> *keys = @[
+    @1, @2, @3, @4, @5, @620, @621, @622, @623, @624, @625, @626, @627,
+    @628, @629, @630, @631, @632, @633, @634, @635, @636
+  ];
+  AncPrivateVaultCanonicalValue *created =
+      Field(map, @4, AncPrivateVaultCanonicalTypeInteger);
+  AncPrivateVaultCanonicalValue *sequence =
+      Field(map, @629, AncPrivateVaultCanonicalTypeInteger);
+  AncPrivateVaultCanonicalValue *epoch =
+      Field(map, @632, AncPrivateVaultCanonicalTypeInteger);
+  AncPrivateVaultCanonicalValue *generation =
+      Field(map, @634, AncPrivateVaultCanonicalTypeInteger);
+  AncPrivateVaultCanonicalValue *deadline =
+      Field(map, @635, AncPrivateVaultCanonicalTypeInteger);
+  NSData *envelopeId =
+      Field(map, @5, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  NSData *issuerId =
+      Field(map, @620, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  NSData *oldBrokerId =
+      Field(map, @621, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  NSData *candidateId =
+      Field(map, @622, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  NSData *candidateEnrollmentRef =
+      Field(map, @625, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  BOOL structurallyValid =
+      ExactKeys(map, keys) &&
+      [Field(map, @1, AncPrivateVaultCanonicalTypeText).textValue
+          isEqualToString:@"anc/v1"] &&
+      Exact(Field(map, @2, AncPrivateVaultCanonicalTypeBytes).bytesValue, 16) &&
+      [Field(map, @3, AncPrivateVaultCanonicalTypeText).textValue
+          isEqualToString:@"broker_replacement_approval"] &&
+      created.integerValue > 0 &&
+      (uint64_t)created.integerValue <= kMaxSafeInteger &&
+      Exact(envelopeId, 16) && Exact(issuerId, 16) && Exact(oldBrokerId, 16) &&
+      Exact(candidateId, 16) &&
+      Exact(Field(map, @623, AncPrivateVaultCanonicalTypeBytes).bytesValue,
+            32) &&
+      Exact(Field(map, @624, AncPrivateVaultCanonicalTypeBytes).bytesValue,
+            32) &&
+      Same(candidateEnrollmentRef, envelopeId) &&
+      Exact(Field(map, @626, AncPrivateVaultCanonicalTypeBytes).bytesValue,
+            32) &&
+      Exact(Field(map, @627, AncPrivateVaultCanonicalTypeBytes).bytesValue,
+            32) &&
+      Exact(Field(map, @628, AncPrivateVaultCanonicalTypeBytes).bytesValue,
+            32) &&
+      sequence.integerValue > 0 &&
+      (uint64_t)sequence.integerValue <= kMaxSafeInteger &&
+      Exact(Field(map, @630, AncPrivateVaultCanonicalTypeBytes).bytesValue,
+            32) &&
+      Exact(Field(map, @631, AncPrivateVaultCanonicalTypeBytes).bytesValue,
+            32) &&
+      epoch.integerValue > 0 &&
+      (uint64_t)epoch.integerValue <= kMaxSafeInteger &&
+      Exact(Field(map, @633, AncPrivateVaultCanonicalTypeBytes).bytesValue,
+            16) &&
+      generation.integerValue > 0 &&
+      (uint64_t)generation.integerValue <= kMaxSafeInteger &&
+      deadline.integerValue > 0 &&
+      (uint64_t)deadline.integerValue <= kMaxSafeInteger &&
+      deadline.integerValue > created.integerValue &&
+      (uint64_t)(deadline.integerValue - created.integerValue) <=
+          kMaximumDeadlineSeconds &&
+      Exact(Field(map, @636, AncPrivateVaultCanonicalTypeBytes).bytesValue,
+            64) &&
+      !Same(oldBrokerId, issuerId) && !Same(candidateId, oldBrokerId) &&
+      !Same(candidateId, issuerId);
+  NSData *hash = structurallyValid
+                     ? DomainHash(kFreezeDomain, sizeof kFreezeDomain,
+                                  encodedApproval)
+                     : nil;
   return hash.length == 32 ? [hash subdataWithRange:NSMakeRange(0, 16)] : nil;
 }
 

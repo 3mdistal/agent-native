@@ -704,6 +704,23 @@ describe("Private Vault authenticated rotation append", () => {
       recoveryWrapHash,
       recoveryWrapByteLength: recoveryWrap.byteLength,
     });
+    const genericCommittedRetryProof = await createEndpointRequestProof({
+      vaultId: VAULT_ID,
+      endpointId: OWNER_ID,
+      method: "POST",
+      path: "/api/private-vault/control-log/append",
+      body,
+      issuedAt: rotation.createdAt,
+      nonce: "e2".repeat(16),
+      signingPrivateKey: ownerSigning.privateKey,
+    });
+    await expect(
+      appendRotation({
+        body,
+        proof: genericCommittedRetryProof,
+        now: new Date(requestTime.getTime() + 5_500),
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
     const projectedEndpoints = await getDb()
       .select()
       .from(schema.contentEncryptedVaultEndpoints);
@@ -888,6 +905,7 @@ describe("Private Vault authenticated rotation append", () => {
         body,
         proof: retryProof,
         now: new Date(retryTime.getTime() + 500),
+        onVerifiedRotationAppend: ceremonyCommit,
       }),
     ).resolves.toEqual(receiptBytes);
 

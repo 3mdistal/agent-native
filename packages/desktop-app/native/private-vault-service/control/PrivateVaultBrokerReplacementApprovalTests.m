@@ -163,6 +163,12 @@ static void FrozenVector(void) {
       description] length] > 0);
   assert([AncPrivateVaultBrokerReplacementApprovalFreezeId(encoded)
       isEqualToData:Hex(@"ae073b3a1fe16f05bb2eb869e7970778")]);
+  assert(AncPrivateVaultBrokerReplacementApprovalFreezeId(
+             [encoded subdataWithRange:NSMakeRange(0, encoded.length - 1)]) ==
+         nil);
+  assert(AncPrivateVaultBrokerReplacementApprovalFreezeId(
+             [@"not-an-approval" dataUsingEncoding:NSUTF8StringEncoding]) ==
+         nil);
 
   uint8_t issuerPublic[32] = {0}, issuerPrivate[64] = {0};
   assert(anc_pv_ed25519_seed_keypair(issuerPublic, issuerPrivate, issuerSeed) ==
@@ -175,7 +181,8 @@ static void FrozenVector(void) {
       Member(Range(0x30, 16), @"broker", YES, Repeated(0x33, 32),
              Repeated(0x34, 32), Repeated(0x35, 16)),
       31, Range(0x11, 32), Range(0x31, 32), 7);
-  AncPrivateVaultBrokerReplacementApprovalStatus status;
+  __block AncPrivateVaultBrokerReplacementApprovalStatus status =
+      AncPrivateVaultBrokerReplacementApprovalStatusInvalid;
   AncPrivateVaultBrokerReplacementApproval *(^verify)(NSData *, uint64_t) =
       ^AncPrivateVaultBrokerReplacementApproval *(NSData *value,
                                                   uint64_t now) {
@@ -198,12 +205,19 @@ static void FrozenVector(void) {
       [AncPrivateVaultCanonicalValue map:extraMap], &canonicalStatus);
   assert(verify(extra, UINT64_C(1784452201)) == nil &&
          status == AncPrivateVaultBrokerReplacementApprovalStatusInvalid);
+  assert(AncPrivateVaultBrokerReplacementApprovalFreezeId(extra) == nil);
   NSMutableDictionary *missingMap = [root.mapValue mutableCopy];
   [missingMap removeObjectForKey:@626];
   NSData *missing = AncPrivateVaultCanonicalEncode(
       [AncPrivateVaultCanonicalValue map:missingMap], &canonicalStatus);
   assert(verify(missing, UINT64_C(1784452201)) == nil &&
          status == AncPrivateVaultBrokerReplacementApprovalStatusInvalid);
+  assert(AncPrivateVaultBrokerReplacementApprovalFreezeId(missing) == nil);
+  NSMutableDictionary *wrongSuiteMap = [root.mapValue mutableCopy];
+  wrongSuiteMap[@1] = [AncPrivateVaultCanonicalValue text:@"anc/v2"];
+  NSData *wrongSuite = AncPrivateVaultCanonicalEncode(
+      [AncPrivateVaultCanonicalValue map:wrongSuiteMap], &canonicalStatus);
+  assert(AncPrivateVaultBrokerReplacementApprovalFreezeId(wrongSuite) == nil);
   NSMutableData *oversized = [NSMutableData dataWithLength:1025];
   assert(verify(oversized, UINT64_C(1784452201)) == nil &&
          status == AncPrivateVaultBrokerReplacementApprovalStatusInvalid);

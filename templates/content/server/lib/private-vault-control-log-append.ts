@@ -978,7 +978,6 @@ export async function appendPrivateVaultControlLogRotation(input: {
     throw new PrivateVaultControlLogAppendError("conflict");
   }
   if (
-    !committed &&
     rotation.ceremonyKind === "broker_replacement" &&
     !input.onVerifiedRotationAppend
   ) {
