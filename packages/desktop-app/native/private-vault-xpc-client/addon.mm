@@ -36,6 +36,7 @@
 #define PV_JOB_PAYLOAD_MAXIMUM_BYTES (16 * 1024 * 1024)
 #define PV_ENROLLMENT_CHALLENGE_MAXIMUM_BYTES (64 * 1024)
 #define PV_ENROLLMENT_AUTHORIZATION_MAXIMUM_BYTES (256 * 1024)
+#define PV_EEK_WRAP_MAXIMUM_BYTES 1024
 #define PV_BROKER_DRAIN_ATTESTATION_MAXIMUM_BYTES 1024
 #define PV_ROTATION_ARTIFACT_MAXIMUM_BYTES (256 * 1024)
 #define PV_OBJECT_PLAINTEXT_MAXIMUM_BYTES (1024 * 1024)
@@ -145,6 +146,13 @@ struct PVMemberSummary {
   bool current = false;
 };
 
+struct PVEekWrapSummary {
+  char recipientEndpointID[33] = {0};
+  std::vector<uint8_t> envelopeID;
+  std::vector<uint8_t> wrapHash;
+  std::vector<uint8_t> encodedWrap;
+};
+
 struct PVParsedReply {
   PVFailure failure = PVFailure::Connection;
   bool available = false;
@@ -232,6 +240,7 @@ struct PVParsedReply {
   std::vector<PVCandidate> candidates;
   std::vector<PVGrantSummary> grants;
   std::vector<PVMemberSummary> members;
+  std::vector<PVEekWrapSummary> recipientEekWraps;
 };
 
 class PVReplyState {
@@ -420,6 +429,7 @@ struct PVAsyncRequest {
   std::vector<PVCandidate> candidates;
   std::vector<PVGrantSummary> grants;
   std::vector<PVMemberSummary> members;
+  std::vector<PVEekWrapSummary> recipientEekWraps;
 
   ~PVAsyncRequest() {
     if (!recoveryConfirmation.empty())
@@ -508,6 +518,11 @@ struct PVAsyncRequest {
       PVClearBytes(drainID);
     for (auto &candidate : candidates)
       PVClearBytes(candidate.candidate);
+    for (auto &wrap : recipientEekWraps) {
+      PVClearBytes(wrap.envelopeID);
+      PVClearBytes(wrap.wrapHash);
+      PVClearBytes(wrap.encodedWrap);
+    }
   }
 };
 
@@ -1043,7 +1058,12 @@ PVParsedReply PVParseReply(xpc_object_t reply, PVOperation operation,
   }
 
   if (operation == PVOperation::RemoveEndpoint) {
-    const char *const keys[] = {"version", "ok", "requestId", "state", "vaultId", "targetEndpointId", "createdAt"};
+    const char *const keys[] = {
+        "version", "ok", "requestId", "state", "vaultId",
+        "targetEndpointId", "createdAt", "ceremonyId", "signedEntry",
+        "recoveryWrap", "transcriptDigest", "baseSequence", "baseHead",
+        "baseMembership", "baseEpoch", "pendingEpoch", "recipientEekWraps",
+    };
     const char *state = PVGetString(reply, "state");
     const char *vaultID = PVGetString(reply, "vaultId");
     const char *target = PVGetString(reply, "targetEndpointId");
@@ -1052,17 +1072,89 @@ PVParsedReply PVParseReply(xpc_object_t reply, PVOperation operation,
                                  xpc_get_type(createdAtValue) == XPC_TYPE_UINT64
                              ? xpc_dictionary_get_uint64(reply, "createdAt")
                              : 0;
-    if (!PVHasExactKeys(reply, keys, 7) || !PVRequestIDMatches(reply, requestID) ||
+    xpc_object_t baseSequenceValue =
+        xpc_dictionary_get_value(reply, "baseSequence");
+    xpc_object_t baseEpochValue = xpc_dictionary_get_value(reply, "baseEpoch");
+    xpc_object_t pendingEpochValue =
+        xpc_dictionary_get_value(reply, "pendingEpoch");
+    uint64_t baseSequence =
+        baseSequenceValue != nullptr &&
+                xpc_get_type(baseSequenceValue) == XPC_TYPE_UINT64
+            ? xpc_dictionary_get_uint64(reply, "baseSequence")
+            : UINT64_MAX;
+    uint64_t baseEpoch =
+        baseEpochValue != nullptr && xpc_get_type(baseEpochValue) == XPC_TYPE_UINT64
+            ? xpc_dictionary_get_uint64(reply, "baseEpoch")
+            : 0;
+    uint64_t pendingEpoch =
+        pendingEpochValue != nullptr &&
+                xpc_get_type(pendingEpochValue) == XPC_TYPE_UINT64
+            ? xpc_dictionary_get_uint64(reply, "pendingEpoch")
+            : 0;
+    xpc_object_t wraps = xpc_dictionary_get_value(reply, "recipientEekWraps");
+    if (!PVHasExactKeys(reply, keys, 17) || !PVRequestIDMatches(reply, requestID) ||
         state == nullptr || strcmp(state, "pending") != 0 ||
         !PVIsLowerHex(vaultID, 32) || expectedVaultID == nullptr ||
         strcmp(vaultID, expectedVaultID) != 0 || !PVIsLowerHex(target, 32) ||
-        createdAt == 0 || createdAt > UINT64_C(9007199254740991)) {
+        createdAt == 0 || createdAt > UINT64_C(9007199254740991) ||
+        baseSequence > UINT64_C(9007199254740991) || baseEpoch == 0 ||
+        baseEpoch >= UINT64_C(9007199254740991) ||
+        pendingEpoch != baseEpoch + 1 || wraps == nullptr ||
+        xpc_get_type(wraps) != XPC_TYPE_ARRAY || xpc_array_get_count(wraps) == 0 ||
+        xpc_array_get_count(wraps) > 64 ||
+        !PVCopyBoundedData(reply, "ceremonyId", 16, parsed.ceremonyID) ||
+        parsed.ceremonyID.size() != 16 ||
+        !PVCopyBoundedData(reply, "signedEntry",
+                           PV_ROTATION_ARTIFACT_MAXIMUM_BYTES,
+                           parsed.signedEntry) ||
+        !PVCopyBoundedData(reply, "recoveryWrap",
+                           PV_ROTATION_ARTIFACT_MAXIMUM_BYTES,
+                           parsed.recoveryWrap) ||
+        !PVCopyBoundedData(reply, "transcriptDigest", 32,
+                           parsed.transcriptDigest) ||
+        parsed.transcriptDigest.size() != 32 ||
+        !PVCopyBoundedData(reply, "baseHead", 32, parsed.baseHead) ||
+        parsed.baseHead.size() != 32 ||
+        !PVCopyBoundedData(reply, "baseMembership", 32,
+                           parsed.baseMembership) ||
+        parsed.baseMembership.size() != 32) {
       parsed.failure = PVFailure::MalformedReply; return parsed;
+    }
+    const char *previousRecipient = nullptr;
+    for (size_t index = 0; index < xpc_array_get_count(wraps); index += 1) {
+      xpc_object_t item = xpc_array_get_value(wraps, index);
+      const char *const itemKeys[] = {"recipientEndpointId", "envelopeId",
+                                      "wrapHash", "encodedWrap"};
+      const char *recipient =
+          item != nullptr && xpc_get_type(item) == XPC_TYPE_DICTIONARY
+              ? PVGetString(item, "recipientEndpointId")
+              : nullptr;
+      PVEekWrapSummary summary;
+      if (item == nullptr || xpc_get_type(item) != XPC_TYPE_DICTIONARY ||
+          !PVHasExactKeys(item, itemKeys, 4) ||
+          !PVIsLowerHex(recipient, 32) || strcmp(recipient, target) == 0 ||
+          (previousRecipient != nullptr &&
+           strcmp(previousRecipient, recipient) >= 0) ||
+          !PVCopyBoundedData(item, "envelopeId", 16, summary.envelopeID) ||
+          summary.envelopeID.size() != 16 ||
+          !PVCopyBoundedData(item, "wrapHash", 32, summary.wrapHash) ||
+          summary.wrapHash.size() != 32 ||
+          !PVCopyBoundedData(item, "encodedWrap", PV_EEK_WRAP_MAXIMUM_BYTES,
+                             summary.encodedWrap)) {
+        parsed.failure = PVFailure::MalformedReply;
+        return parsed;
+      }
+      memcpy(summary.recipientEndpointID, recipient, 33);
+      parsed.recipientEekWraps.push_back(std::move(summary));
+      previousRecipient = parsed.recipientEekWraps.back().recipientEndpointID;
     }
     memcpy(parsed.state, state, strlen(state) + 1);
     memcpy(parsed.vaultID, vaultID, 33);
     memcpy(parsed.targetEndpointID, target, 33);
     parsed.issuedAt = createdAt;
+    parsed.baseSequence = baseSequence;
+    parsed.baseEpoch = baseEpoch;
+    parsed.pendingEpoch = pendingEpoch;
     parsed.failure = PVFailure::None; return parsed;
   }
 
@@ -2992,6 +3084,7 @@ void PVExecute(napi_env env, void *data) {
     request->disclosureScopeHash = std::move(parsed.disclosureScopeHash);
     request->grants = std::move(parsed.grants);
     request->members = std::move(parsed.members);
+    request->recipientEekWraps = std::move(parsed.recipientEekWraps);
     request->sasTranscriptHash = std::move(parsed.sasTranscriptHash);
     request->manifestCheckpoint = std::move(parsed.manifestCheckpoint);
     request->manifestAuthorization = std::move(parsed.manifestAuthorization);
@@ -3245,6 +3338,46 @@ void PVComplete(napi_env env, napi_status status, void *data) {
       PVSetString(env, result, "vaultId", request->vaultID);
       PVSetString(env, result, "targetEndpointId", request->targetEndpointID);
       PVSetSafeInteger(env, result, "createdAt", request->issuedAt);
+      PVSetSafeInteger(env, result, "baseSequence", request->baseSequence);
+      PVSetSafeInteger(env, result, "baseEpoch", request->baseEpoch);
+      PVSetSafeInteger(env, result, "pendingEpoch", request->pendingEpoch);
+      napi_value wraps;
+      bool valid = PVSetBuffer(env, result, "ceremonyId", request->ceremonyID) &&
+          PVSetBuffer(env, result, "signedEntry", request->signedEntry) &&
+          PVSetBuffer(env, result, "recoveryWrap", request->recoveryWrap) &&
+          PVSetBuffer(env, result, "transcriptDigest",
+                      request->transcriptDigest) &&
+          PVSetBuffer(env, result, "baseHead", request->baseHead) &&
+          PVSetBuffer(env, result, "baseMembership", request->baseMembership) &&
+          napi_create_array_with_length(env, request->recipientEekWraps.size(),
+                                        &wraps) == napi_ok;
+      for (size_t index = 0; valid && index < request->recipientEekWraps.size();
+           index += 1) {
+        const PVEekWrapSummary &summary = request->recipientEekWraps[index];
+        napi_value item;
+        valid = napi_create_object(env, &item) == napi_ok;
+        if (!valid) break;
+        PVSetString(env, item, "recipientEndpointId",
+                    summary.recipientEndpointID);
+        valid = PVSetBuffer(env, item, "envelopeId", summary.envelopeID) &&
+            PVSetBuffer(env, item, "wrapHash", summary.wrapHash) &&
+            PVSetBuffer(env, item, "encodedWrap", summary.encodedWrap) &&
+            napi_set_element(env, wraps, index, item) == napi_ok;
+      }
+      valid = valid &&
+          napi_set_named_property(env, result, "recipientEekWraps", wraps) ==
+              napi_ok;
+      if (!valid) {
+        napi_value message;
+        napi_value error;
+        PVCreateString(env, "Private Vault native service request failed",
+                       &message);
+        napi_create_error(env, nullptr, message, &error);
+        napi_reject_deferred(env, request->deferred, error);
+        napi_delete_async_work(env, request->work);
+        delete request;
+        return;
+      }
     } else if (request->operation == PVOperation::ReplaceBroker) {
       PVSetString(env, result, "vaultId", request->vaultID);
       PVSetString(env, result, "oldBrokerEndpointId",

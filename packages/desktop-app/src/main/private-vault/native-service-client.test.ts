@@ -1071,23 +1071,49 @@ describe("Private Vault native service client", () => {
       new PrivateVaultNativeServiceClientError(),
     );
   });
-  it("starts endpoint removal without exposing signed rotation artifacts", async () => {
+  it("returns the exact public endpoint-removal ceremony without secret coordinates", async () => {
     const vaultId = "00112233445566778899aabbccddeeff";
-    const targetEndpointId = "11112222333344445555666677778888";
-    const request = vi.fn(async () => ({
+    const targetEndpointId = "99".repeat(16);
+    const publicArtifacts = {
+      ceremonyId: Buffer.alloc(16, 1),
+      signedEntry: Buffer.from([0xa1, 0x01, 0x01]),
+      recoveryWrap: Buffer.from([0xa1, 0x02, 0x02]),
+      transcriptDigest: Buffer.alloc(32, 3),
+      baseSequence: 7,
+      baseHead: Buffer.alloc(32, 4),
+      baseMembership: Buffer.alloc(32, 5),
+      baseEpoch: 3,
+      pendingEpoch: 4,
+      recipientEekWraps: [
+        {
+          recipientEndpointId: "11".repeat(16),
+          envelopeId: Buffer.alloc(16, 6),
+          wrapHash: Buffer.alloc(32, 7),
+          encodedWrap: Buffer.from([0xa1, 0x03, 0x03]),
+        },
+        {
+          recipientEndpointId: "22".repeat(16),
+          envelopeId: Buffer.alloc(16, 8),
+          wrapHash: Buffer.alloc(32, 9),
+          encodedWrap: Buffer.from([0xa1, 0x04, 0x04]),
+        },
+      ],
+    };
+    const reply = {
       version: 3,
       operation: "remove_endpoint",
       state: "pending",
       vaultId,
       targetEndpointId,
       createdAt: 1_721_296_802,
-    }));
+      ...publicArtifacts,
+    };
+    const request = vi.fn(async () => reply);
     const client = createPrivateVaultNativeServiceClientForTest(async () => ({
       request,
     }));
-    await expect(
-      client.removeVaultEndpoint(vaultId, targetEndpointId),
-    ).resolves.toEqual({
+    const result = await client.removeVaultEndpoint(vaultId, targetEndpointId);
+    expect(result).toMatchObject({
       version: 1,
       suite: "anc/v1",
       operation: "remove_endpoint",
@@ -1095,12 +1121,60 @@ describe("Private Vault native service client", () => {
       vaultId,
       targetEndpointId,
       createdAt: 1_721_296_802,
+      baseSequence: 7,
+      baseEpoch: 3,
+      pendingEpoch: 4,
     });
+    expect(result.ceremonyId).toEqual(
+      Uint8Array.from(publicArtifacts.ceremonyId),
+    );
+    expect(result.signedEntry).toEqual(
+      Uint8Array.from(publicArtifacts.signedEntry),
+    );
+    expect(result.recoveryWrap).toEqual(
+      Uint8Array.from(publicArtifacts.recoveryWrap),
+    );
+    expect(result.recipientEekWraps).toHaveLength(2);
+    expect(result.recipientEekWraps[0]?.wrapHash).toEqual(
+      Uint8Array.from(publicArtifacts.recipientEekWraps[0]!.wrapHash),
+    );
     expect(request).toHaveBeenCalledWith(
       "remove_endpoint",
       vaultId,
       targetEndpointId,
     );
+    expect(wrapperSource).not.toContain("pendingEpochKey");
+    expect(wrapperSource).not.toContain("issuerSigningSeed");
+
+    for (const mutation of [
+      { pendingEpoch: 5 },
+      { transcriptDigest: Buffer.alloc(31, 3) },
+      { recipientEekWraps: [] },
+      {
+        recipientEekWraps: [
+          publicArtifacts.recipientEekWraps[1],
+          publicArtifacts.recipientEekWraps[0],
+        ],
+      },
+      {
+        recipientEekWraps: [
+          {
+            ...publicArtifacts.recipientEekWraps[0],
+            recipientEndpointId: targetEndpointId,
+          },
+        ],
+      },
+      { checkpointSignature: Buffer.alloc(64) },
+    ]) {
+      const hostile = createPrivateVaultNativeServiceClientForTest(
+        async () => ({
+          request: vi.fn(async () => ({ ...reply, ...mutation })),
+        }),
+      );
+      await expect(
+        hostile.removeVaultEndpoint(vaultId, targetEndpointId),
+      ).rejects.toBeInstanceOf(PrivateVaultNativeServiceClientError);
+    }
   });
 
   it("lists only content-free grant summaries through the native boundary", async () => {

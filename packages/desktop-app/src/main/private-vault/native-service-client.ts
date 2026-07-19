@@ -270,6 +270,23 @@ export interface NativePendingEndpointRemovalResult {
   readonly vaultId: string;
   readonly targetEndpointId: string;
   readonly createdAt: number;
+  readonly ceremonyId: Uint8Array;
+  readonly signedEntry: Uint8Array;
+  readonly recoveryWrap: Uint8Array;
+  readonly transcriptDigest: Uint8Array;
+  readonly baseSequence: number;
+  readonly baseHead: Uint8Array;
+  readonly baseMembership: Uint8Array;
+  readonly baseEpoch: number;
+  readonly pendingEpoch: number;
+  readonly recipientEekWraps: readonly NativeEndpointRemovalEekWrap[];
+}
+
+export interface NativeEndpointRemovalEekWrap {
+  readonly recipientEndpointId: string;
+  readonly envelopeId: Uint8Array;
+  readonly wrapHash: Uint8Array;
+  readonly encodedWrap: Uint8Array;
 }
 
 export interface NativeBrokerReplacementDecisionInput {
@@ -1664,15 +1681,70 @@ function parsePendingEndpointRemoval(
       "vaultId",
       "targetEndpointId",
       "createdAt",
+      "ceremonyId",
+      "signedEntry",
+      "recoveryWrap",
+      "transcriptDigest",
+      "baseSequence",
+      "baseHead",
+      "baseMembership",
+      "baseEpoch",
+      "pendingEpoch",
+      "recipientEekWraps",
     ]) ||
     value.version !== XPC_PROTOCOL_VERSION ||
     value.operation !== "remove_endpoint" ||
     value.state !== "pending" ||
     value.vaultId !== vaultId ||
     value.targetEndpointId !== targetEndpointId ||
-    !isSafeInteger(value.createdAt, true)
+    !isSafeInteger(value.createdAt, true) ||
+    !isSafeInteger(value.baseSequence, false) ||
+    !isSafeInteger(value.baseEpoch, true) ||
+    value.baseEpoch >= Number.MAX_SAFE_INTEGER ||
+    value.pendingEpoch !== value.baseEpoch + 1 ||
+    !Array.isArray(value.recipientEekWraps) ||
+    value.recipientEekWraps.length === 0 ||
+    value.recipientEekWraps.length > 64
   )
     throw new PrivateVaultNativeServiceClientError();
+  const ceremonyId = copyBoundedBytes(value.ceremonyId, 16);
+  const transcriptDigest = copyBoundedBytes(value.transcriptDigest, 32);
+  const baseHead = copyBoundedBytes(value.baseHead, 32);
+  const baseMembership = copyBoundedBytes(value.baseMembership, 32);
+  if (
+    ceremonyId.byteLength !== 16 ||
+    transcriptDigest.byteLength !== 32 ||
+    baseHead.byteLength !== 32 ||
+    baseMembership.byteLength !== 32
+  )
+    throw new PrivateVaultNativeServiceClientError();
+  let previousRecipient = "";
+  const recipientEekWraps = value.recipientEekWraps.map((item) => {
+    if (
+      !isRecord(item) ||
+      !hasExactKeys(item, [
+        "recipientEndpointId",
+        "envelopeId",
+        "wrapHash",
+        "encodedWrap",
+      ]) ||
+      !isLowerHex(item.recipientEndpointId, 32) ||
+      item.recipientEndpointId === targetEndpointId ||
+      item.recipientEndpointId <= previousRecipient
+    )
+      throw new PrivateVaultNativeServiceClientError();
+    previousRecipient = item.recipientEndpointId;
+    const envelopeId = copyBoundedBytes(item.envelopeId, 16);
+    const wrapHash = copyBoundedBytes(item.wrapHash, 32);
+    if (envelopeId.byteLength !== 16 || wrapHash.byteLength !== 32)
+      throw new PrivateVaultNativeServiceClientError();
+    return Object.freeze({
+      recipientEndpointId: item.recipientEndpointId,
+      envelopeId,
+      wrapHash,
+      encodedWrap: copyBoundedBytes(item.encodedWrap, 1_024),
+    });
+  });
   return Object.freeze({
     version: SERVICE_VERSION,
     suite: SERVICE_SUITE,
@@ -1681,6 +1753,16 @@ function parsePendingEndpointRemoval(
     vaultId,
     targetEndpointId,
     createdAt: value.createdAt,
+    ceremonyId,
+    signedEntry: copyBoundedBytes(value.signedEntry, 256 * 1_024),
+    recoveryWrap: copyBoundedBytes(value.recoveryWrap, 256 * 1_024),
+    transcriptDigest,
+    baseSequence: value.baseSequence,
+    baseHead,
+    baseMembership,
+    baseEpoch: value.baseEpoch,
+    pendingEpoch: value.pendingEpoch,
+    recipientEekWraps: Object.freeze(recipientEekWraps),
   });
 }
 

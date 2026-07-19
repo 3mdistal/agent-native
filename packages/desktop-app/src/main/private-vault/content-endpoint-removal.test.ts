@@ -17,6 +17,35 @@ const newRevisionOne = "77".repeat(32);
 const newRevisionTwo = "88".repeat(32);
 const newManifestRevisionId = "99".repeat(32);
 
+function pendingRemovalResult() {
+  return {
+    version: 1 as const,
+    suite: "anc/v1" as const,
+    operation: "remove_endpoint" as const,
+    state: "pending" as const,
+    vaultId,
+    targetEndpointId,
+    createdAt: 1_721_296_802,
+    ceremonyId: new Uint8Array(16),
+    signedEntry: Uint8Array.of(1),
+    recoveryWrap: Uint8Array.of(2),
+    transcriptDigest: new Uint8Array(32),
+    baseSequence: 4,
+    baseHead: new Uint8Array(32),
+    baseMembership: new Uint8Array(32),
+    baseEpoch: 7,
+    pendingEpoch: 8,
+    recipientEekWraps: [
+      {
+        recipientEndpointId: "aa".repeat(16),
+        envelopeId: new Uint8Array(16),
+        wrapHash: new Uint8Array(32),
+        encodedWrap: Uint8Array.of(3),
+      },
+    ],
+  };
+}
+
 function head(): PrivateVaultLocalManifestHead {
   return {
     version: 1,
@@ -120,15 +149,7 @@ describe("Private Vault endpoint removal preparation", () => {
       })),
     };
     const native = {
-      removeVaultEndpoint: vi.fn(async () => ({
-        version: 1 as const,
-        suite: "anc/v1" as const,
-        operation: "remove_endpoint" as const,
-        state: "pending" as const,
-        vaultId,
-        targetEndpointId,
-        createdAt: 1_721_296_802,
-      })),
+      removeVaultEndpoint: vi.fn(async () => pendingRemovalResult()),
     };
     const preparer = new PrivateVaultContentEndpointRemovalPreparer({
       native,
@@ -216,15 +237,7 @@ describe("Private Vault endpoint removal preparation", () => {
     const ids = [newRevisionOne, newRevisionTwo];
     const preparer = new PrivateVaultContentEndpointRemovalPreparer({
       native: {
-        removeVaultEndpoint: vi.fn(async () => ({
-          version: 1 as const,
-          suite: "anc/v1" as const,
-          operation: "remove_endpoint" as const,
-          state: "pending" as const,
-          vaultId,
-          targetEndpointId,
-          createdAt: 1_721_296_802,
-        })),
+        removeVaultEndpoint: vi.fn(async () => pendingRemovalResult()),
       },
       index,
       transport,

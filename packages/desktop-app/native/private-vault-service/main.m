@@ -1286,6 +1286,18 @@ static NSData *PVManifestCiphertextHash(NSData *encodedRevision) {
     return value;
 }
 
+static NSData *PVEekWrapHash(NSData *encodedWrap) {
+    static const uint8_t domain[] = "anc/v1/eek-wrap";
+    if (encodedWrap.length == 0 || encodedWrap.length > 1024) return nil;
+    uint8_t digest[32] = {0};
+    BOOL okay = anc_pv_blake2b_256_two_part(
+        digest, domain, sizeof domain, encodedWrap.bytes,
+        encodedWrap.length) == ANC_PV_CRYPTO_OK;
+    NSData *value = okay ? [NSData dataWithBytes:digest length:32] : nil;
+    anc_pv_zeroize(digest, sizeof digest);
+    return value;
+}
+
 static BOOL PVEnrollmentEndpointSecrets(
     NSString *vaultId, uint64_t expectedEpoch, BOOL includeEpoch,
     AncPrivateVaultGuardedMemory **signingSeed,
@@ -1938,19 +1950,96 @@ static void PVRemoveEndpoint(xpc_connection_t peer, xpc_object_t message,
                                          targetEndpointId:targetBytes
                                                   prepared:&prepared
                                                 checkpoint:&checkpoint];
+    AncPrivateVaultRotationPreparationSnapshot snapshot =
+        checkpoint == nil ? (AncPrivateVaultRotationPreparationSnapshot){0}
+                          : checkpoint.snapshot;
+    uint64_t createdAt = PVControlStateSignedAtSeconds(prepared.nextState);
+    BOOL valid = status == AncPrivateVaultRotationCoordinatorStatusOK &&
+        prepared != nil && checkpoint != nil &&
+        snapshot.phase == ANC_PV_ROTATION_PREPARATION_PHASE_PREPARED &&
+        snapshot.role == ANC_PV_ROTATION_PREPARATION_ROLE_ENDPOINT &&
+        snapshot.preparation_generation > 0 &&
+        snapshot.preparation_generation <= UINT64_C(9007199254740991) &&
+        snapshot.base_sequence <= UINT64_C(9007199254740991) &&
+        snapshot.base_epoch > 0 &&
+        snapshot.base_epoch < UINT64_C(9007199254740991) &&
+        snapshot.pending_epoch == snapshot.base_epoch + 1 &&
+        memcmp(snapshot.vault_id, vaultID, 16) == 0 &&
+        prepared.signedEntry.length > 0 &&
+        prepared.signedEntry.length <= 256 * 1024 &&
+        prepared.recoveryWrap.length > 0 &&
+        prepared.recoveryWrap.length <= 256 * 1024 &&
+        prepared.transcriptDigest.length == 32 &&
+        prepared.nextState.sequence == snapshot.base_sequence + 1 &&
+        prepared.nextState.epoch == snapshot.pending_epoch &&
+        prepared.nextState.headHash.length == 32 &&
+        prepared.nextState.membershipHash.length == 32 &&
+        [prepared.transcriptDigest
+            isEqualToData:prepared.nextState.membershipHash] &&
+        createdAt > 0 && createdAt <= UINT64_C(9007199254740991) &&
+        prepared.eekWraps.count > 0 && prepared.eekWraps.count <= 64;
+    NSMutableSet<NSData *> *recipients = [NSMutableSet set];
+    NSMutableArray<NSData *> *wrapHashes = [NSMutableArray array];
+    NSData *issuerId = [NSData dataWithBytes:snapshot.endpoint_id length:16];
+    for (AncPrivateVaultEekWrap *wrap in prepared.eekWraps) {
+        NSData *hash = PVEekWrapHash(wrap.encodedEnvelope);
+        BOOL wrapValid = wrap.recipientEndpointId.length == 16 &&
+            wrap.issuerEndpointId.length == 16 &&
+            [wrap.issuerEndpointId isEqualToData:issuerId] &&
+            wrap.envelopeId.length == 16 && wrap.encodedEnvelope.length > 0 &&
+            wrap.encodedEnvelope.length <= 1024 && hash.length == 32 &&
+            wrap.epoch == snapshot.pending_epoch &&
+            wrap.createdAt == createdAt &&
+            ![wrap.recipientEndpointId isEqualToData:targetBytes] &&
+            ![recipients containsObject:wrap.recipientEndpointId];
+        valid = valid && wrapValid;
+        if (!wrapValid) break;
+        [recipients addObject:wrap.recipientEndpointId];
+        [wrapHashes addObject:hash];
+    }
     anc_pv_zeroize(vaultID, sizeof vaultID);
     anc_pv_zeroize(targetEndpointID, sizeof targetEndpointID);
-    if (status != AncPrivateVaultRotationCoordinatorStatusOK || prepared == nil ||
-        checkpoint == nil) {
+    if (!valid || wrapHashes.count != prepared.eekWraps.count) {
+        anc_pv_rotation_preparation_snapshot_zero(&snapshot);
         PVSendError(peer, message, "endpoint_removal_failed"); return;
     }
     xpc_object_t reply = PVCreateReply(message, request);
-    if (reply == NULL) return;
+    if (reply == NULL) {
+        anc_pv_rotation_preparation_snapshot_zero(&snapshot);
+        return;
+    }
     xpc_dictionary_set_string(reply, "state", "pending");
     xpc_dictionary_set_string(reply, "vaultId", request->vaultID);
     xpc_dictionary_set_string(reply, "targetEndpointId", request->targetEndpointID);
-    xpc_dictionary_set_uint64(
-        reply, "createdAt", PVControlStateSignedAtSeconds(prepared.nextState));
+    xpc_dictionary_set_uint64(reply, "createdAt", createdAt);
+    xpc_dictionary_set_data(reply, "ceremonyId", snapshot.ceremony_id, 16);
+    xpc_dictionary_set_data(reply, "signedEntry", prepared.signedEntry.bytes,
+                            prepared.signedEntry.length);
+    xpc_dictionary_set_data(reply, "recoveryWrap", prepared.recoveryWrap.bytes,
+                            prepared.recoveryWrap.length);
+    xpc_dictionary_set_data(reply, "transcriptDigest",
+                            prepared.transcriptDigest.bytes, 32);
+    xpc_dictionary_set_uint64(reply, "baseSequence", snapshot.base_sequence);
+    xpc_dictionary_set_data(reply, "baseHead", snapshot.base_head, 32);
+    xpc_dictionary_set_data(reply, "baseMembership", snapshot.base_membership,
+                            32);
+    xpc_dictionary_set_uint64(reply, "baseEpoch", snapshot.base_epoch);
+    xpc_dictionary_set_uint64(reply, "pendingEpoch", snapshot.pending_epoch);
+    xpc_object_t eekWraps = xpc_array_create(NULL, 0);
+    for (NSUInteger index = 0; index < prepared.eekWraps.count; index += 1) {
+        AncPrivateVaultEekWrap *wrap = prepared.eekWraps[index];
+        xpc_object_t item = xpc_dictionary_create(NULL, NULL, 0);
+        NSString *recipient = PVVaultIDHex(wrap.recipientEndpointId);
+        xpc_dictionary_set_string(item, "recipientEndpointId",
+                                  recipient.UTF8String);
+        xpc_dictionary_set_data(item, "envelopeId", wrap.envelopeId.bytes, 16);
+        xpc_dictionary_set_data(item, "wrapHash", wrapHashes[index].bytes, 32);
+        xpc_dictionary_set_data(item, "encodedWrap", wrap.encodedEnvelope.bytes,
+                                wrap.encodedEnvelope.length);
+        xpc_array_append_value(eekWraps, item);
+    }
+    xpc_dictionary_set_value(reply, "recipientEekWraps", eekWraps);
+    anc_pv_rotation_preparation_snapshot_zero(&snapshot);
     xpc_connection_send_message(peer, reply);
 }
 
