@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import { ancV1BytesToHex } from "./canonical.js";
+import { encodeAncV1ControlLogRotationAppendReceipt } from "./control-log-append.js";
 import { ancV1SigningKeypairFromSeed } from "./portable-crypto.js";
 import {
   ANC_ROTATION_EVIDENCE_SUITE_ID,
@@ -21,6 +23,7 @@ import {
   signAncV1RotationRecipientAcknowledgement,
   signAncV1RotationRecipientOffer,
   verifyAncV1RotationAcknowledgementSet,
+  verifyAncV1CompletedRotationEvidence,
   verifyAncV1RotationControlCommitAttestation,
   verifyAncV1RotationEpochDestructionAttestation,
   verifyAncV1RotationManifestCheckpoint,
@@ -40,6 +43,7 @@ const removedId = fill(4);
 const recipientOneId = issuerId;
 const recipientTwoId = fill(6);
 const pendingEpochKey = fill(7, 32);
+const hostedVaultId = "vault-rotation-test";
 const now = 1_784_451_800;
 
 async function fixture() {
@@ -410,25 +414,40 @@ describe("anc/rotation/v1 evidence", () => {
       value.encodedCheckpoint,
       { expectedVaultId: vaultId },
     );
-    const destruction = encodeAncV1RotationEpochDestructionAttestation(
-      await signAncV1RotationEpochDestructionAttestation(
-        {
-          suite: ANC_ROTATION_EVIDENCE_SUITE_ID,
-          vaultId,
-          type: "rotation-epoch-destruction-attestation",
-          createdAt: now,
-          envelopeId: fill(0x51),
-          ceremonyId,
-          checkpointHash: value.checkpointHash,
-          controlEntryHash: checkpoint.controlEntryHash,
-          endpointId: issuerId,
-          destroyedEpoch: 3,
-          activatedEpoch: 4,
-          custodyGeneration: 8,
-        },
-        value.issuer.privateKey,
-      ),
-    );
+    const makeDestruction = async (input: {
+      endpointId: Uint8Array;
+      privateKey: Uint8Array;
+      marker: number;
+    }) =>
+      encodeAncV1RotationEpochDestructionAttestation(
+        await signAncV1RotationEpochDestructionAttestation(
+          {
+            suite: ANC_ROTATION_EVIDENCE_SUITE_ID,
+            vaultId,
+            type: "rotation-epoch-destruction-attestation",
+            createdAt: now,
+            envelopeId: fill(input.marker),
+            ceremonyId,
+            checkpointHash: value.checkpointHash,
+            controlEntryHash: checkpoint.controlEntryHash,
+            endpointId: input.endpointId,
+            destroyedEpoch: 3,
+            activatedEpoch: 4,
+            custodyGeneration: 8,
+          },
+          input.privateKey,
+        ),
+      );
+    const destruction = await makeDestruction({
+      endpointId: issuerId,
+      privateKey: value.issuer.privateKey,
+      marker: 0x51,
+    });
+    const secondDestruction = await makeDestruction({
+      endpointId: recipientTwoId,
+      privateKey: value.two.keys.privateKey,
+      marker: 0x52,
+    });
     await expect(
       verifyAncV1RotationEpochDestructionAttestation(destruction, {
         expectedVaultId: vaultId,
@@ -444,29 +463,45 @@ describe("anc/rotation/v1 evidence", () => {
       }),
     ).rejects.toBeInstanceOf(AncV1RotationEvidenceError);
 
-    const hostedReceiptHash = await hashAncV1RotationHostedReceipt(
-      new Uint8Array([0xa1, 0x01, 0x02]),
-    );
-    const completion = encodeAncV1RotationControlCommitAttestation(
-      await signAncV1RotationControlCommitAttestation(
-        {
-          suite: ANC_ROTATION_EVIDENCE_SUITE_ID,
-          vaultId,
-          type: "rotation-control-commit-attestation",
-          createdAt: now + 1,
-          envelopeId: fill(0x61),
-          ceremonyId,
-          checkpointHash: value.checkpointHash,
-          controlEntryHash: checkpoint.controlEntryHash,
-          hostedReceiptHash,
-          signerEndpointId: issuerId,
-          committedSequence: 9,
-          committedHeadHash: fill(0x62, 32),
-          recipientSetHash: checkpoint.recipientSetHash,
-        },
-        value.issuer.privateKey,
-      ),
-    );
+    const recoveryWrapHash = fill(0x63, 32);
+    const recoveryWrapByteLength = 128;
+    const hostedEntryId = "rotation-entry-0001";
+    const hostedReceipt = encodeAncV1ControlLogRotationAppendReceipt({
+      version: 1,
+      suite: "anc/v1",
+      type: "control-log-rotation-append-receipt",
+      vaultId: hostedVaultId,
+      entryId: hostedEntryId,
+      sequence: 9,
+      headHash: ancV1BytesToHex(checkpoint.controlEntryHash),
+      recoveryWrapHash: ancV1BytesToHex(recoveryWrapHash),
+      recoveryWrapByteLength,
+    });
+    const makeCompletion = async (encodedReceipt: Uint8Array) =>
+      encodeAncV1RotationControlCommitAttestation(
+        await signAncV1RotationControlCommitAttestation(
+          {
+            suite: ANC_ROTATION_EVIDENCE_SUITE_ID,
+            vaultId,
+            type: "rotation-control-commit-attestation",
+            createdAt: now + 1,
+            envelopeId: fill(0x61),
+            ceremonyId,
+            checkpointHash: value.checkpointHash,
+            controlEntryHash: checkpoint.controlEntryHash,
+            hostedReceiptHash:
+              await hashAncV1RotationHostedReceipt(encodedReceipt),
+            signerEndpointId: issuerId,
+            committedSequence: 9,
+            committedHeadHash: checkpoint.controlEntryHash,
+            recipientSetHash: checkpoint.recipientSetHash,
+          },
+          value.issuer.privateKey,
+        ),
+      );
+    const hostedReceiptHash =
+      await hashAncV1RotationHostedReceipt(hostedReceipt);
+    const completion = await makeCompletion(hostedReceipt);
     await expect(
       verifyAncV1RotationControlCommitAttestation(completion, {
         expectedVaultId: vaultId,
@@ -475,5 +510,75 @@ describe("anc/rotation/v1 evidence", () => {
         signerSigningPublicKey: value.issuer.publicKey,
       }),
     ).resolves.toMatchObject({ committedSequence: 9 });
+
+    const completedInput = {
+      encodedAcknowledgements: [value.one.encodedAck, value.two.encodedAck],
+      encodedDestructions: [destruction, secondDestruction],
+      encodedCompletion: completion,
+      encodedCheckpoint: value.encodedCheckpoint,
+      encodedHostedReceipt: hostedReceipt,
+      expectedHostedEntryId: hostedEntryId,
+      expectedHostedVaultId: hostedVaultId,
+      expectedRecoveryWrapHash: recoveryWrapHash,
+      expectedRecoveryWrapByteLength: recoveryWrapByteLength,
+      expectedVaultId: vaultId,
+      expectedSignerEndpointId: issuerId,
+      signerSigningPublicKey: value.issuer.publicKey,
+      expectedRecipients: [
+        { ...value.recipientSet[0]!, encodedOffer: value.one.encodedOffer },
+        { ...value.recipientSet[1]!, encodedOffer: value.two.encodedOffer },
+      ],
+      pendingEpochKey,
+      now: now + 1,
+    };
+    await expect(
+      verifyAncV1CompletedRotationEvidence(completedInput),
+    ).resolves.toMatchObject({
+      acknowledgements: [{ targetEpoch: 4 }, { targetEpoch: 4 }],
+      destructions: [{ activatedEpoch: 4 }, { activatedEpoch: 4 }],
+      completion: { committedSequence: 9 },
+    });
+    await expect(
+      verifyAncV1CompletedRotationEvidence({
+        ...completedInput,
+        encodedDestructions: [destruction],
+      }),
+    ).rejects.toBeInstanceOf(AncV1RotationEvidenceError);
+    const wrongReceipt = encodeAncV1ControlLogRotationAppendReceipt({
+      version: 1,
+      suite: "anc/v1",
+      type: "control-log-rotation-append-receipt",
+      vaultId: hostedVaultId,
+      entryId: "rotation-entry-0001",
+      sequence: 10,
+      headHash: ancV1BytesToHex(checkpoint.controlEntryHash),
+      recoveryWrapHash: ancV1BytesToHex(fill(0x63, 32)),
+      recoveryWrapByteLength: 128,
+    });
+    await expect(
+      verifyAncV1CompletedRotationEvidence({
+        ...completedInput,
+        encodedHostedReceipt: wrongReceipt,
+        encodedCompletion: await makeCompletion(wrongReceipt),
+      }),
+    ).rejects.toBeInstanceOf(AncV1RotationEvidenceError);
+    const substitutedWrapReceipt = encodeAncV1ControlLogRotationAppendReceipt({
+      version: 1,
+      suite: "anc/v1",
+      type: "control-log-rotation-append-receipt",
+      vaultId: hostedVaultId,
+      entryId: hostedEntryId,
+      sequence: 9,
+      headHash: ancV1BytesToHex(checkpoint.controlEntryHash),
+      recoveryWrapHash: ancV1BytesToHex(fill(0x64, 32)),
+      recoveryWrapByteLength,
+    });
+    await expect(
+      verifyAncV1CompletedRotationEvidence({
+        ...completedInput,
+        encodedHostedReceipt: substitutedWrapReceipt,
+        encodedCompletion: await makeCompletion(substitutedWrapReceipt),
+      }),
+    ).rejects.toBeInstanceOf(AncV1RotationEvidenceError);
   });
 });

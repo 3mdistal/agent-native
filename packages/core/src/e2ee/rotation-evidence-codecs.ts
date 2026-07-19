@@ -5,6 +5,7 @@ import {
   decodeAncV1Envelope,
   encodeAncV1Canonical,
 } from "./canonical.js";
+import { decodeAncV1ControlLogRotationAppendReceipt } from "./control-log-append.js";
 import { E2EE_ENVELOPE_FIELDS } from "./suite.js";
 
 const COMMON = E2EE_ENVELOPE_FIELDS.common;
@@ -1487,6 +1488,7 @@ export async function hashAncV1RotationHostedReceipt(
     encodedReceipt.byteLength > 1_024
   )
     fail("Rotation hosted receipt is outside its limit");
+  decodeAncV1ControlLogRotationAppendReceipt(encodedReceipt);
   return hash("rotation-hosted-receipt-hash", encodedReceipt.slice());
 }
 
@@ -1533,6 +1535,7 @@ export async function verifyAncV1RotationControlCommitAttestation(
   return decoded;
 }
 
+/** Component verification only; this does not establish rotation completion. */
 export async function verifyAncV1RotationAcknowledgementSet(input: {
   readonly encodedAcknowledgements: readonly Uint8Array[];
   readonly encodedCheckpoint: Uint8Array;
@@ -1683,6 +1686,7 @@ export async function verifyAncV1RotationAcknowledgementSet(input: {
   return Object.freeze(verified);
 }
 
+/** Component verification only; this does not establish rotation completion. */
 export async function verifyAncV1RotationDestructionSet(input: {
   readonly encodedAttestations: readonly Uint8Array[];
   readonly encodedCheckpoint: Uint8Array;
@@ -1775,10 +1779,19 @@ export async function verifyAncV1RotationDestructionSet(input: {
   return Object.freeze(verified);
 }
 
+/**
+ * Component verification only. Callers deciding success or publication must
+ * use verifyAncV1CompletedRotationEvidence so notBefore comes from verified
+ * acknowledgement and destruction evidence rather than caller assertion.
+ */
 export async function verifyAncV1RotationCommittedCompletion(input: {
   readonly encodedCompletion: Uint8Array;
   readonly encodedCheckpoint: Uint8Array;
   readonly encodedHostedReceipt: Uint8Array;
+  readonly expectedHostedEntryId: string;
+  readonly expectedHostedVaultId: string;
+  readonly expectedRecoveryWrapHash: Uint8Array;
+  readonly expectedRecoveryWrapByteLength: number;
   readonly expectedVaultId: Uint8Array;
   readonly expectedSignerEndpointId: Uint8Array;
   readonly signerSigningPublicKey: Uint8Array;
@@ -1791,6 +1804,10 @@ export async function verifyAncV1RotationCommittedCompletion(input: {
       "encodedCompletion",
       "encodedCheckpoint",
       "encodedHostedReceipt",
+      "expectedHostedEntryId",
+      "expectedHostedVaultId",
+      "expectedRecoveryWrapHash",
+      "expectedRecoveryWrapByteLength",
       "expectedVaultId",
       "expectedSignerEndpointId",
       "signerSigningPublicKey",
@@ -1810,6 +1827,9 @@ export async function verifyAncV1RotationCommittedCompletion(input: {
   const checkpointHash = await hashAncV1RotationManifestCheckpoint(
     input.encodedCheckpoint,
     input.expectedVaultId,
+  );
+  const receipt = decodeAncV1ControlLogRotationAppendReceipt(
+    input.encodedHostedReceipt,
   );
   const receiptHash = await hashAncV1RotationHostedReceipt(
     input.encodedHostedReceipt,
@@ -1831,6 +1851,19 @@ export async function verifyAncV1RotationCommittedCompletion(input: {
     !same(completion.controlEntryHash, checkpoint.controlEntryHash) ||
     !same(completion.committedHeadHash, checkpoint.controlEntryHash) ||
     !same(completion.recipientSetHash, checkpoint.recipientSetHash) ||
+    receipt.vaultId !== input.expectedHostedVaultId ||
+    receipt.entryId !== input.expectedHostedEntryId ||
+    receipt.sequence !== checkpoint.baseSequence + 1 ||
+    receipt.headHash !== hex(checkpoint.controlEntryHash) ||
+    receipt.recoveryWrapHash !==
+      hex(
+        bytes(input.expectedRecoveryWrapHash, 32, "expectedRecoveryWrapHash"),
+      ) ||
+    receipt.recoveryWrapByteLength !==
+      positive(
+        input.expectedRecoveryWrapByteLength,
+        "expectedRecoveryWrapByteLength",
+      ) ||
     checkpoint.baseSequence === Number.MAX_SAFE_INTEGER ||
     completion.committedSequence !== checkpoint.baseSequence + 1 ||
     completion.createdAt + ANC_ROTATION_EVIDENCE_SIZE_LIMITS.clockSkewSeconds <
@@ -1840,4 +1873,110 @@ export async function verifyAncV1RotationCommittedCompletion(input: {
   )
     fail("Rotation completion is not bound to committed ceremony evidence");
   return completion;
+}
+
+export interface AncV1CompletedRotationEvidence {
+  readonly acknowledgements: readonly AncV1RotationRecipientAcknowledgement[];
+  readonly destructions: readonly AncV1RotationEpochDestructionAttestation[];
+  readonly completion: AncV1RotationControlCommitAttestation;
+}
+
+/**
+ * The sole success predicate for a completed attended rotation. The caller must
+ * not publish a new live manifest or report endpoint removal until this verifier
+ * accepts the complete, canonical evidence bundle.
+ */
+export async function verifyAncV1CompletedRotationEvidence(input: {
+  readonly encodedAcknowledgements: readonly Uint8Array[];
+  readonly encodedDestructions: readonly Uint8Array[];
+  readonly encodedCompletion: Uint8Array;
+  readonly encodedCheckpoint: Uint8Array;
+  readonly encodedHostedReceipt: Uint8Array;
+  readonly expectedHostedEntryId: string;
+  readonly expectedHostedVaultId: string;
+  readonly expectedRecoveryWrapHash: Uint8Array;
+  readonly expectedRecoveryWrapByteLength: number;
+  readonly expectedVaultId: Uint8Array;
+  readonly expectedSignerEndpointId: Uint8Array;
+  readonly signerSigningPublicKey: Uint8Array;
+  readonly expectedRecipients: readonly (AncV1RotationRecipient & {
+    readonly encodedOffer: Uint8Array;
+  })[];
+  readonly pendingEpochKey: Uint8Array;
+  readonly now: number;
+}): Promise<AncV1CompletedRotationEvidence> {
+  exact(
+    input,
+    [
+      "encodedAcknowledgements",
+      "encodedDestructions",
+      "encodedCompletion",
+      "encodedCheckpoint",
+      "encodedHostedReceipt",
+      "expectedHostedEntryId",
+      "expectedHostedVaultId",
+      "expectedRecoveryWrapHash",
+      "expectedRecoveryWrapByteLength",
+      "expectedVaultId",
+      "expectedSignerEndpointId",
+      "signerSigningPublicKey",
+      "expectedRecipients",
+      "pendingEpochKey",
+      "now",
+    ],
+    "Completed rotation evidence input",
+  );
+  if (
+    !Array.isArray(input.expectedRecipients) ||
+    input.expectedRecipients.length < 1 ||
+    !Array.isArray(input.encodedAcknowledgements) ||
+    !Array.isArray(input.encodedDestructions) ||
+    input.encodedAcknowledgements.length !== input.expectedRecipients.length ||
+    input.encodedDestructions.length !== input.expectedRecipients.length
+  )
+    fail("Completed rotation evidence requires full non-empty coverage");
+  const acknowledgements = await verifyAncV1RotationAcknowledgementSet({
+    encodedAcknowledgements: input.encodedAcknowledgements,
+    encodedCheckpoint: input.encodedCheckpoint,
+    expectedVaultId: input.expectedVaultId,
+    expectedSignerEndpointId: input.expectedSignerEndpointId,
+    signerSigningPublicKey: input.signerSigningPublicKey,
+    expectedRecipients: input.expectedRecipients,
+    pendingEpochKey: input.pendingEpochKey,
+    now: input.now,
+  });
+  const recipients = input.expectedRecipients.map((recipient) => ({
+    endpointId: recipient.endpointId,
+    signingPublicKey: recipient.signingPublicKey,
+    keyAgreementPublicKey: recipient.keyAgreementPublicKey,
+    eekWrapHash: recipient.eekWrapHash,
+  }));
+  const destructions = await verifyAncV1RotationDestructionSet({
+    encodedAttestations: input.encodedDestructions,
+    encodedCheckpoint: input.encodedCheckpoint,
+    expectedVaultId: input.expectedVaultId,
+    expectedSignerEndpointId: input.expectedSignerEndpointId,
+    signerSigningPublicKey: input.signerSigningPublicKey,
+    expectedRecipients: recipients,
+    now: input.now,
+  });
+  const notBefore = Math.max(
+    ...acknowledgements.map((value) => value.createdAt),
+    ...destructions.map((value) => value.createdAt),
+  );
+  const completion = await verifyAncV1RotationCommittedCompletion({
+    encodedCompletion: input.encodedCompletion,
+    encodedCheckpoint: input.encodedCheckpoint,
+    encodedHostedReceipt: input.encodedHostedReceipt,
+    expectedHostedEntryId: input.expectedHostedEntryId,
+    expectedHostedVaultId: input.expectedHostedVaultId,
+    expectedRecoveryWrapHash: input.expectedRecoveryWrapHash,
+    expectedRecoveryWrapByteLength: input.expectedRecoveryWrapByteLength,
+    expectedVaultId: input.expectedVaultId,
+    expectedSignerEndpointId: input.expectedSignerEndpointId,
+    signerSigningPublicKey: input.signerSigningPublicKey,
+    notBefore,
+    now: input.now,
+  });
+  return Object.freeze({ acknowledgements, destructions, completion });
 }
