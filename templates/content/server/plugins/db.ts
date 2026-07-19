@@ -1533,6 +1533,14 @@ const runContentMigrations = runMigrations(
         ON content_encrypted_vault_broker_replacement_drain_jobs
         (owner_email, org_id, vault_id, drain_id)`,
     },
+    {
+      version: 113,
+      name: "content-private-vault-enrollment-manifest-evidence",
+      sql: `ALTER TABLE content_encrypted_vault_enrollment_ceremonies
+        ADD COLUMN IF NOT EXISTS manifest_checkpoint_bytes_base64url TEXT;
+      ALTER TABLE content_encrypted_vault_enrollment_ceremonies
+        ADD COLUMN IF NOT EXISTS manifest_authorization_bytes_base64url TEXT`,
+    },
   ],
   { table: "content_migrations" },
 );

@@ -1,10 +1,13 @@
 import { PrivateVaultContentBootstrapTransport } from "./content-bootstrap-transport.js";
 import { PrivateVaultContentEnrollmentCoordinator } from "./content-enrollment-coordinator.js";
+import { PrivateVaultContentEnrollmentManifestRevisionSource } from "./content-enrollment-manifest-revision-source.js";
 import {
   PrivateVaultContentEnrollmentAuthorizer,
   PrivateVaultContentEnrollmentCandidate,
 } from "./content-enrollment-roles.js";
 import { PrivateVaultContentEnrollmentTransport } from "./content-enrollment-transport.js";
+import { PrivateVaultContentObjectTransport } from "./content-object-transport.js";
+import { createEncryptedContentIndexStore } from "./encrypted-content-index-store.js";
 import {
   createPrivateVaultNativeServiceClient,
   type PrivateVaultNativeServiceClient,
@@ -47,15 +50,22 @@ export class PrivateVaultContentEnrollmentRuntime {
     const existing = byOrigin.get(input.origin);
     if (existing) return existing;
     const hosted = new PrivateVaultContentEnrollmentTransport(input);
+    const manifest = new PrivateVaultContentEnrollmentManifestRevisionSource({
+      index: createEncryptedContentIndexStore(),
+      transport: new PrivateVaultContentObjectTransport(input),
+      native: this.#native,
+    });
     const roles = Object.freeze({
       candidate: new PrivateVaultContentEnrollmentCandidate({
         native: this.#native,
         hosted,
         bootstrap: new PrivateVaultContentBootstrapTransport(input),
+        manifest,
       }),
       authorizer: new PrivateVaultContentEnrollmentAuthorizer({
         native: this.#native,
         hosted,
+        manifest,
       }),
     });
     byOrigin.set(input.origin, roles);

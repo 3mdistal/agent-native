@@ -11,6 +11,8 @@ const offer = Uint8Array.of(1, 2, 3);
 const challenge = Uint8Array.of(4, 5, 6);
 const sasDecision = Uint8Array.of(10, 11, 12);
 const authorization = Uint8Array.of(7, 8, 9);
+const manifestCheckpoint = Uint8Array.of(13, 14, 15);
+const manifestAuthorization = Uint8Array.of(16, 17, 18);
 
 function statusBody(phase: "offer" | "challenge" | "confirmed" | "committed") {
   return {
@@ -27,6 +29,14 @@ function statusBody(phase: "offer" | "challenge" | "confirmed" | "committed") {
     authorization:
       phase === "committed"
         ? Buffer.from(authorization).toString("base64url")
+        : null,
+    manifestCheckpoint:
+      phase === "committed"
+        ? Buffer.from(manifestCheckpoint).toString("base64url")
+        : null,
+    manifestAuthorization:
+      phase === "committed"
+        ? Buffer.from(manifestAuthorization).toString("base64url")
         : null,
     controlEntryId: phase === "committed" ? "11".repeat(16) : null,
     controlEntryHash: phase === "committed" ? "22".repeat(32) : null,
@@ -99,10 +109,18 @@ describe("PrivateVaultContentEnrollmentTransport", () => {
       transport.publishSasDecision(offerHash, offer, sasDecision),
     ).resolves.toMatchObject({ phase: "confirmed", sasDecision });
     await expect(
-      transport.publishAuthorization(offerHash, offer, authorization),
+      transport.publishAuthorization(
+        offerHash,
+        offer,
+        authorization,
+        manifestCheckpoint,
+        manifestAuthorization,
+      ),
     ).resolves.toMatchObject({
       phase: "committed",
       authorization,
+      manifestCheckpoint,
+      manifestAuthorization,
       controlEntryId: "11".repeat(16),
     });
     expect(fetch.mock.calls.map(([url]) => url)).toEqual([
@@ -167,6 +185,36 @@ describe("PrivateVaultContentEnrollmentTransport", () => {
     for (let index = 0; index < 3; index += 1) {
       await expect(
         transport.publishOffer(offerHash, offer),
+      ).rejects.toBeInstanceOf(PrivateVaultContentEnrollmentTransportError);
+    }
+  });
+
+  it("fails closed when committed evidence is missing, substituted, or oversized", async () => {
+    const path = `/api/private-vault/enrollment/${offerHash}/authorization`;
+    const missing = statusBody("committed");
+    missing.manifestCheckpoint = null;
+    const substituted = statusBody("committed");
+    substituted.manifestAuthorization = Buffer.from([99]).toString("base64url");
+    const oversized = statusBody("committed");
+    oversized.manifestCheckpoint = Buffer.alloc(1_025).toString("base64url");
+    const fetch = vi
+      .fn<PrivateVaultContentSession["fetch"]>()
+      .mockResolvedValueOnce(response(path, missing))
+      .mockResolvedValueOnce(response(path, substituted))
+      .mockResolvedValueOnce(response(path, oversized));
+    const transport = new PrivateVaultContentEnrollmentTransport({
+      session: { fetch },
+      origin: "https://content-fork.example",
+    });
+    for (let index = 0; index < 3; index += 1) {
+      await expect(
+        transport.publishAuthorization(
+          offerHash,
+          offer,
+          authorization,
+          manifestCheckpoint,
+          manifestAuthorization,
+        ),
       ).rejects.toBeInstanceOf(PrivateVaultContentEnrollmentTransportError);
     }
   });

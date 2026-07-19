@@ -54,6 +54,7 @@ let schema: typeof import("../db/schema.js");
 let publishOffer: (typeof import("./private-vault-enrollment.js"))["publishPrivateVaultEnrollmentOffer"];
 let publishChallenge: (typeof import("./private-vault-enrollment.js"))["publishPrivateVaultEnrollmentChallenge"];
 let publishSasDecision: (typeof import("./private-vault-enrollment.js"))["publishPrivateVaultEnrollmentSasDecision"];
+let commitAuthorization: (typeof import("./private-vault-enrollment.js"))["commitPrivateVaultEnrollmentAuthorization"];
 let readStatus: (typeof import("./private-vault-enrollment.js"))["readPrivateVaultEnrollmentStatus"];
 
 function state(input?: { broker?: boolean }): ControlLogState {
@@ -226,6 +227,7 @@ beforeAll(async () => {
   publishOffer = enrollment.publishPrivateVaultEnrollmentOffer;
   publishChallenge = enrollment.publishPrivateVaultEnrollmentChallenge;
   publishSasDecision = enrollment.publishPrivateVaultEnrollmentSasDecision;
+  commitAuthorization = enrollment.commitPrivateVaultEnrollmentAuthorization;
   readStatus = enrollment.readPrivateVaultEnrollmentStatus;
 }, 60_000);
 
@@ -251,6 +253,23 @@ afterAll(() => {
 });
 
 describe("Private Vault enrollment rendezvous", () => {
+  it("rejects hostile authorization framing before touching the ceremony row", async () => {
+    for (const authorizationBundle of [
+      Uint8Array.of(1, 2, 3),
+      Uint8Array.from([0x41, 0x4e, 0x45, 0x41, 2, ...new Uint8Array(15)]),
+      new Uint8Array(256 * 1024 + 2 * 1024 + 18),
+    ]) {
+      await expect(
+        commitAuthorization({
+          scope,
+          offerHash: "ab".repeat(32),
+          authorizationBundle,
+          now: NOW,
+        }),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+    }
+  });
+
   it("persists one canonical broker offer and returns byte-identical retries", async () => {
     const encoded = await offer();
     const first = await publishOffer({ scope, offer: encoded, now: NOW });
@@ -375,6 +394,37 @@ describe("Private Vault enrollment rendezvous", () => {
       .update(schema.contentEncryptedVaultEnrollmentCeremonies)
       .set({
         offerBytesBase64url: `${stored.offerBytesBase64url.slice(0, -1)}${stored.offerBytesBase64url.endsWith("A") ? "B" : "A"}`,
+      })
+      .where(
+        eq(
+          schema.contentEncryptedVaultEnrollmentCeremonies.offerHash,
+          stored.offerHash,
+        ),
+      );
+
+    await expect(
+      readStatus({ scope, offerHash: stored.offerHash }),
+    ).rejects.toMatchObject({ code: "unavailable" });
+  });
+
+  it("fails closed when a committed row is missing opaque manifest evidence", async () => {
+    const encoded = await offer();
+    await publishOffer({ scope, offer: encoded, now: NOW });
+    const [stored] = await getDb()
+      .select()
+      .from(schema.contentEncryptedVaultEnrollmentCeremonies);
+    await getDb()
+      .update(schema.contentEncryptedVaultEnrollmentCeremonies)
+      .set({
+        phase: "committed",
+        challengeBytesBase64url: "AQ",
+        sasDecisionBytesBase64url: "Ag",
+        authorizationBytesBase64url: "Aw",
+        manifestCheckpointBytesBase64url: null,
+        manifestAuthorizationBytesBase64url: "BA",
+        controlEntryId: "55".repeat(16),
+        controlEntryHash: "66".repeat(32),
+        consumedAt: NOW.toISOString(),
       })
       .where(
         eq(

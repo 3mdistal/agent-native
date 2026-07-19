@@ -8,6 +8,7 @@ export * from "./control-log.js";
 export * from "./control-log-append.js";
 export * from "./control-evidence.js";
 export * from "./endpoint-request-auth.js";
+export * from "./enrollment-authorization-bundle-codec.js";
 export * from "./enrollment-ceremony-codecs.js";
 export * from "./export-archive.js";
 export * from "./failure-fixtures.js";

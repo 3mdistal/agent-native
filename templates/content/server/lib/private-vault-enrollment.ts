@@ -1,9 +1,11 @@
 import {
+  ANC_ENROLLMENT_AUTHORIZATION_BUNDLE_LIMITS,
   ancV1BytesToHex,
   ancV1EnrollmentChallengeConsumptionKey,
   ancV1Hash,
   ancV1LifecycleIdToHex,
   decodeAncV1EndpointEnrollmentOffer,
+  decodeAncV1EnrollmentAuthorizationBundle,
   decodeAncV1EnrollmentAuthorization,
   decodeAncV1EnrollmentChallenge,
   encodeAncV1EnrollmentSasDecision,
@@ -28,6 +30,12 @@ const OFFER_MAX_BYTES = 64 * 1024;
 const CHALLENGE_MAX_BYTES = 64 * 1024;
 const SAS_DECISION_MAX_BYTES = 2 * 1024;
 const AUTHORIZATION_MAX_BYTES = 256 * 1024;
+const AUTHORIZATION_BUNDLE_MAX_BYTES =
+  ANC_ENROLLMENT_AUTHORIZATION_BUNDLE_LIMITS.totalBytes;
+const MANIFEST_CHECKPOINT_MAX_BYTES =
+  ANC_ENROLLMENT_AUTHORIZATION_BUNDLE_LIMITS.manifestCheckpointBytes;
+const MANIFEST_AUTHORIZATION_MAX_BYTES =
+  ANC_ENROLLMENT_AUTHORIZATION_BUNDLE_LIMITS.manifestAuthorizationBytes;
 
 type EnrollmentPhase =
   | "offer"
@@ -59,6 +67,8 @@ export interface PrivateVaultEnrollmentStatus {
   challenge: Uint8Array | null;
   sasDecision: Uint8Array | null;
   authorization: Uint8Array | null;
+  manifestCheckpoint: Uint8Array | null;
+  manifestAuthorization: Uint8Array | null;
   controlEntryId: string | null;
   controlEntryHash: string | null;
   expiresAt: string;
@@ -117,6 +127,14 @@ async function parseRow(
     row.authorizationBytesBase64url,
     AUTHORIZATION_MAX_BYTES,
   );
+  const manifestCheckpoint = decode(
+    row.manifestCheckpointBytesBase64url,
+    MANIFEST_CHECKPOINT_MAX_BYTES,
+  );
+  const manifestAuthorization = decode(
+    row.manifestAuthorizationBytesBase64url,
+    MANIFEST_AUTHORIZATION_MAX_BYTES,
+  );
   if (
     !offer ||
     !(
@@ -126,6 +144,8 @@ async function parseRow(
       (challenge !== null ||
         sasDecision !== null ||
         authorization !== null ||
+        manifestCheckpoint !== null ||
+        manifestAuthorization !== null ||
         row.controlEntryId !== null ||
         row.controlEntryHash !== null ||
         row.consumedAt !== null)) ||
@@ -133,6 +153,8 @@ async function parseRow(
       (challenge === null ||
         sasDecision !== null ||
         authorization !== null ||
+        manifestCheckpoint !== null ||
+        manifestAuthorization !== null ||
         row.controlEntryId !== null ||
         row.controlEntryHash !== null ||
         row.consumedAt !== null)) ||
@@ -140,6 +162,8 @@ async function parseRow(
       (challenge === null ||
         sasDecision === null ||
         authorization !== null ||
+        manifestCheckpoint !== null ||
+        manifestAuthorization !== null ||
         row.controlEntryId !== null ||
         row.controlEntryHash !== null ||
         row.consumedAt !== null)) ||
@@ -147,6 +171,8 @@ async function parseRow(
       (challenge === null ||
         sasDecision === null ||
         authorization === null ||
+        manifestCheckpoint === null ||
+        manifestAuthorization === null ||
         row.controlEntryId === null ||
         row.controlEntryHash === null ||
         row.consumedAt === null))
@@ -260,6 +286,8 @@ async function parseRow(
     challenge,
     sasDecision,
     authorization,
+    manifestCheckpoint,
+    manifestAuthorization,
     controlEntryId: row.controlEntryId,
     controlEntryHash: row.controlEntryHash,
     expiresAt: row.expiresAt,
@@ -415,14 +443,23 @@ export async function publishPrivateVaultEnrollmentChallenge(input: {
 export async function commitPrivateVaultEnrollmentAuthorization(input: {
   scope: PrivateVaultControlLogScope;
   offerHash: string;
-  authorization: Uint8Array;
+  authorizationBundle: Uint8Array;
   now?: Date;
 }): Promise<PrivateVaultEnrollmentStatus> {
   const now = input.now ?? new Date();
-  const authorizationBytes = bounded(
-    input.authorization,
-    AUTHORIZATION_MAX_BYTES,
-  );
+  let authorizationBytes: Uint8Array;
+  let manifestCheckpointBytes: Uint8Array;
+  let manifestAuthorizationBytes: Uint8Array;
+  try {
+    const bundle = decodeAncV1EnrollmentAuthorizationBundle(
+      bounded(input.authorizationBundle, AUTHORIZATION_BUNDLE_MAX_BYTES),
+    );
+    authorizationBytes = bundle.enrollmentAuthorization;
+    manifestCheckpointBytes = bundle.manifestCheckpoint;
+    manifestAuthorizationBytes = bundle.manifestAuthorization;
+  } catch {
+    throw new PrivateVaultEnrollmentError("invalid_request");
+  }
   const [row] = await getDb()
     .select()
     .from(schema.contentEncryptedVaultEnrollmentCeremonies)
@@ -433,7 +470,11 @@ export async function commitPrivateVaultEnrollmentAuthorization(input: {
   if (status.phase === "committed") {
     if (
       status.authorization &&
-      exact(status.authorization, authorizationBytes)
+      status.manifestCheckpoint &&
+      status.manifestAuthorization &&
+      exact(status.authorization, authorizationBytes) &&
+      exact(status.manifestCheckpoint, manifestCheckpointBytes) &&
+      exact(status.manifestAuthorization, manifestAuthorizationBytes)
     ) {
       return status;
     }
@@ -485,6 +526,10 @@ export async function commitPrivateVaultEnrollmentAuthorization(input: {
             phase: "committed",
             authorizationId,
             authorizationBytesBase64url: encode(authorizationBytes),
+            manifestCheckpointBytesBase64url: encode(manifestCheckpointBytes),
+            manifestAuthorizationBytesBase64url: encode(
+              manifestAuthorizationBytes,
+            ),
             controlEntryId: append.entry.envelopeId,
             controlEntryHash: append.entryHash,
             consumedAt: append.serverReceivedAt,
@@ -608,4 +653,7 @@ export const privateVaultEnrollmentLimits = Object.freeze({
   challengeBytes: CHALLENGE_MAX_BYTES,
   sasDecisionBytes: SAS_DECISION_MAX_BYTES,
   authorizationBytes: AUTHORIZATION_MAX_BYTES,
+  authorizationBundleBytes: AUTHORIZATION_BUNDLE_MAX_BYTES,
+  manifestCheckpointBytes: MANIFEST_CHECKPOINT_MAX_BYTES,
+  manifestAuthorizationBytes: MANIFEST_AUTHORIZATION_MAX_BYTES,
 });

@@ -1,3 +1,8 @@
+import {
+  ANC_ENROLLMENT_AUTHORIZATION_BUNDLE_LIMITS,
+  encodeAncV1EnrollmentAuthorizationBundle,
+} from "@agent-native/core/e2ee";
+
 import type { PrivateVaultContentSession } from "./content-genesis-transport.js";
 
 const MEDIA_TYPE = "application/vnd.agent-native.private-vault-enrollment+cbor";
@@ -5,6 +10,10 @@ const OFFER_MAX_BYTES = 64 * 1024;
 const CHALLENGE_MAX_BYTES = 64 * 1024;
 const SAS_DECISION_MAX_BYTES = 2 * 1024;
 const AUTHORIZATION_MAX_BYTES = 256 * 1024;
+const MANIFEST_CHECKPOINT_MAX_BYTES =
+  ANC_ENROLLMENT_AUTHORIZATION_BUNDLE_LIMITS.manifestCheckpointBytes;
+const MANIFEST_AUTHORIZATION_MAX_BYTES =
+  ANC_ENROLLMENT_AUTHORIZATION_BUNDLE_LIMITS.manifestAuthorizationBytes;
 const STATUS_MAX_BYTES = 512 * 1024;
 
 export type PrivateVaultEnrollmentPhase =
@@ -20,6 +29,8 @@ export interface PrivateVaultHostedEnrollmentStatus {
   readonly challenge: Uint8Array | null;
   readonly sasDecision: Uint8Array | null;
   readonly authorization: Uint8Array | null;
+  readonly manifestCheckpoint: Uint8Array | null;
+  readonly manifestAuthorization: Uint8Array | null;
   readonly controlEntryId: string | null;
   readonly controlEntryHash: string | null;
   readonly expiresAt: string;
@@ -51,7 +62,7 @@ function exactHttpsOrigin(value: string): string {
   }
 }
 
-function exactBytes(value: Uint8Array, maximum: number): Uint8Array {
+function exactBytes(value: unknown, maximum: number): Uint8Array {
   if (
     !(value instanceof Uint8Array) ||
     value.byteLength === 0 ||
@@ -98,6 +109,8 @@ function exactStatus(value: unknown): PrivateVaultHostedEnrollmentStatus {
     "controlEntryHash",
     "controlEntryId",
     "expiresAt",
+    "manifestAuthorization",
+    "manifestCheckpoint",
     "offer",
     "phase",
     "sasDecision",
@@ -126,6 +139,14 @@ function exactStatus(value: unknown): PrivateVaultHostedEnrollmentStatus {
     input.authorization,
     AUTHORIZATION_MAX_BYTES,
   );
+  const manifestCheckpoint = optionalBytes(
+    input.manifestCheckpoint,
+    MANIFEST_CHECKPOINT_MAX_BYTES,
+  );
+  const manifestAuthorization = optionalBytes(
+    input.manifestAuthorization,
+    MANIFEST_AUTHORIZATION_MAX_BYTES,
+  );
   const controlEntryId = input.controlEntryId;
   const controlEntryHash = input.controlEntryHash;
   const committed = input.phase === "committed";
@@ -134,24 +155,32 @@ function exactStatus(value: unknown): PrivateVaultHostedEnrollmentStatus {
       (challenge !== null ||
         sasDecision !== null ||
         authorization !== null ||
+        manifestCheckpoint !== null ||
+        manifestAuthorization !== null ||
         controlEntryId !== null ||
         controlEntryHash !== null)) ||
     (input.phase === "challenge" &&
       (challenge === null ||
         sasDecision !== null ||
         authorization !== null ||
+        manifestCheckpoint !== null ||
+        manifestAuthorization !== null ||
         controlEntryId !== null ||
         controlEntryHash !== null)) ||
     ((input.phase === "confirmed" || input.phase === "rejected") &&
       (challenge === null ||
         sasDecision === null ||
         authorization !== null ||
+        manifestCheckpoint !== null ||
+        manifestAuthorization !== null ||
         controlEntryId !== null ||
         controlEntryHash !== null)) ||
     (committed &&
       (challenge === null ||
         sasDecision === null ||
         authorization === null ||
+        manifestCheckpoint === null ||
+        manifestAuthorization === null ||
         typeof controlEntryId !== "string" ||
         !/^[0-9a-f]{32}$/.test(controlEntryId) ||
         typeof controlEntryHash !== "string" ||
@@ -165,6 +194,8 @@ function exactStatus(value: unknown): PrivateVaultHostedEnrollmentStatus {
     challenge,
     sasDecision,
     authorization,
+    manifestCheckpoint,
+    manifestAuthorization,
     controlEntryId: controlEntryId as string | null,
     controlEntryHash: controlEntryHash as string | null,
     expiresAt: input.expiresAt,
@@ -215,12 +246,30 @@ export class PrivateVaultContentEnrollmentTransport {
     offerHash: string,
     offer: Uint8Array,
     authorization: Uint8Array,
+    manifestCheckpoint?: Uint8Array,
+    manifestAuthorization?: Uint8Array,
   ) {
+    const expectedEvidence = {
+      authorization: exactBytes(authorization, AUTHORIZATION_MAX_BYTES),
+      manifestCheckpoint: exactBytes(
+        manifestCheckpoint,
+        MANIFEST_CHECKPOINT_MAX_BYTES,
+      ),
+      manifestAuthorization: exactBytes(
+        manifestAuthorization,
+        MANIFEST_AUTHORIZATION_MAX_BYTES,
+      ),
+    };
     return this.#post(
       `/api/private-vault/enrollment/${offerHash}/authorization`,
       offerHash,
-      exactBytes(authorization, AUTHORIZATION_MAX_BYTES),
+      encodeAncV1EnrollmentAuthorizationBundle({
+        enrollmentAuthorization: expectedEvidence.authorization,
+        manifestCheckpoint: expectedEvidence.manifestCheckpoint,
+        manifestAuthorization: expectedEvidence.manifestAuthorization,
+      }),
       offer,
+      expectedEvidence,
     );
   }
 
@@ -251,6 +300,11 @@ export class PrivateVaultContentEnrollmentTransport {
     offerHash: string,
     body: Uint8Array,
     expectedOffer?: Uint8Array,
+    expectedEvidence?: {
+      readonly authorization: Uint8Array;
+      readonly manifestCheckpoint: Uint8Array;
+      readonly manifestAuthorization: Uint8Array;
+    },
   ) {
     return this.#request(
       path,
@@ -265,6 +319,7 @@ export class PrivateVaultContentEnrollmentTransport {
         },
       },
       expectedOffer ?? body,
+      expectedEvidence,
     );
   }
 
@@ -273,6 +328,11 @@ export class PrivateVaultContentEnrollmentTransport {
     offerHash: string,
     init: Pick<RequestInit, "method" | "body" | "headers">,
     expectedOffer: Uint8Array,
+    expectedEvidence?: {
+      readonly authorization: Uint8Array;
+      readonly manifestCheckpoint: Uint8Array;
+      readonly manifestAuthorization: Uint8Array;
+    },
   ): Promise<PrivateVaultHostedEnrollmentStatus> {
     try {
       if (!/^[0-9a-f]{64}$/.test(offerHash)) throw new Error();
@@ -315,6 +375,23 @@ export class PrivateVaultContentEnrollmentTransport {
         JSON.parse(Buffer.from(body).toString("utf8")),
       );
       if (!same(status.offer, exactBytes(expectedOffer, OFFER_MAX_BYTES))) {
+        throw new Error();
+      }
+      if (
+        expectedEvidence &&
+        (!status.authorization ||
+          !status.manifestCheckpoint ||
+          !status.manifestAuthorization ||
+          !same(status.authorization, expectedEvidence.authorization) ||
+          !same(
+            status.manifestCheckpoint,
+            expectedEvidence.manifestCheckpoint,
+          ) ||
+          !same(
+            status.manifestAuthorization,
+            expectedEvidence.manifestAuthorization,
+          ))
+      ) {
         throw new Error();
       }
       return status;

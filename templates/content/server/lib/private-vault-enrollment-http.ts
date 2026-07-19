@@ -82,6 +82,14 @@ export function serializePrivateVaultEnrollmentStatus(
       status.authorization === null
         ? null
         : Buffer.from(status.authorization).toString("base64url"),
+    manifestCheckpoint:
+      status.manifestCheckpoint === null
+        ? null
+        : Buffer.from(status.manifestCheckpoint).toString("base64url"),
+    manifestAuthorization:
+      status.manifestAuthorization === null
+        ? null
+        : Buffer.from(status.manifestAuthorization).toString("base64url"),
     controlEntryId: status.controlEntryId,
     controlEntryHash: status.controlEntryHash,
     expiresAt: status.expiresAt,

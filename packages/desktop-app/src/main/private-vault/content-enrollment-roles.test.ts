@@ -5,7 +5,7 @@ import type {
   PrivateVaultContentBootstrapTransport,
 } from "./content-bootstrap-transport.js";
 import type { PrivateVaultTrustedEnrollmentOperator } from "./content-enrollment-coordinator.js";
-import type { PrivateVaultEnrollmentManifestCheckpointVerifier } from "./content-enrollment-manifest-checkpoint.js";
+import type { PrivateVaultContentEnrollmentManifestRevisionSource } from "./content-enrollment-manifest-revision-source.js";
 import {
   PrivateVaultContentEnrollmentAuthorizer,
   PrivateVaultContentEnrollmentCandidate,
@@ -24,18 +24,25 @@ const proof = new Uint8Array(64).fill(4);
 const challenge = Uint8Array.of(5, 6);
 const sasDecision = Uint8Array.of(7, 8);
 const authorization = Uint8Array.of(9, 10);
+const manifestRevision = Uint8Array.of(11, 12);
+const manifestCheckpoint = Uint8Array.of(13, 14);
+const manifestAuthorization = Uint8Array.of(15, 16);
 
 function hostedTranscript() {
   let phase: PrivateVaultEnrollmentPhase = "offer";
   let currentChallenge: Uint8Array | null = null;
   let currentDecision: Uint8Array | null = null;
   let currentAuthorization: Uint8Array | null = null;
+  let currentManifestCheckpoint: Uint8Array | null = null;
+  let currentManifestAuthorization: Uint8Array | null = null;
   const status = () => ({
     phase,
     offer: offer.slice(),
     challenge: currentChallenge?.slice() ?? null,
     sasDecision: currentDecision?.slice() ?? null,
     authorization: currentAuthorization?.slice() ?? null,
+    manifestCheckpoint: currentManifestCheckpoint?.slice() ?? null,
+    manifestAuthorization: currentManifestAuthorization?.slice() ?? null,
     controlEntryId: phase === "committed" ? "22".repeat(16) : null,
     controlEntryHash: phase === "committed" ? "33".repeat(32) : null,
     expiresAt: "2026-07-19T00:00:00.000Z",
@@ -54,15 +61,29 @@ function hostedTranscript() {
         phase = "confirmed";
         return status();
       }),
-      publishAuthorization: vi.fn(async (_hash, _offer, value: Uint8Array) => {
-        currentAuthorization = value.slice();
-        phase = "committed";
-        return status();
-      }),
+      publishAuthorization: vi.fn(
+        async (
+          _hash,
+          _offer,
+          value: Uint8Array,
+          checkpoint: Uint8Array,
+          manifestBinding: Uint8Array,
+        ) => {
+          currentAuthorization = value.slice();
+          currentManifestCheckpoint = checkpoint.slice();
+          currentManifestAuthorization = manifestBinding.slice();
+          phase = "committed";
+          return status();
+        },
+      ),
     } as unknown as PrivateVaultContentEnrollmentTransport,
     reject() {
       currentDecision = sasDecision.slice();
       phase = "rejected";
+    },
+    removeManifestEvidence() {
+      currentManifestCheckpoint = null;
+      currentManifestAuthorization = null;
     },
   };
 }
@@ -135,33 +156,54 @@ function bootstrapTransport(): PrivateVaultContentBootstrapTransport {
   } as unknown as PrivateVaultContentBootstrapTransport;
 }
 
-function manifestCheckpoint(): PrivateVaultEnrollmentManifestCheckpointVerifier {
+function manifestSource(input?: {
+  readonly rejectVerification?: boolean;
+}): PrivateVaultContentEnrollmentManifestRevisionSource {
   return {
-    verify: vi.fn(async () => undefined),
-  } as unknown as PrivateVaultEnrollmentManifestCheckpointVerifier;
+    readTrustedCurrentRevision: vi.fn(async () => manifestRevision.slice()),
+    verifyUniqueHostedRevision: vi.fn(async () => {
+      if (input?.rejectVerification) throw new Error();
+      return {
+        version: 3,
+        suite: "anc/v1",
+        operation: "verify_manifest",
+        state: "verified",
+        vaultId,
+        checkpointDigest: new Uint8Array(32).fill(17),
+      } as const;
+    }),
+  } as unknown as PrivateVaultContentEnrollmentManifestRevisionSource;
 }
 
 describe("Private Vault cross-device enrollment roles", () => {
   it("alternates two Macs through public hosted state without merging custody roles", async () => {
     const shared = hostedTranscript();
     const candidateOperator = candidateNative();
+    let authorizerManifestSeen: Uint8Array | null = null;
     const authorizerOperator = {
       buildBrokerEnrollmentChallenge: vi.fn(async () => ({
         encoded: challenge,
       })),
-      buildBrokerEnrollmentAuthorization: vi.fn(async () => ({
-        encoded: authorization,
-      })),
+      buildBrokerEnrollmentAuthorization: vi.fn(async (input) => {
+        authorizerManifestSeen = input.manifestRevision?.slice() ?? null;
+        return {
+          encoded: authorization,
+          manifestCheckpoint,
+          manifestAuthorization,
+        };
+      }),
     };
+    const manifest = manifestSource();
     const candidate = new PrivateVaultContentEnrollmentCandidate({
       native: candidateOperator,
       hosted: shared.transport,
       bootstrap: bootstrapTransport(),
-      manifestCheckpoint: manifestCheckpoint(),
+      manifest,
     });
     const authorizer = new PrivateVaultContentEnrollmentAuthorizer({
       native: authorizerOperator,
       hosted: shared.transport,
+      manifest,
     });
 
     const begun = await candidate.begin(vaultId);
@@ -198,7 +240,23 @@ describe("Private Vault cross-device enrollment roles", () => {
       offer,
       challenge,
       sasDecision,
+      manifestRevision: expect.any(Uint8Array),
     });
+    expect(authorizerManifestSeen).toEqual(manifestRevision);
+    expect(manifest.verifyUniqueHostedRevision).toHaveBeenCalledWith({
+      vaultId,
+      challenge,
+      authorization,
+      manifestCheckpoint,
+      manifestAuthorization,
+    });
+    expect(
+      vi.mocked(manifest.verifyUniqueHostedRevision).mock
+        .invocationCallOrder[0],
+    ).toBeLessThan(
+      vi.mocked(candidateOperator.activateBrokerEnrollment).mock
+        .invocationCallOrder[0]!,
+    );
     expect(candidateOperator.confirmBrokerEnrollment).toHaveBeenCalledWith(
       vaultId,
       challenge,
@@ -222,7 +280,7 @@ describe("Private Vault cross-device enrollment roles", () => {
       native: candidateNative(),
       hosted: shared.transport,
       bootstrap: bootstrapTransport(),
-      manifestCheckpoint: manifestCheckpoint(),
+      manifest: manifestSource(),
     }).begin(vaultId);
     if (begun.state !== "awaiting-authorizer") throw new Error();
     const authorizer = new PrivateVaultContentEnrollmentAuthorizer({
@@ -231,19 +289,21 @@ describe("Private Vault cross-device enrollment roles", () => {
         buildBrokerEnrollmentAuthorization: vi.fn(),
       },
       hosted: shared.transport,
+      manifest: manifestSource(),
     });
     await expect(authorizer.advance(begun.invitation)).rejects.toBeInstanceOf(
       PrivateVaultContentEnrollmentRoleRejectedError,
     );
   });
 
-  it("cannot activate a committed enrollment until H3 manifest evidence is wired", async () => {
+  it("cannot activate a committed enrollment unless native verifies the hosted manifest", async () => {
     const shared = hostedTranscript();
     const native = candidateNative();
     const candidate = new PrivateVaultContentEnrollmentCandidate({
       native,
       hosted: shared.transport,
       bootstrap: bootstrapTransport(),
+      manifest: manifestSource({ rejectVerification: true }),
     });
     const authorizer = new PrivateVaultContentEnrollmentAuthorizer({
       native: {
@@ -252,9 +312,12 @@ describe("Private Vault cross-device enrollment roles", () => {
         })),
         buildBrokerEnrollmentAuthorization: vi.fn(async () => ({
           encoded: authorization,
+          manifestCheckpoint,
+          manifestAuthorization,
         })),
       },
       hosted: shared.transport,
+      manifest: manifestSource(),
     });
     const begun = await candidate.begin(vaultId);
     if (begun.state !== "awaiting-authorizer") throw new Error();
@@ -265,6 +328,44 @@ describe("Private Vault cross-device enrollment roles", () => {
     await expect(candidate.advance(begun.invitation)).rejects.toBeInstanceOf(
       PrivateVaultContentEnrollmentRoleError,
     );
+    expect(native.activateBrokerEnrollment).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a committed status omits manifest evidence", async () => {
+    const shared = hostedTranscript();
+    const native = candidateNative();
+    const manifest = manifestSource();
+    const candidate = new PrivateVaultContentEnrollmentCandidate({
+      native,
+      hosted: shared.transport,
+      bootstrap: bootstrapTransport(),
+      manifest,
+    });
+    const authorizer = new PrivateVaultContentEnrollmentAuthorizer({
+      native: {
+        buildBrokerEnrollmentChallenge: vi.fn(async () => ({
+          encoded: challenge,
+        })),
+        buildBrokerEnrollmentAuthorization: vi.fn(async () => ({
+          encoded: authorization,
+          manifestCheckpoint,
+          manifestAuthorization,
+        })),
+      },
+      hosted: shared.transport,
+      manifest: manifestSource(),
+    });
+    const begun = await candidate.begin(vaultId);
+    if (begun.state !== "awaiting-authorizer") throw new Error();
+    await authorizer.advance(begun.invitation);
+    await candidate.advance(begun.invitation);
+    await authorizer.advance(begun.invitation);
+    shared.removeManifestEvidence();
+
+    await expect(candidate.advance(begun.invitation)).rejects.toBeInstanceOf(
+      PrivateVaultContentEnrollmentRoleError,
+    );
+    expect(manifest.verifyUniqueHostedRevision).not.toHaveBeenCalled();
     expect(native.activateBrokerEnrollment).not.toHaveBeenCalled();
   });
 });

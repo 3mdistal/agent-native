@@ -596,6 +596,12 @@ export const contentEncryptedVaultEnrollmentCeremonies = table(
     sasDecisionHash: text("sas_decision_hash"),
     authorizationId: text("authorization_id"),
     authorizationBytesBase64url: text("authorization_bytes_base64url"),
+    manifestCheckpointBytesBase64url: text(
+      "manifest_checkpoint_bytes_base64url",
+    ),
+    manifestAuthorizationBytesBase64url: text(
+      "manifest_authorization_bytes_base64url",
+    ),
     controlEntryId: text("control_entry_id"),
     controlEntryHash: text("control_entry_hash"),
     expiresAt: text("expires_at").notNull(),

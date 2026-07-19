@@ -27,17 +27,17 @@ export default defineEventHandler(async (event) => {
     !/^[0-9a-f]{64}$/.test(offerHash) ||
     !hasPrivateVaultEnrollmentMediaType(event) ||
     !Number.isSafeInteger(length) ||
-    length > privateVaultEnrollmentLimits.authorizationBytes
+    length > privateVaultEnrollmentLimits.authorizationBundleBytes
   ) {
     return privateVaultEnrollmentFailure(event, 404);
   }
-  const authorization = await readPrivateVaultBoundedBody(
+  const authorizationBundle = await readPrivateVaultBoundedBody(
     event,
     length,
-    privateVaultEnrollmentLimits.authorizationBytes,
+    privateVaultEnrollmentLimits.authorizationBundleBytes,
   ).catch(() => null);
   const scope = await resolveAuthenticatedPrivateVaultBootstrapScope(event);
-  if (!authorization || !scope) {
+  if (!authorizationBundle || !scope) {
     return privateVaultEnrollmentFailure(event, 404);
   }
   try {
@@ -45,7 +45,7 @@ export default defineEventHandler(async (event) => {
       await commitPrivateVaultEnrollmentAuthorization({
         scope,
         offerHash,
-        authorization,
+        authorizationBundle,
       }),
     );
   } catch (error) {

@@ -8,12 +8,15 @@ import {
   decodePrivateVaultContentEnrollmentInvitation,
   encodePrivateVaultContentEnrollmentInvitation,
 } from "./content-enrollment-invitation.js";
-import type { PrivateVaultEnrollmentManifestCheckpointVerifier } from "./content-enrollment-manifest-checkpoint.js";
+import type { PrivateVaultContentEnrollmentManifestRevisionSource } from "./content-enrollment-manifest-revision-source.js";
 import type {
   PrivateVaultContentEnrollmentTransport,
   PrivateVaultHostedEnrollmentStatus,
 } from "./content-enrollment-transport.js";
-import type { NativeActivateEnrollmentResult } from "./native-service-client.js";
+import type {
+  NativeActivateEnrollmentResult,
+  PrivateVaultNativeServiceClient,
+} from "./native-service-client.js";
 
 type PrivateVaultCandidateEnrollmentOperator =
   PrivateVaultTrustedEnrollmentOperator & {
@@ -22,6 +25,11 @@ type PrivateVaultCandidateEnrollmentOperator =
       encoded: Uint8Array,
     ): Promise<PrivateVaultBootstrapPageAcceptance>;
   };
+
+type PrivateVaultAuthorizerEnrollmentOperator = Pick<
+  PrivateVaultNativeServiceClient,
+  "buildBrokerEnrollmentChallenge" | "buildBrokerEnrollmentAuthorization"
+>;
 
 export type PrivateVaultCandidateEnrollmentProgress =
   | Readonly<{ state: "awaiting-authorizer"; invitation: Uint8Array }>
@@ -78,22 +86,19 @@ export class PrivateVaultContentEnrollmentCandidate extends SerializedEnrollment
   readonly #native: PrivateVaultCandidateEnrollmentOperator;
   readonly #hosted: PrivateVaultContentEnrollmentTransport;
   readonly #bootstrap: PrivateVaultContentBootstrapTransport;
-  readonly #manifestCheckpoint:
-    | PrivateVaultEnrollmentManifestCheckpointVerifier
-    | undefined;
+  readonly #manifest: PrivateVaultContentEnrollmentManifestRevisionSource;
 
   constructor(input: {
     readonly native: PrivateVaultCandidateEnrollmentOperator;
     readonly hosted: PrivateVaultContentEnrollmentTransport;
     readonly bootstrap: PrivateVaultContentBootstrapTransport;
-    /** Required for activation; legacy wiring fails closed until it provides this. */
-    readonly manifestCheckpoint?: PrivateVaultEnrollmentManifestCheckpointVerifier;
+    readonly manifest: PrivateVaultContentEnrollmentManifestRevisionSource;
   }) {
     super();
     this.#native = input.native;
     this.#hosted = input.hosted;
     this.#bootstrap = input.bootstrap;
-    this.#manifestCheckpoint = input.manifestCheckpoint;
+    this.#manifest = input.manifest;
   }
 
   begin(vaultId: string): Promise<PrivateVaultCandidateEnrollmentProgress> {
@@ -182,14 +187,18 @@ export class PrivateVaultContentEnrollmentCandidate extends SerializedEnrollment
         if (
           status.phase !== "committed" ||
           !status.challenge ||
-          !status.authorization
+          !status.authorization ||
+          !status.manifestCheckpoint ||
+          !status.manifestAuthorization
         ) {
           throw new Error();
         }
-        if (!this.#manifestCheckpoint) throw new Error();
-        await this.#manifestCheckpoint.verify({
+        await this.#manifest.verifyUniqueHostedRevision({
           vaultId: invitation.vaultId,
-          encodedEnrollmentAuthorization: status.authorization.slice(),
+          challenge: status.challenge.slice(),
+          authorization: status.authorization.slice(),
+          manifestCheckpoint: status.manifestCheckpoint.slice(),
+          manifestAuthorization: status.manifestAuthorization.slice(),
         });
         const result = await this.#native.activateBrokerEnrollment(
           invitation.vaultId,
@@ -209,22 +218,19 @@ export class PrivateVaultContentEnrollmentCandidate extends SerializedEnrollment
 
 /** Runs only the existing trusted endpoint half on a different enrolled Mac. */
 export class PrivateVaultContentEnrollmentAuthorizer extends SerializedEnrollmentRole {
-  readonly #native: Pick<
-    PrivateVaultTrustedEnrollmentOperator,
-    "buildBrokerEnrollmentChallenge" | "buildBrokerEnrollmentAuthorization"
-  >;
+  readonly #native: PrivateVaultAuthorizerEnrollmentOperator;
   readonly #hosted: PrivateVaultContentEnrollmentTransport;
+  readonly #manifest: PrivateVaultContentEnrollmentManifestRevisionSource;
 
   constructor(input: {
-    readonly native: Pick<
-      PrivateVaultTrustedEnrollmentOperator,
-      "buildBrokerEnrollmentChallenge" | "buildBrokerEnrollmentAuthorization"
-    >;
+    readonly native: PrivateVaultAuthorizerEnrollmentOperator;
     readonly hosted: PrivateVaultContentEnrollmentTransport;
+    readonly manifest: PrivateVaultContentEnrollmentManifestRevisionSource;
   }) {
     super();
     this.#native = input.native;
     this.#hosted = input.hosted;
+    this.#manifest = input.manifest;
   }
 
   advance(
@@ -255,22 +261,48 @@ export class PrivateVaultContentEnrollmentAuthorizer extends SerializedEnrollmen
         }
         if (status.phase === "confirmed") {
           if (!status.challenge || !status.sasDecision) throw new Error();
-          const authorization =
-            await this.#native.buildBrokerEnrollmentAuthorization({
-              vaultId: invitation.vaultId,
-              offer: invitation.offer.slice(),
-              challenge: status.challenge.slice(),
-              sasDecision: status.sasDecision.slice(),
-            });
+          const manifestRevision =
+            await this.#manifest.readTrustedCurrentRevision(invitation.vaultId);
+          let authorization;
+          try {
+            authorization =
+              await this.#native.buildBrokerEnrollmentAuthorization({
+                vaultId: invitation.vaultId,
+                offer: invitation.offer.slice(),
+                challenge: status.challenge.slice(),
+                sasDecision: status.sasDecision.slice(),
+                manifestRevision,
+              });
+          } finally {
+            manifestRevision.fill(0);
+          }
+          if (
+            !authorization.manifestCheckpoint ||
+            !authorization.manifestAuthorization
+          ) {
+            throw new Error();
+          }
           status = await this.#hosted.publishAuthorization(
             invitation.offerHash,
             invitation.offer.slice(),
             authorization.encoded.slice(),
+            authorization.manifestCheckpoint.slice(),
+            authorization.manifestAuthorization.slice(),
           );
           if (
             status.phase !== "committed" ||
             !status.authorization ||
-            !same(status.authorization, authorization.encoded)
+            !status.manifestCheckpoint ||
+            !status.manifestAuthorization ||
+            !same(status.authorization, authorization.encoded) ||
+            !same(
+              status.manifestCheckpoint,
+              authorization.manifestCheckpoint,
+            ) ||
+            !same(
+              status.manifestAuthorization,
+              authorization.manifestAuthorization,
+            )
           ) {
             throw new Error();
           }
