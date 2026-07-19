@@ -930,13 +930,14 @@ function activeAuthorizer(
   return member;
 }
 
-export async function verifyAncV1EnrollmentChallenge(
+async function verifyAncV1EnrollmentChallengeWithMode(
   encodedChallenge: Uint8Array,
   input: {
     encodedOffer: Uint8Array;
     verifiedControlState: ControlLogState;
     now: number;
   },
+  expectedOldBrokerEndpointId?: Uint8Array,
 ): Promise<{
   offer: AncV1EndpointEnrollmentOffer;
   challenge: AncV1EnrollmentChallenge;
@@ -991,11 +992,37 @@ export async function verifyAncV1EnrollmentChallenge(
     fail("Challenge offer hash does not match");
   if (offer.membershipRole !== challenge.targetMembershipRole)
     fail("Challenge role does not match offer");
-  if (
-    challenge.targetMembershipRole === "broker" &&
-    state.activeMembers.some((member) => member.role === "broker")
-  ) {
-    fail("A broker is already active");
+  if (expectedOldBrokerEndpointId === undefined) {
+    if (
+      challenge.targetMembershipRole === "broker" &&
+      state.activeMembers.some((member) => member.role === "broker")
+    ) {
+      fail("A broker is already active");
+    }
+  } else {
+    if (
+      offer.membershipRole !== "broker" ||
+      !offer.unattended ||
+      challenge.targetMembershipRole !== "broker"
+    ) {
+      fail("Broker replacement candidate must be an unattended broker");
+    }
+    const expectedOldBrokerId = ancV1LifecycleIdToHex(
+      bytes(
+        expectedOldBrokerEndpointId,
+        ID_BYTES,
+        "expectedOldBrokerEndpointId",
+      ),
+    );
+    const activeBrokers = state.activeMembers.filter(
+      (member) => member.role === "broker",
+    );
+    if (
+      activeBrokers.length !== 1 ||
+      activeBrokers[0]!.endpointId !== expectedOldBrokerId
+    ) {
+      fail("Broker replacement requires exactly the expected active broker");
+    }
   }
   if (
     !(await verifyAncV1CandidateKeyProof(
@@ -1047,6 +1074,52 @@ export async function verifyAncV1EnrollmentChallenge(
     transcriptHash,
     sasCode: await deriveAncV1EnrollmentSasCode(transcriptHash),
   };
+}
+
+export async function verifyAncV1EnrollmentChallenge(
+  encodedChallenge: Uint8Array,
+  input: {
+    encodedOffer: Uint8Array;
+    verifiedControlState: ControlLogState;
+    now: number;
+  },
+) {
+  return verifyAncV1EnrollmentChallengeWithMode(encodedChallenge, input);
+}
+
+/**
+ * Verify the pre-authorization challenge for replacing one existing broker.
+ * This only authenticates the candidate ceremony; it does not alter membership,
+ * freeze a lane, or claim that replacement has committed.
+ */
+export async function verifyAncV1BrokerReplacementChallenge(
+  encodedChallenge: Uint8Array,
+  input: {
+    encodedOffer: Uint8Array;
+    verifiedControlState: ControlLogState;
+    expectedOldBrokerEndpointId: Uint8Array;
+    now: number;
+  },
+) {
+  exact(
+    input,
+    [
+      "encodedOffer",
+      "verifiedControlState",
+      "expectedOldBrokerEndpointId",
+      "now",
+    ],
+    "Broker replacement challenge verification input",
+  );
+  return verifyAncV1EnrollmentChallengeWithMode(
+    encodedChallenge,
+    {
+      encodedOffer: input.encodedOffer,
+      verifiedControlState: input.verifiedControlState,
+      now: input.now,
+    },
+    input.expectedOldBrokerEndpointId,
+  );
 }
 
 const AUTHORIZATION_UNSIGNED_FIELDS = [
@@ -1447,6 +1520,24 @@ export async function verifyAncV1EnrollmentSasDecision(
       now: input.now,
     },
   );
+  return verifyAncV1EnrollmentSasDecisionAgainstChallenge(
+    encodedReceipt,
+    input.encodedOffer,
+    input.encodedChallenge,
+    verified,
+  );
+}
+
+async function verifyAncV1EnrollmentSasDecisionAgainstChallenge(
+  encodedReceipt: Uint8Array,
+  encodedOffer: Uint8Array,
+  encodedChallenge: Uint8Array,
+  verified: Awaited<ReturnType<typeof verifyAncV1EnrollmentChallengeWithMode>>,
+): Promise<{
+  receipt: AncV1EnrollmentSasDecision;
+  challenge: AncV1EnrollmentChallenge;
+  sasCode: string;
+}> {
   const receipt = await verifyAncV1EnrollmentSasDecisionSignature(
     encodedReceipt,
     {
@@ -1455,11 +1546,11 @@ export async function verifyAncV1EnrollmentSasDecision(
     },
   );
   const expectedOfferHash = await hashAncV1EndpointEnrollmentOffer(
-    input.encodedOffer,
+    encodedOffer,
     { expectedVaultId: verified.offer.vaultId },
   );
   const expectedChallengeHash = await hashAncV1EnrollmentChallenge(
-    input.encodedChallenge,
+    encodedChallenge,
     verified.offer.vaultId,
   );
   if (
@@ -1478,6 +1569,49 @@ export async function verifyAncV1EnrollmentSasDecision(
     challenge: verified.challenge,
     sasCode: verified.sasCode,
   };
+}
+
+/** Verify a candidate-signed SAS decision without authorizing membership. */
+export async function verifyAncV1BrokerReplacementSasDecision(
+  encodedReceipt: Uint8Array,
+  input: {
+    encodedOffer: Uint8Array;
+    encodedChallenge: Uint8Array;
+    verifiedControlState: ControlLogState;
+    expectedOldBrokerEndpointId: Uint8Array;
+    now: number;
+  },
+): Promise<{
+  receipt: AncV1EnrollmentSasDecision;
+  challenge: AncV1EnrollmentChallenge;
+  sasCode: string;
+}> {
+  exact(
+    input,
+    [
+      "encodedOffer",
+      "encodedChallenge",
+      "verifiedControlState",
+      "expectedOldBrokerEndpointId",
+      "now",
+    ],
+    "Broker replacement SAS decision verification input",
+  );
+  const verified = await verifyAncV1BrokerReplacementChallenge(
+    input.encodedChallenge,
+    {
+      encodedOffer: input.encodedOffer,
+      verifiedControlState: input.verifiedControlState,
+      expectedOldBrokerEndpointId: input.expectedOldBrokerEndpointId,
+      now: input.now,
+    },
+  );
+  return verifyAncV1EnrollmentSasDecisionAgainstChallenge(
+    encodedReceipt,
+    input.encodedOffer,
+    input.encodedChallenge,
+    verified,
+  );
 }
 
 export async function verifyAncV1EnrollmentAuthorizationSignature(

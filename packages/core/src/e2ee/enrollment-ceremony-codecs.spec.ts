@@ -41,6 +41,8 @@ import {
   signAncV1EnrollmentChallenge,
   signAncV1EnrollmentSasDecision,
   verifyAncV1CandidateKeyProof,
+  verifyAncV1BrokerReplacementChallenge,
+  verifyAncV1BrokerReplacementSasDecision,
   verifyAncV1EnrollmentAuthorization,
   verifyAncV1EnrollmentAuthorizationSignature,
   verifyAncV1EnrollmentChallenge,
@@ -69,6 +71,7 @@ const p = ancV1PatternBytes;
 const vaultId = p(0x01, 16);
 const candidateId = p(0x03, 16);
 const authorizerId = p(0x02, 16);
+const oldBrokerId = p(0x04, 16);
 
 function map(encoded: Uint8Array): Map<number, AncV1CanonicalValue> {
   return decodeAncV1Canonical(encoded) as Map<number, AncV1CanonicalValue>;
@@ -84,7 +87,7 @@ function mutate(
   return encodeAncV1Canonical(decoded);
 }
 
-async function fixture() {
+async function fixture(membershipRole: "endpoint" | "broker" = "endpoint") {
   const candidate = await ancV1SigningKeypairFromSeed(p(0x12, 32));
   const authorizer = await ancV1SigningKeypairFromSeed(p(0x11, 32));
   const offer = {
@@ -95,8 +98,8 @@ async function fixture() {
     envelopeId: p(0x0e, 16),
     endpointId: candidateId,
     ceremonyId: p(0x0c, 16),
-    membershipRole: "endpoint" as const,
-    unattended: false,
+    membershipRole,
+    unattended: membershipRole === "broker",
     signingPublicKey: candidate.publicKey,
     keyAgreementPublicKey: p(0x33, 32),
     enrollmentNonce: p(0xa5, 32),
@@ -124,7 +127,7 @@ async function fixture() {
     controlSequence: 9,
     controlHeadHash: p(0x71, 32),
     membershipHash: p(0x72, 32),
-    targetMembershipRole: "endpoint" as const,
+    targetMembershipRole: membershipRole,
     challengeNonce: p(0xa7, 32),
     expiresAt: 1_721_111_720,
   };
@@ -176,6 +179,18 @@ async function fixture() {
         keyAgreementPublicKey: "22".repeat(32),
         enrollmentRef: "10".repeat(16),
       },
+      ...(membershipRole === "broker"
+        ? [
+            {
+              endpointId: ancV1LifecycleIdToHex(oldBrokerId),
+              role: "broker" as const,
+              unattended: true,
+              signingPublicKey: "44".repeat(32),
+              keyAgreementPublicKey: "55".repeat(32),
+              enrollmentRef: "66".repeat(16),
+            },
+          ]
+        : []),
     ],
     removedEndpointIds: [],
     epoch: 7,
@@ -201,7 +216,7 @@ async function fixture() {
     offerHash,
     challengeHash,
     authorizerEndpointId: authorizerId,
-    targetMembershipRole: "endpoint",
+    targetMembershipRole: membershipRole,
     previousControlSequence: 9,
     previousControlHeadHash: p(0x71, 32),
     previousMembershipHash: p(0x72, 32),
@@ -454,6 +469,137 @@ describe("anc/v1 enrollment ceremony canonical contracts", () => {
         now: unsigned.createdAt,
       }),
     ).rejects.toThrow(/signature/);
+  });
+
+  it("verifies replacement challenge and SAS only for exactly the expected active broker", async () => {
+    const value = await fixture("broker");
+    const now = value.challenge.createdAt + 2;
+    await expect(
+      verifyAncV1EnrollmentChallenge(value.encodedChallenge, {
+        encodedOffer: value.encodedOffer,
+        verifiedControlState: value.state,
+        now,
+      }),
+    ).rejects.toThrow(/already active/);
+
+    const verified = await verifyAncV1BrokerReplacementChallenge(
+      value.encodedChallenge,
+      {
+        encodedOffer: value.encodedOffer,
+        verifiedControlState: value.state,
+        expectedOldBrokerEndpointId: oldBrokerId,
+        now,
+      },
+    );
+    expect(verified.offer).toMatchObject({
+      membershipRole: "broker",
+      unattended: true,
+    });
+
+    const receipt = await signAncV1EnrollmentSasDecision(
+      {
+        suite: E2EE_SUITE_ID,
+        vaultId,
+        type: "enrollment-sas-decision",
+        createdAt: now,
+        envelopeId: p(0x45, 16),
+        offerHash: value.offerHash,
+        challengeHash: await hashAncV1EnrollmentChallenge(
+          value.encodedChallenge,
+          vaultId,
+        ),
+        sasTranscriptHash: value.sasTranscriptHash,
+        candidateEndpointId: value.offer.endpointId,
+        ceremonyId: value.offer.ceremonyId,
+        decision: "confirmed",
+      },
+      value.candidate.privateKey,
+    );
+    const encodedReceipt = encodeAncV1EnrollmentSasDecision(receipt);
+    await expect(
+      verifyAncV1EnrollmentSasDecision(encodedReceipt, {
+        encodedOffer: value.encodedOffer,
+        encodedChallenge: value.encodedChallenge,
+        verifiedControlState: value.state,
+        now,
+      }),
+    ).rejects.toThrow(/already active/);
+    await expect(
+      verifyAncV1BrokerReplacementSasDecision(encodedReceipt, {
+        encodedOffer: value.encodedOffer,
+        encodedChallenge: value.encodedChallenge,
+        verifiedControlState: value.state,
+        expectedOldBrokerEndpointId: oldBrokerId,
+        now,
+      }),
+    ).resolves.toMatchObject({ receipt: { decision: "confirmed" } });
+  });
+
+  it("rejects replacement ceremonies with absent, extra, wrong, or unsafe members", async () => {
+    const value = await fixture("broker");
+    const verify = (
+      state: ControlLogState,
+      expectedOldBrokerEndpointId = oldBrokerId,
+    ) =>
+      verifyAncV1BrokerReplacementChallenge(value.encodedChallenge, {
+        encodedOffer: value.encodedOffer,
+        verifiedControlState: state,
+        expectedOldBrokerEndpointId,
+        now: value.challenge.createdAt + 1,
+      });
+    const authorizer = value.state.activeMembers[0]!;
+    const oldBroker = value.state.activeMembers[1]!;
+    await expect(
+      verify({ ...value.state, activeMembers: [authorizer] }),
+    ).rejects.toThrow(/At most one active broker|exactly the expected/);
+    await expect(
+      verify({
+        ...value.state,
+        activeMembers: [
+          authorizer,
+          oldBroker,
+          { ...oldBroker, endpointId: "77".repeat(16) },
+        ],
+      }),
+    ).rejects.toThrow(/At most one active broker|exactly the expected/);
+    await expect(verify(value.state, p(0x77, 16))).rejects.toThrow(
+      /exactly the expected active broker/,
+    );
+    await expect(
+      verify({
+        ...value.state,
+        activeMembers: [oldBroker],
+      }),
+    ).rejects.toThrow(/active attended endpoint/);
+    await expect(
+      verify({
+        ...value.state,
+        activeMembers: [
+          authorizer,
+          {
+            ...authorizer,
+            endpointId: ancV1LifecycleIdToHex(candidateId),
+          },
+          oldBroker,
+        ],
+      }),
+    ).rejects.toThrow(/already active/);
+    await expect(
+      verify({
+        ...value.state,
+        removedEndpointIds: [ancV1LifecycleIdToHex(candidateId)],
+      }),
+    ).rejects.toThrow(/tombstoned/);
+
+    const ordinary = await fixture();
+    await expect(
+      verifyAncV1BrokerReplacementChallenge(ordinary.encodedChallenge, {
+        encodedOffer: ordinary.encodedOffer,
+        verifiedControlState: ordinary.state,
+        expectedOldBrokerEndpointId: oldBrokerId,
+        now: ordinary.challenge.createdAt + 1,
+      }),
+    ).rejects.toThrow(/unattended broker/);
   });
 
   it("rejects wrong candidate proof, offer, role, broker/removed authorizer, keys and stale state", async () => {

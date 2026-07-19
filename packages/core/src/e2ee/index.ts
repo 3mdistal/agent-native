@@ -1,5 +1,6 @@
 export * from "./ceremonies.js";
 export * from "./broker-drain-attestation-codecs.js";
+export * from "./broker-replacement-approval-codecs.js";
 export * from "./broker-job-protocol.js";
 export * from "./broker-disclosure-protocol.js";
 export * from "./canonical.js";
