@@ -222,26 +222,31 @@ int main(void) {
            [retry.drainAttestationHash isEqualToData:result.drainAttestationHash]);
 
     uint64_t freshDrainTime = UINT64_C(1721296922);
+    AncPrivateVaultControlLogState *freshState = State(
+        issuerId, oldBrokerId, [NSData dataWithBytes:signingPublic length:32],
+        [NSData dataWithBytes:agreementPublic length:32],
+        [NSData dataWithBytes:recoveryPublic length:32]);
+    freshState.signedAt = Timestamp(freshDrainTime);
     NSData *freshDrain = AncPrivateVaultCreateBrokerDrainAttestation(
-        state, oldBrokerId, candidateId, candidateSigning,
+        freshState, oldBrokerId, candidateId, candidateSigning,
         candidateAgreement, candidateEnrollment, Bytes(0x55, 16),
         freshDrainTime, 10, 12, Bytes(0x56, 32), 0, signingSeed, &status);
     assert(freshDrain.length > 0 &&
            AncPrivateVaultBuildBrokerReplacement(
-               state, oldBrokerId, candidateId, candidateSigning,
+               freshState, oldBrokerId, candidateId, candidateSigning,
                candidateAgreement, candidateEnrollment, freshDrain,
                Bytes(0x57, 16), Bytes(0x58, 16), Bytes(0x59, 24),
                freshDrainTime, pending, signingSeed, agreementSeed,
                &status) != nil);
     assert(AncPrivateVaultBuildBrokerReplacement(
-               state, oldBrokerId, candidateId, candidateSigning,
+               freshState, oldBrokerId, candidateId, candidateSigning,
                candidateAgreement, candidateEnrollment, freshDrain,
                Bytes(0x57, 16), Bytes(0x58, 16), Bytes(0x59, 24),
                freshDrainTime + UINT64_C(901), pending, signingSeed,
                agreementSeed, &status) == nil &&
            status == AncPrivateVaultBrokerReplacementBuilderStatusDrainRejected);
     assert(AncPrivateVaultBuildBrokerReplacement(
-               state, oldBrokerId, candidateId, candidateSigning,
+               freshState, oldBrokerId, candidateId, candidateSigning,
                candidateAgreement, candidateEnrollment, freshDrain,
                Bytes(0x57, 16), Bytes(0x58, 16), Bytes(0x59, 24),
                freshDrainTime - UINT64_C(61), pending, signingSeed,
