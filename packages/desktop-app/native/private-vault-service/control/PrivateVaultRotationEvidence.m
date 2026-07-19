@@ -29,6 +29,8 @@ static const uint8_t kHostedReceiptHashDomain[] =
     "anc/rotation/v1/rotation-hosted-receipt-hash";
 static const uint8_t kRecipientSetHashDomain[] =
     "anc/rotation/v1/rotation-recipient-set-hash";
+static const uint8_t kLiveRevisionSetHashDomain[] =
+    "anc/rotation/v1/rotation-live-revision-set-hash";
 
 @interface AncPrivateVaultRotationEvidenceRecipient ()
 @property(nonatomic, readwrite) NSData *endpointId;
@@ -62,6 +64,62 @@ static const uint8_t kRecipientSetHashDomain[] =
   }
   return self;
 }
+@end
+
+@interface AncPrivateVaultRotationLiveRevision ()
+@property(nonatomic, readwrite) NSData *objectId;
+@property(nonatomic, readwrite) uint64_t revision;
+@property(nonatomic, readwrite) NSData *priorRevisionId;
+@property(nonatomic, readwrite) NSData *rotatedRevisionId;
+@end
+
+@implementation AncPrivateVaultRotationLiveRevision
+- (instancetype)initWithObjectId:(NSData *)objectId
+                        revision:(uint64_t)revision
+                 priorRevisionId:(NSData *)priorRevisionId
+               rotatedRevisionId:(NSData *)rotatedRevisionId {
+  if (![objectId isKindOfClass:NSData.class] || objectId.length != 16 ||
+      revision < 1 || revision > kMaxSafe ||
+      ![priorRevisionId isKindOfClass:NSData.class] ||
+      priorRevisionId.length != 32 ||
+      ![rotatedRevisionId isKindOfClass:NSData.class] ||
+      rotatedRevisionId.length != 32)
+    return nil;
+  if ((self = [super init])) {
+    _objectId = [objectId copy];
+    _revision = revision;
+    _priorRevisionId = [priorRevisionId copy];
+    _rotatedRevisionId = [rotatedRevisionId copy];
+  }
+  return self;
+}
+@end
+
+@interface AncPrivateVaultRotationPreparationEvidence ()
+@property(nonatomic, readwrite) NSData *encodedCheckpoint;
+@property(nonatomic, readwrite) NSData *expectedVaultId;
+@property(nonatomic, readwrite) NSData *signerSigningPublicKey;
+@property(nonatomic, readwrite) NSArray<AncPrivateVaultRotationEvidenceRecipient *> *recipients;
+@property(nonatomic, readwrite) NSDictionary<NSData *, AncPrivateVaultRotationEvidenceRecipient *> *recipientsById;
+@property(nonatomic, readwrite) NSDictionary<NSData *, NSDictionary *> *offersById;
+@property(nonatomic, readwrite) NSDictionary<NSData *, NSData *> *offerHashesById;
+@property(nonatomic, readwrite) NSDictionary *checkpoint;
+@property(nonatomic, readwrite) NSData *checkpointHash;
+- (instancetype)initPrivate;
+@end
+
+@implementation AncPrivateVaultRotationPreparationEvidence
+- (instancetype)initPrivate { return [super init]; }
+@end
+
+@interface AncPrivateVaultRotationCustodyEvidence ()
+@property(nonatomic, readwrite) AncPrivateVaultRotationPreparationEvidence *preparation;
+@property(nonatomic, readwrite) uint64_t notBefore;
+- (instancetype)initPrivate;
+@end
+
+@implementation AncPrivateVaultRotationCustodyEvidence
+- (instancetype)initPrivate { return [super init]; }
 @end
 
 static void SetStatus(AncPrivateVaultRotationEvidenceStatus *status,
@@ -303,7 +361,7 @@ NSData *AncPrivateVaultRotationEvidenceBuildOffer(
   return encoded;
 }
 
-static NSData *PossessionMac(
+static NSMutableData *PossessionMac(
     NSDictionary<NSNumber *, AncPrivateVaultCanonicalValue *> *unsignedMap,
     const uint8_t pendingEpochKey[32]) {
   NSData *encoded = Encode(unsignedMap);
@@ -322,7 +380,8 @@ static NSData *PossessionMac(
                   epoch) == ANC_PV_CRYPTO_OK &&
               anc_pv_blake2b_256_keyed(output, message.bytes, message.length,
                                        key) == ANC_PV_CRYPTO_OK;
-  NSData *result = okay ? [NSData dataWithBytes:output length:32] : nil;
+  NSMutableData *result =
+      okay ? [NSMutableData dataWithBytes:output length:32] : nil;
   anc_pv_zeroize(message.mutableBytes, message.length);
   anc_pv_zeroize(epoch, sizeof epoch);
   anc_pv_zeroize(key, sizeof key);
@@ -350,7 +409,7 @@ NSData *AncPrivateVaultRotationEvidenceBuildAcknowledgement(
     @42 : Bytes(eekWrapHash), @43 : Bytes(recipientEndpointId),
     @44 : Integer(targetEpoch), @47 : Bytes(offerHash),
   }];
-  NSData *mac = PossessionMac(map, pendingEpochKey);
+  NSMutableData *mac = PossessionMac(map, pendingEpochKey);
   if (mac == nil) {
     SetStatus(status, AncPrivateVaultRotationEvidenceStatusCrypto);
     return nil;
@@ -359,6 +418,7 @@ NSData *AncPrivateVaultRotationEvidenceBuildAcknowledgement(
   NSData *encoded = SignMap(map, @46, kAcknowledgementDomain,
                             sizeof kAcknowledgementDomain,
                             recipientSigningSeed);
+  anc_pv_zeroize(mac.mutableBytes, mac.length);
   SetStatus(status, encoded ? AncPrivateVaultRotationEvidenceStatusOK
                             : AncPrivateVaultRotationEvidenceStatusCrypto);
   return encoded;
@@ -688,88 +748,145 @@ NSData *AncPrivateVaultRotationEvidenceHashRecipientSet(
              : nil;
 }
 
+NSData *AncPrivateVaultRotationEvidenceHashLiveRevisionSet(
+    NSArray<AncPrivateVaultRotationLiveRevision *> *liveRevisions) {
+  if (![liveRevisions isKindOfClass:NSArray.class] ||
+      liveRevisions.count > 10000)
+    return nil;
+  for (id value in liveRevisions)
+    if (![value isKindOfClass:AncPrivateVaultRotationLiveRevision.class] ||
+        !Exact([value objectId], 16) || !Positive([value revision]) ||
+        !Exact([value priorRevisionId], 32) ||
+        !Exact([value rotatedRevisionId], 32))
+      return nil;
+  NSArray *sorted = [liveRevisions
+      sortedArrayUsingComparator:^NSComparisonResult(
+          AncPrivateVaultRotationLiveRevision *left,
+          AncPrivateVaultRotationLiveRevision *right) {
+        NSComparisonResult objects = CompareData(left.objectId, right.objectId);
+        if (objects != NSOrderedSame)
+          return objects;
+        if (left.revision < right.revision)
+          return NSOrderedAscending;
+        if (left.revision > right.revision)
+          return NSOrderedDescending;
+        return NSOrderedSame;
+      }];
+  NSMutableArray *values = [NSMutableArray arrayWithCapacity:sorted.count];
+  AncPrivateVaultRotationLiveRevision *prior = nil;
+  for (AncPrivateVaultRotationLiveRevision *revision in sorted) {
+    if (prior != nil && Same(prior.objectId, revision.objectId) &&
+        prior.revision == revision.revision)
+      return nil;
+    [values addObject:[AncPrivateVaultCanonicalValue array:@[
+      Bytes(revision.objectId), Integer(revision.revision),
+      Bytes(revision.priorRevisionId), Bytes(revision.rotatedRevisionId)
+    ]]];
+    prior = revision;
+  }
+  AncPrivateVaultCanonicalStatus status;
+  NSData *encoded = AncPrivateVaultCanonicalEncode(
+      [AncPrivateVaultCanonicalValue array:values], &status);
+  return status == AncPrivateVaultCanonicalStatusOK
+             ? DomainHash(kLiveRevisionSetHashDomain,
+                          sizeof kLiveRevisionSetHashDomain, encoded)
+             : nil;
+}
+
 static BOOL Reject(AncPrivateVaultRotationEvidenceStatus *status,
                    AncPrivateVaultRotationEvidenceStatus value) {
   SetStatus(status, value);
   return NO;
 }
 
-BOOL AncPrivateVaultVerifyCompletedRotationEvidence(
-    NSData *encodedCheckpoint, NSArray<NSData *> *encodedAcknowledgements,
-    NSArray<NSData *> *encodedDestructions, NSData *encodedCompletion,
-    NSData *encodedHostedReceipt, NSString *expectedHostedEntryId,
-    NSString *expectedHostedVaultId, NSData *expectedRecoveryWrapHash,
-    uint64_t expectedRecoveryWrapByteLength, NSData *expectedVaultId,
+static id RejectObject(AncPrivateVaultRotationEvidenceStatus *status,
+                       AncPrivateVaultRotationEvidenceStatus value) {
+  SetStatus(status, value);
+  return nil;
+}
+
+AncPrivateVaultRotationPreparationEvidence *
+AncPrivateVaultVerifyRotationPreparationEvidence(
+    NSData *encodedCheckpoint, NSData *expectedVaultId,
     NSData *expectedSignerEndpointId, NSData *signerSigningPublicKey,
     NSArray<AncPrivateVaultRotationEvidenceRecipient *> *expectedRecipients,
-    const uint8_t pendingEpochKey[32], uint64_t now,
-    AncPrivateVaultRotationEvidenceStatus *status) {
+    NSArray<AncPrivateVaultRotationLiveRevision *> *liveRevisions,
+    uint64_t now, AncPrivateVaultRotationEvidenceStatus *status) {
   SetStatus(status, AncPrivateVaultRotationEvidenceStatusInvalid);
   if (!Exact(expectedVaultId, 16) || !Exact(expectedSignerEndpointId, 16) ||
-      !Exact(signerSigningPublicKey, 32) ||
-      !Exact(expectedRecoveryWrapHash, 32) ||
-      !Positive(expectedRecoveryWrapByteLength) ||
-      expectedRecoveryWrapByteLength > 1024 * 1024 || !Positive(now) ||
-      pendingEpochKey == NULL ||
+      !Exact(signerSigningPublicKey, 32) || !Positive(now) ||
       ![expectedRecipients isKindOfClass:NSArray.class] ||
-      expectedRecipients.count < 1 || expectedRecipients.count > kRecipientLimit ||
-      ![encodedAcknowledgements isKindOfClass:NSArray.class] ||
-      ![encodedDestructions isKindOfClass:NSArray.class] ||
-      encodedAcknowledgements.count != expectedRecipients.count ||
-      encodedDestructions.count != expectedRecipients.count ||
-      !OpaqueId(expectedHostedEntryId) || !OpaqueId(expectedHostedVaultId))
-    return NO;
+      expectedRecipients.count < 1 ||
+      expectedRecipients.count > kRecipientLimit ||
+      ![liveRevisions isKindOfClass:NSArray.class] ||
+      liveRevisions.count > 10000)
+    return nil;
 
   NSDictionary *checkpoint = Checkpoint(encodedCheckpoint, expectedVaultId);
   if (checkpoint == nil)
-    return NO;
-  uint64_t baseSequence = Unsigned(checkpoint, @11, NO);
+    return nil;
   uint64_t baseEpoch = Unsigned(checkpoint, @23, YES);
   uint64_t targetEpoch = Unsigned(checkpoint, @13, YES);
-  uint64_t liveObjects = Unsigned(checkpoint, @18, NO);
-  uint64_t liveRevisions = Unsigned(checkpoint, @24, NO);
-  NSData *ceremonyId = Field(checkpoint, @10,
-                             AncPrivateVaultCanonicalTypeBytes).bytesValue;
-  NSData *removedEndpointId = Field(
-      checkpoint, @21, AncPrivateVaultCanonicalTypeBytes).bytesValue;
-  NSData *checkpointSigner = Field(
-      checkpoint, @20, AncPrivateVaultCanonicalTypeBytes).bytesValue;
-  NSData *checkpointRecipientSetHash = Field(
-      checkpoint, @25, AncPrivateVaultCanonicalTypeBytes).bytesValue;
-  NSData *controlEntryHash = Field(
-      checkpoint, @26, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  uint64_t liveObjectCount = Unsigned(checkpoint, @18, NO);
+  uint64_t liveRevisionCount = Unsigned(checkpoint, @24, NO);
+  NSData *ceremonyId =
+      Field(checkpoint, @10, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  NSData *removedEndpointId =
+      Field(checkpoint, @21, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  NSData *checkpointSigner =
+      Field(checkpoint, @20, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  NSData *checkpointRecipientSetHash =
+      Field(checkpoint, @25, AncPrivateVaultCanonicalTypeBytes).bytesValue;
   if (baseEpoch == kMaxSafe || targetEpoch != baseEpoch + 1 ||
       !Same(checkpointSigner, expectedSignerEndpointId) ||
       Same(checkpointSigner, removedEndpointId) ||
-      liveObjects > liveRevisions)
-    return Reject(status, AncPrivateVaultRotationEvidenceStatusBinding);
+      liveObjectCount > liveRevisionCount)
+    return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
   if (!VerifyMapSignature(checkpoint, @22, kCheckpointDomain,
                           sizeof kCheckpointDomain, signerSigningPublicKey))
-    return Reject(status, AncPrivateVaultRotationEvidenceStatusSignature);
+    return RejectObject(status, AncPrivateVaultRotationEvidenceStatusSignature);
+
+  if (liveRevisions.count != liveRevisionCount)
+    return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
+  NSMutableSet<NSData *> *liveObjects = [NSMutableSet set];
+  for (id revision in liveRevisions) {
+    if (![revision isKindOfClass:AncPrivateVaultRotationLiveRevision.class])
+      return nil;
+    [liveObjects addObject:[revision objectId]];
+  }
+  NSData *liveRevisionSetHash =
+      AncPrivateVaultRotationEvidenceHashLiveRevisionSet(liveRevisions);
+  if (liveObjects.count != liveObjectCount ||
+      !Same(liveRevisionSetHash,
+            Field(checkpoint, @19,
+                  AncPrivateVaultCanonicalTypeBytes).bytesValue))
+    return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
+
   NSData *checkpointHash = AncPrivateVaultRotationEvidenceHashCheckpoint(
       encodedCheckpoint, expectedVaultId);
   NSData *recipientSetHash =
       AncPrivateVaultRotationEvidenceHashRecipientSet(expectedRecipients);
   if (!Same(recipientSetHash, checkpointRecipientSetHash))
-    return Reject(status, AncPrivateVaultRotationEvidenceStatusBinding);
+    return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
 
   NSMutableDictionary<NSData *, AncPrivateVaultRotationEvidenceRecipient *>
       *recipients = [NSMutableDictionary dictionary];
   BOOL signerPresent = NO;
-  for (AncPrivateVaultRotationEvidenceRecipient *recipient in
-       expectedRecipients) {
-    if (![recipient
-            isKindOfClass:AncPrivateVaultRotationEvidenceRecipient.class] ||
-        recipients[recipient.endpointId] != nil ||
+  for (id value in expectedRecipients) {
+    if (![value
+            isKindOfClass:AncPrivateVaultRotationEvidenceRecipient.class])
+      return nil;
+    AncPrivateVaultRotationEvidenceRecipient *recipient = value;
+    if (recipients[recipient.endpointId] != nil ||
         Same(recipient.endpointId, removedEndpointId))
-      return Reject(status, AncPrivateVaultRotationEvidenceStatusBinding);
+      return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
     recipients[recipient.endpointId] = recipient;
     if (Same(recipient.endpointId, checkpointSigner) &&
         Same(recipient.signingPublicKey, signerSigningPublicKey))
       signerPresent = YES;
   }
   if (!signerPresent)
-    return Reject(status, AncPrivateVaultRotationEvidenceStatusBinding);
+    return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
 
   NSMutableDictionary<NSData *, NSDictionary *> *offers =
       [NSMutableDictionary dictionary];
@@ -793,26 +910,75 @@ BOOL AncPrivateVaultVerifyCompletedRotationEvidence(
         !Same(Field(offer, @32, AncPrivateVaultCanonicalTypeBytes).bytesValue,
               recipient.eekWrapHash) ||
         Unsigned(offer, @35, YES) != targetEpoch)
-      return Reject(status, AncPrivateVaultRotationEvidenceStatusBinding);
+      return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
     if (!VerifyMapSignature(offer, @37, kOfferDomain, sizeof kOfferDomain,
                             signerSigningPublicKey))
-      return Reject(status, AncPrivateVaultRotationEvidenceStatusSignature);
+      return RejectObject(status,
+                          AncPrivateVaultRotationEvidenceStatusSignature);
     NSData *offerHash = AncPrivateVaultRotationEvidenceHashOffer(
         recipient.encodedOffer, expectedVaultId);
     if (!Exact(offerHash, 32))
-      return Reject(status, AncPrivateVaultRotationEvidenceStatusCrypto);
+      return RejectObject(status, AncPrivateVaultRotationEvidenceStatusCrypto);
     offers[recipient.endpointId] = offer;
     offerHashes[recipient.endpointId] = offerHash;
   }
 
-  NSMutableSet<NSData *> *seenAcknowledgements = [NSMutableSet set];
+  AncPrivateVaultRotationPreparationEvidence *result =
+      [[AncPrivateVaultRotationPreparationEvidence alloc] initPrivate];
+  result.encodedCheckpoint = [encodedCheckpoint copy];
+  result.expectedVaultId = [expectedVaultId copy];
+  result.signerSigningPublicKey = [signerSigningPublicKey copy];
+  result.recipients = [expectedRecipients copy];
+  result.recipientsById = [recipients copy];
+  result.offersById = [offers copy];
+  result.offerHashesById = [offerHashes copy];
+  result.checkpoint = checkpoint;
+  result.checkpointHash = checkpointHash;
+  SetStatus(status, AncPrivateVaultRotationEvidenceStatusOK);
+  return result;
+}
+
+AncPrivateVaultRotationCustodyEvidence *
+AncPrivateVaultVerifyRotationCustodyEvidence(
+    AncPrivateVaultRotationPreparationEvidence *preparation,
+    NSArray<NSData *> *encodedAcknowledgements,
+    NSArray<NSData *> *encodedDestructions,
+    const uint8_t pendingEpochKey[32], uint64_t now,
+    AncPrivateVaultRotationEvidenceStatus *status) {
+  SetStatus(status, AncPrivateVaultRotationEvidenceStatusInvalid);
+  if (![preparation
+          isKindOfClass:AncPrivateVaultRotationPreparationEvidence.class] ||
+      preparation.recipients.count < 1 ||
+      preparation.recipients.count > kRecipientLimit ||
+      preparation.recipientsById.count != preparation.recipients.count ||
+      preparation.offersById.count != preparation.recipients.count ||
+      preparation.offerHashesById.count != preparation.recipients.count ||
+      ![preparation.checkpoint isKindOfClass:NSDictionary.class] ||
+      !Exact(preparation.expectedVaultId, 16) ||
+      !Exact(preparation.signerSigningPublicKey, 32) ||
+      !Exact(preparation.checkpointHash, 32) ||
+      ![encodedAcknowledgements isKindOfClass:NSArray.class] ||
+      ![encodedDestructions isKindOfClass:NSArray.class] ||
+      encodedAcknowledgements.count != preparation.recipients.count ||
+      encodedDestructions.count != preparation.recipients.count ||
+      pendingEpochKey == NULL || !Positive(now))
+    return nil;
+  NSDictionary *checkpoint = preparation.checkpoint;
+  NSData *ceremonyId =
+      Field(checkpoint, @10, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  NSData *controlEntryHash =
+      Field(checkpoint, @26, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  uint64_t baseEpoch = Unsigned(checkpoint, @23, YES);
+  uint64_t targetEpoch = Unsigned(checkpoint, @13, YES);
   uint64_t notBefore = 0;
+  NSMutableSet<NSData *> *seenAcknowledgements = [NSMutableSet set];
   for (NSData *encoded in encodedAcknowledgements) {
-    NSDictionary *ack = Acknowledgement(encoded, expectedVaultId);
+    NSDictionary *ack = Acknowledgement(encoded, preparation.expectedVaultId);
     NSData *endpointId =
         Field(ack, @43, AncPrivateVaultCanonicalTypeBytes).bytesValue;
-    AncPrivateVaultRotationEvidenceRecipient *recipient = recipients[endpointId];
-    NSDictionary *offer = offers[endpointId];
+    AncPrivateVaultRotationEvidenceRecipient *recipient =
+        preparation.recipientsById[endpointId];
+    NSDictionary *offer = preparation.offersById[endpointId];
     uint64_t created = Unsigned(ack, @4, YES);
     uint64_t offerCreated = Unsigned(offer, @4, YES);
     uint64_t offerExpires = Unsigned(offer, @36, YES);
@@ -821,39 +987,44 @@ BOOL AncPrivateVaultVerifyCompletedRotationEvidence(
         !Same(Field(ack, @40, AncPrivateVaultCanonicalTypeBytes).bytesValue,
               ceremonyId) ||
         !Same(Field(ack, @41, AncPrivateVaultCanonicalTypeBytes).bytesValue,
-              checkpointHash) ||
+              preparation.checkpointHash) ||
         !Same(Field(ack, @42, AncPrivateVaultCanonicalTypeBytes).bytesValue,
               recipient.eekWrapHash) ||
         !Same(Field(ack, @47, AncPrivateVaultCanonicalTypeBytes).bytesValue,
-              offerHashes[endpointId]) ||
+              preparation.offerHashesById[endpointId]) ||
         Unsigned(ack, @44, YES) != targetEpoch ||
         created + kClockSkew < offerCreated ||
         created > offerExpires + kClockSkew || created > now + kClockSkew)
-      return Reject(status, AncPrivateVaultRotationEvidenceStatusBinding);
+      return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
     NSMutableDictionary *unsignedAck = [ack mutableCopy];
-    NSData *mac = Field(ack, @45,
-                        AncPrivateVaultCanonicalTypeBytes).bytesValue;
+    NSData *mac =
+        Field(ack, @45, AncPrivateVaultCanonicalTypeBytes).bytesValue;
     [unsignedAck removeObjectForKey:@45];
     [unsignedAck removeObjectForKey:@46];
-    NSData *expectedMac = PossessionMac(unsignedAck, pendingEpochKey);
-    if (!Same(mac, expectedMac))
-      return Reject(status, AncPrivateVaultRotationEvidenceStatusCrypto);
+    NSMutableData *expectedMac = PossessionMac(unsignedAck, pendingEpochKey);
+    BOOL macMatches = Same(mac, expectedMac);
+    anc_pv_zeroize(expectedMac.mutableBytes, expectedMac.length);
+    if (!macMatches)
+      return RejectObject(status, AncPrivateVaultRotationEvidenceStatusCrypto);
     if (!VerifyMapSignature(ack, @46, kAcknowledgementDomain,
                             sizeof kAcknowledgementDomain,
                             recipient.signingPublicKey))
-      return Reject(status, AncPrivateVaultRotationEvidenceStatusSignature);
+      return RejectObject(status,
+                          AncPrivateVaultRotationEvidenceStatusSignature);
     [seenAcknowledgements addObject:endpointId];
     notBefore = MAX(notBefore, created);
   }
-  if (seenAcknowledgements.count != expectedRecipients.count)
-    return Reject(status, AncPrivateVaultRotationEvidenceStatusBinding);
+  if (seenAcknowledgements.count != preparation.recipients.count)
+    return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
 
   NSMutableSet<NSData *> *seenDestructions = [NSMutableSet set];
   for (NSData *encoded in encodedDestructions) {
-    NSDictionary *destruction = Destruction(encoded, expectedVaultId);
-    NSData *endpointId = Field(
-        destruction, @53, AncPrivateVaultCanonicalTypeBytes).bytesValue;
-    AncPrivateVaultRotationEvidenceRecipient *recipient = recipients[endpointId];
+    NSDictionary *destruction =
+        Destruction(encoded, preparation.expectedVaultId);
+    NSData *endpointId =
+        Field(destruction, @53, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+    AncPrivateVaultRotationEvidenceRecipient *recipient =
+        preparation.recipientsById[endpointId];
     uint64_t created = Unsigned(destruction, @4, YES);
     if (destruction == nil || recipient == nil ||
         [seenDestructions containsObject:endpointId] ||
@@ -862,24 +1033,74 @@ BOOL AncPrivateVaultVerifyCompletedRotationEvidence(
               ceremonyId) ||
         !Same(Field(destruction, @51,
                     AncPrivateVaultCanonicalTypeBytes).bytesValue,
-              checkpointHash) ||
+              preparation.checkpointHash) ||
         !Same(Field(destruction, @52,
                     AncPrivateVaultCanonicalTypeBytes).bytesValue,
               controlEntryHash) ||
         Unsigned(destruction, @54, YES) != baseEpoch ||
         Unsigned(destruction, @55, YES) != targetEpoch ||
         created > now + kClockSkew)
-      return Reject(status, AncPrivateVaultRotationEvidenceStatusBinding);
+      return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
     if (!VerifyMapSignature(destruction, @57, kDestructionDomain,
                             sizeof kDestructionDomain,
                             recipient.signingPublicKey))
-      return Reject(status, AncPrivateVaultRotationEvidenceStatusSignature);
+      return RejectObject(status,
+                          AncPrivateVaultRotationEvidenceStatusSignature);
     [seenDestructions addObject:endpointId];
     notBefore = MAX(notBefore, created);
   }
-  if (seenDestructions.count != expectedRecipients.count)
-    return Reject(status, AncPrivateVaultRotationEvidenceStatusBinding);
+  if (seenDestructions.count != preparation.recipients.count)
+    return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
 
+  AncPrivateVaultRotationCustodyEvidence *result =
+      [[AncPrivateVaultRotationCustodyEvidence alloc] initPrivate];
+  result.preparation = preparation;
+  result.notBefore = notBefore;
+  SetStatus(status, AncPrivateVaultRotationEvidenceStatusOK);
+  return result;
+}
+
+BOOL AncPrivateVaultVerifyCompletedRotationEvidence(
+    NSData *encodedCheckpoint, NSArray<NSData *> *encodedAcknowledgements,
+    NSArray<NSData *> *encodedDestructions, NSData *encodedCompletion,
+    NSData *encodedHostedReceipt, NSString *expectedHostedEntryId,
+    NSString *expectedHostedVaultId, NSData *expectedRecoveryWrapHash,
+    uint64_t expectedRecoveryWrapByteLength, NSData *expectedVaultId,
+    NSData *expectedSignerEndpointId, NSData *signerSigningPublicKey,
+    NSArray<AncPrivateVaultRotationEvidenceRecipient *> *expectedRecipients,
+    NSArray<AncPrivateVaultRotationLiveRevision *> *liveRevisions,
+    const uint8_t pendingEpochKey[32], uint64_t now,
+    AncPrivateVaultRotationEvidenceStatus *status) {
+  SetStatus(status, AncPrivateVaultRotationEvidenceStatusInvalid);
+  if (!Exact(expectedVaultId, 16) || !Exact(expectedSignerEndpointId, 16) ||
+      !Exact(signerSigningPublicKey, 32) ||
+      !Exact(expectedRecoveryWrapHash, 32) ||
+      !Positive(expectedRecoveryWrapByteLength) ||
+      expectedRecoveryWrapByteLength > 1024 * 1024 || !Positive(now) ||
+      pendingEpochKey == NULL ||
+      !OpaqueId(expectedHostedEntryId) || !OpaqueId(expectedHostedVaultId))
+    return NO;
+  AncPrivateVaultRotationPreparationEvidence *preparation =
+      AncPrivateVaultVerifyRotationPreparationEvidence(
+          encodedCheckpoint, expectedVaultId, expectedSignerEndpointId,
+          signerSigningPublicKey, expectedRecipients, liveRevisions, now,
+          status);
+  if (preparation == nil)
+    return NO;
+  AncPrivateVaultRotationCustodyEvidence *custody =
+      AncPrivateVaultVerifyRotationCustodyEvidence(
+          preparation, encodedAcknowledgements, encodedDestructions,
+          pendingEpochKey, now, status);
+  if (custody == nil)
+    return NO;
+  NSDictionary *checkpoint = preparation.checkpoint;
+  uint64_t baseSequence = Unsigned(checkpoint, @11, NO);
+  NSData *ceremonyId = Field(checkpoint, @10,
+                             AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  NSData *checkpointRecipientSetHash = Field(
+      checkpoint, @25, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  NSData *controlEntryHash = Field(
+      checkpoint, @26, AncPrivateVaultCanonicalTypeBytes).bytesValue;
   NSDictionary *receipt = Receipt(encodedHostedReceipt);
   NSData *receiptHash =
       AncPrivateVaultRotationEvidenceHashHostedReceipt(encodedHostedReceipt);
@@ -905,7 +1126,7 @@ BOOL AncPrivateVaultVerifyCompletedRotationEvidence(
             ceremonyId) ||
       !Same(Field(completion, @61,
                   AncPrivateVaultCanonicalTypeBytes).bytesValue,
-            checkpointHash) ||
+            preparation.checkpointHash) ||
       !Same(Field(completion, @62,
                   AncPrivateVaultCanonicalTypeBytes).bytesValue,
             controlEntryHash) ||
@@ -928,7 +1149,7 @@ BOOL AncPrivateVaultVerifyCompletedRotationEvidence(
             expectedRecoveryWrapHash) ||
       Unsigned(receipt, @9, YES) != expectedRecoveryWrapByteLength ||
       Unsigned(completion, @65, YES) != baseSequence + 1 ||
-      completionCreated + kClockSkew < notBefore ||
+      completionCreated + kClockSkew < custody.notBefore ||
       completionCreated > now + kClockSkew)
     return Reject(status, AncPrivateVaultRotationEvidenceStatusBinding);
 

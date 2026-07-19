@@ -23,6 +23,29 @@ typedef NS_ENUM(NSInteger, AncPrivateVaultRotationEvidenceStatus) {
                                encodedOffer:(NSData *)encodedOffer;
 @end
 
+@interface AncPrivateVaultRotationLiveRevision : NSObject
+@property(nonatomic, readonly) NSData *objectId;
+@property(nonatomic, readonly) uint64_t revision;
+@property(nonatomic, readonly) NSData *priorRevisionId;
+@property(nonatomic, readonly) NSData *rotatedRevisionId;
+- (nullable instancetype)initWithObjectId:(NSData *)objectId
+                                 revision:(uint64_t)revision
+                          priorRevisionId:(NSData *)priorRevisionId
+                        rotatedRevisionId:(NSData *)rotatedRevisionId;
+@end
+
+/* Opaque component-verification results. Neither type establishes rotation
+ * completion. Custody evidence can only be produced from verified preparation
+ * evidence, preventing acknowledgement/destruction checks from being composed
+ * against an independently supplied checkpoint or roster. */
+@interface AncPrivateVaultRotationPreparationEvidence : NSObject
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
+@interface AncPrivateVaultRotationCustodyEvidence : NSObject
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
 FOUNDATION_EXPORT NSData *_Nullable AncPrivateVaultRotationEvidenceBuildCheckpoint(
     NSData *vaultId, uint64_t createdAt, NSData *envelopeId,
     NSData *ceremonyId, uint64_t baseSequence, NSData *baseHeadHash,
@@ -78,6 +101,30 @@ FOUNDATION_EXPORT NSData *_Nullable
 AncPrivateVaultRotationEvidenceHashHostedReceipt(NSData *encodedReceipt);
 FOUNDATION_EXPORT NSData *_Nullable AncPrivateVaultRotationEvidenceHashRecipientSet(
     NSArray<AncPrivateVaultRotationEvidenceRecipient *> *recipients);
+FOUNDATION_EXPORT NSData *_Nullable
+AncPrivateVaultRotationEvidenceHashLiveRevisionSet(
+    NSArray<AncPrivateVaultRotationLiveRevision *> *liveRevisions);
+
+/* Component verification only; success does not establish rotation
+ * completion or authorize control commit/publication. */
+FOUNDATION_EXPORT AncPrivateVaultRotationPreparationEvidence *_Nullable
+AncPrivateVaultVerifyRotationPreparationEvidence(
+    NSData *encodedCheckpoint, NSData *expectedVaultId,
+    NSData *expectedSignerEndpointId, NSData *signerSigningPublicKey,
+    NSArray<AncPrivateVaultRotationEvidenceRecipient *> *expectedRecipients,
+    NSArray<AncPrivateVaultRotationLiveRevision *> *liveRevisions,
+    uint64_t now, AncPrivateVaultRotationEvidenceStatus *_Nullable status);
+
+/* Component verification only; success proves exact acknowledgement and old
+ * epoch destruction coverage for an already verified preparation. It does not
+ * establish rotation completion or authorize publication. */
+FOUNDATION_EXPORT AncPrivateVaultRotationCustodyEvidence *_Nullable
+AncPrivateVaultVerifyRotationCustodyEvidence(
+    AncPrivateVaultRotationPreparationEvidence *preparation,
+    NSArray<NSData *> *encodedAcknowledgements,
+    NSArray<NSData *> *encodedDestructions,
+    const uint8_t *_Nonnull pendingEpochKey, uint64_t now,
+    AncPrivateVaultRotationEvidenceStatus *_Nullable status);
 
 /* Sole native success predicate for a completed attended rotation. Secret
  * inputs are borrowed for this call only; derived keys, private keys, MAC
@@ -91,6 +138,7 @@ FOUNDATION_EXPORT BOOL AncPrivateVaultVerifyCompletedRotationEvidence(
     uint64_t expectedRecoveryWrapByteLength, NSData *expectedVaultId,
     NSData *expectedSignerEndpointId, NSData *signerSigningPublicKey,
     NSArray<AncPrivateVaultRotationEvidenceRecipient *> *expectedRecipients,
+    NSArray<AncPrivateVaultRotationLiveRevision *> *liveRevisions,
     const uint8_t *_Nonnull pendingEpochKey, uint64_t now,
     AncPrivateVaultRotationEvidenceStatus *_Nullable status);
 

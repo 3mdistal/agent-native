@@ -86,6 +86,23 @@ static NSArray<AncPrivateVaultRotationEvidenceRecipient *> *Recipients(
   return @[ one, two ];
 }
 
+static NSArray<AncPrivateVaultRotationLiveRevision *> *LiveRevisions(void) {
+  AncPrivateVaultRotationLiveRevision *first =
+      [[AncPrivateVaultRotationLiveRevision alloc]
+          initWithObjectId:Fill(0x31, 16)
+                   revision:2
+            priorRevisionId:Fill(0x32, 32)
+          rotatedRevisionId:Fill(0x33, 32)];
+  AncPrivateVaultRotationLiveRevision *second =
+      [[AncPrivateVaultRotationLiveRevision alloc]
+          initWithObjectId:Fill(0x21, 16)
+                   revision:1
+            priorRevisionId:Fill(0x22, 32)
+          rotatedRevisionId:Fill(0x23, 32)];
+  assert(first != nil && second != nil);
+  return @[ first, second ];
+}
+
 static BOOL Verify(NSDictionary *fixture, NSData *checkpoint,
                    NSArray<NSData *> *acknowledgements,
                    NSArray<NSData *> *destructions, NSData *completion,
@@ -98,7 +115,7 @@ static BOOL Verify(NSDictionary *fixture, NSData *checkpoint,
       checkpoint, acknowledgements, destructions, completion, receipt,
       @"rotation-entry-0001", @"vault-rotation-test", Fill(0x63, 32), 128,
       Fill(1, 16), Fill(3, 16), F(fixture, @"issuerPublicKey"), recipients,
-      pendingEpochKey, UINT64_C(1784451801), status);
+      LiveRevisions(), pendingEpochKey, UINT64_C(1784451801), status);
 }
 
 static void CoreNativeVectorsAndAggregate(void) {
@@ -173,16 +190,117 @@ static void CoreNativeVectorsAndAggregate(void) {
   NSArray *recipients = Recipients(fixture, offerOne, offerTwo);
   assert([AncPrivateVaultRotationEvidenceHashRecipientSet(recipients)
       isEqualToData:F(fixture, @"recipientSetHash")]);
+  assert([AncPrivateVaultRotationEvidenceHashLiveRevisionSet(LiveRevisions())
+      isEqualToData:F(fixture, @"liveRevisionSetHash")]);
   assert(Verify(fixture, checkpoint, @[ ackOne, ackTwo ],
                 @[ destroyOne, destroyTwo ], completion, receipt, recipients,
                 epochKey, &status));
   assert(status == AncPrivateVaultRotationEvidenceStatusOK);
 
+  AncPrivateVaultRotationPreparationEvidence *preparation =
+      AncPrivateVaultVerifyRotationPreparationEvidence(
+          checkpoint, Fill(1, 16), Fill(3, 16),
+          F(fixture, @"issuerPublicKey"), recipients, LiveRevisions(),
+          UINT64_C(1784451801), &status);
+  assert(preparation != nil &&
+         status == AncPrivateVaultRotationEvidenceStatusOK);
+  AncPrivateVaultRotationCustodyEvidence *custody =
+      AncPrivateVaultVerifyRotationCustodyEvidence(
+          preparation, @[ ackOne, ackTwo ], @[ destroyOne, destroyTwo ],
+          epochKey, UINT64_C(1784451801), &status);
+  assert(custody != nil && status == AncPrivateVaultRotationEvidenceStatusOK);
+  assert(AncPrivateVaultVerifyRotationCustodyEvidence(
+             preparation, @[ ackOne ], @[ destroyOne, destroyTwo ], epochKey,
+             UINT64_C(1784451801), &status) == nil);
+  assert(AncPrivateVaultVerifyRotationCustodyEvidence(
+             preparation, @[ ackOne, ackOne ], @[ destroyOne, destroyTwo ],
+             epochKey, UINT64_C(1784451801), &status) == nil);
+  assert(AncPrivateVaultVerifyRotationCustodyEvidence(
+             preparation, @[ ackOne, ackTwo, ackTwo ],
+             @[ destroyOne, destroyTwo ], epochKey,
+             UINT64_C(1784451801), &status) == nil);
+  assert(AncPrivateVaultVerifyRotationCustodyEvidence(
+             preparation, @[ ackOne, ackTwo ], @[ destroyOne ], epochKey,
+             UINT64_C(1784451801), &status) == nil);
+  assert(AncPrivateVaultVerifyRotationCustodyEvidence(
+             preparation, @[ ackOne, ackTwo ], @[ destroyOne, destroyOne ],
+             epochKey, UINT64_C(1784451801), &status) == nil);
+  assert(AncPrivateVaultVerifyRotationCustodyEvidence(
+             preparation, @[ ackOne, ackTwo ],
+             @[ destroyOne, destroyTwo, destroyTwo ], epochKey,
+             UINT64_C(1784451801), &status) == nil);
+  assert(!AncPrivateVaultVerifyCompletedRotationEvidence(
+      checkpoint, @[ ackOne, ackTwo ], @[ destroyOne, destroyTwo ],
+      Fill(0xee, 32), receipt, @"rotation-entry-0001",
+      @"vault-rotation-test", Fill(0x63, 32), 128, Fill(1, 16),
+      Fill(3, 16), F(fixture, @"issuerPublicKey"), recipients,
+      LiveRevisions(), epochKey, UINT64_C(1784451801), &status));
+
+  NSArray<AncPrivateVaultRotationLiveRevision *> *live = LiveRevisions();
+  assert([AncPrivateVaultRotationEvidenceHashLiveRevisionSet(live)
+      isEqualToData:AncPrivateVaultRotationEvidenceHashLiveRevisionSet(
+                        @[ live[1], live[0] ])]);
+  assert(AncPrivateVaultVerifyRotationPreparationEvidence(
+             checkpoint, Fill(1, 16), Fill(3, 16),
+             F(fixture, @"issuerPublicKey"), recipients, @[ live[0] ],
+             UINT64_C(1784451801), &status) == nil);
+  assert(AncPrivateVaultVerifyRotationPreparationEvidence(
+             checkpoint, Fill(1, 16), Fill(3, 16),
+             F(fixture, @"issuerPublicKey"), recipients,
+             @[ live[0], live[1], live[1] ], UINT64_C(1784451801),
+             &status) == nil);
+  assert(AncPrivateVaultRotationEvidenceHashLiveRevisionSet(
+             @[ live[0], live[0] ]) == nil);
+  AncPrivateVaultRotationLiveRevision *substitutedLive =
+      [[AncPrivateVaultRotationLiveRevision alloc]
+          initWithObjectId:live[1].objectId
+                   revision:live[1].revision
+            priorRevisionId:Fill(0xee, 32)
+          rotatedRevisionId:live[1].rotatedRevisionId];
+  assert(AncPrivateVaultVerifyRotationPreparationEvidence(
+             checkpoint, Fill(1, 16), Fill(3, 16),
+             F(fixture, @"issuerPublicKey"), recipients,
+             @[ live[0], substitutedLive ], UINT64_C(1784451801),
+             &status) == nil);
+
+  NSData *wrongObjectCountCheckpoint =
+      AncPrivateVaultRotationEvidenceBuildCheckpoint(
+          Fill(1, 16), UINT64_C(1784451780), Fill(13, 16), Fill(2, 16), 8,
+          Fill(14, 32), 3, 4, Fill(15, 16), Fill(16, 32), 9, Fill(17, 32),
+          1, 2, F(fixture, @"liveRevisionSetHash"),
+          F(fixture, @"recipientSetHash"), Fill(18, 32), Fill(3, 16),
+          Fill(4, 16), issuerSeed, &status);
+  assert(AncPrivateVaultVerifyRotationPreparationEvidence(
+             wrongObjectCountCheckpoint, Fill(1, 16), Fill(3, 16),
+             F(fixture, @"issuerPublicKey"), recipients, live,
+             UINT64_C(1784451801), &status) == nil);
+  NSData *wrongRevisionCountCheckpoint =
+      AncPrivateVaultRotationEvidenceBuildCheckpoint(
+          Fill(1, 16), UINT64_C(1784451780), Fill(13, 16), Fill(2, 16), 8,
+          Fill(14, 32), 3, 4, Fill(15, 16), Fill(16, 32), 9, Fill(17, 32),
+          2, 1, F(fixture, @"liveRevisionSetHash"),
+          F(fixture, @"recipientSetHash"), Fill(18, 32), Fill(3, 16),
+          Fill(4, 16), issuerSeed, &status);
+  assert(AncPrivateVaultVerifyRotationPreparationEvidence(
+             wrongRevisionCountCheckpoint, Fill(1, 16), Fill(3, 16),
+             F(fixture, @"issuerPublicKey"), recipients, live,
+             UINT64_C(1784451801), &status) == nil);
+  NSData *wrongLiveHashCheckpoint =
+      AncPrivateVaultRotationEvidenceBuildCheckpoint(
+          Fill(1, 16), UINT64_C(1784451780), Fill(13, 16), Fill(2, 16), 8,
+          Fill(14, 32), 3, 4, Fill(15, 16), Fill(16, 32), 9, Fill(17, 32),
+          2, 2, Fill(0xee, 32), F(fixture, @"recipientSetHash"),
+          Fill(18, 32), Fill(3, 16), Fill(4, 16), issuerSeed, &status);
+  assert(AncPrivateVaultVerifyRotationPreparationEvidence(
+             wrongLiveHashCheckpoint, Fill(1, 16), Fill(3, 16),
+             F(fixture, @"issuerPublicKey"), recipients, live,
+             UINT64_C(1784451801), &status) == nil);
+
   assert(!AncPrivateVaultVerifyCompletedRotationEvidence(
       checkpoint, @[ ackOne, ackTwo ], @[ destroyOne, destroyTwo ], completion,
       receipt, @"rotation-entry-0001", @"vault-rotation-test",
       Fill(0x63, 32), 128, Fill(0xee, 16), Fill(3, 16),
-      F(fixture, @"issuerPublicKey"), recipients, epochKey,
+      F(fixture, @"issuerPublicKey"), recipients, LiveRevisions(), epochKey,
       UINT64_C(1784451801), &status));
 
   NSData *wrongCeremonyAck =
