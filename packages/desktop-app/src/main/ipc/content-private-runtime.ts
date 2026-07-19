@@ -58,6 +58,7 @@ type RuntimeSurface = Pick<
   | "activeVaultId"
   | "listAgentGrants"
   | "listVaultMembers"
+  | "removeVaultEndpoint"
   | "listDisclosureActivity"
   | "revokeAgentGrant"
   | "listLegacyMigrationCandidates"
@@ -224,6 +225,13 @@ export function createContentPrivateRuntimeIpcHandlers(input: {
         exactNoArguments(arguments_);
         return runtime(event).listVaultMembers();
       }),
+    removeEndpoint: (event: IpcMainInvokeEvent, ...arguments_: unknown[]) =>
+      result(async () => {
+        if (arguments_.length !== 1) throw new Error();
+        return runtime(event).removeVaultEndpoint(
+          opaqueIdSchema.parse(arguments_[0]),
+        );
+      }),
     listDisclosures: (event: IpcMainInvokeEvent, ...arguments_: unknown[]) =>
       result(async () => {
         exactNoArguments(arguments_);
@@ -336,6 +344,10 @@ export function registerContentPrivateRuntimeIpc(input: {
   ipcMain.handle(
     IPC.CONTENT_PRIVATE_RUNTIME_LIST_MEMBERS,
     handlers.listMembers,
+  );
+  ipcMain.handle(
+    IPC.CONTENT_PRIVATE_RUNTIME_REMOVE_ENDPOINT,
+    handlers.removeEndpoint,
   );
   ipcMain.handle(
     IPC.CONTENT_PRIVATE_RUNTIME_LIST_DISCLOSURES,

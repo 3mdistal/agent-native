@@ -67,6 +67,7 @@ static bool PVHasOnlyProtocolKeys(xpc_object_t message,
                 strcmp(key, "algorithmId") == 0 ||
                 strcmp(key, "grantRef") == 0 ||
                 strcmp(key, "recipientEndpointId") == 0 ||
+                strcmp(key, "targetEndpointId") == 0 ||
                 strcmp(key, "subjectAgentId") == 0 ||
                 strcmp(key, "senderEndpointId") == 0 ||
                 strcmp(key, "expiresAt") == 0 ||
@@ -204,6 +205,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
     bool listMembers = strcmp(operation, "list_members") == 0;
     bool brokerKey = strcmp(operation, "broker_key") == 0;
     bool revokeGrant = strcmp(operation, "revoke_grant") == 0;
+    bool removeEndpoint = strcmp(operation, "remove_endpoint") == 0;
     bool refreshAuthority = strcmp(operation, "refresh_head") == 0;
     bool sealJob = strcmp(operation, "seal_job") == 0;
     bool openResult = strcmp(operation, "open_result") == 0;
@@ -230,7 +232,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
         !authorizeAdmission && !acceptAdmission && !finalizeGenesis &&
         !acceptBootstrap && !recoverBegin && !recoverPage && !recoverStatus &&
         !openJob && !createGrant && !listGrants && !listMembers && !brokerKey &&
-        !revokeGrant && !refreshAuthority && !sealJob && !openResult && !sealResult &&
+        !revokeGrant && !removeEndpoint && !refreshAuthority && !sealJob && !openResult && !sealResult &&
         !completeResult && !pendingResult &&
         !signRequest && !prepareEnrollment && !challengeEnrollment &&
         !inspectEnrollment && !decideEnrollment && !authorizeEnrollment &&
@@ -336,6 +338,15 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
             !PVIsVaultID(xpc_dictionary_get_string(message, "vaultId"))) {
             return PVRequestInvalid;
         }
+    } else if (removeEndpoint) {
+        xpc_object_t targetValue = xpc_dictionary_get_value(message, "targetEndpointId");
+        const char *targetEndpointId = targetValue != NULL && xpc_get_type(targetValue) == XPC_TYPE_STRING
+            ? xpc_dictionary_get_string(message, "targetEndpointId") : NULL;
+        if (fieldCount != 5 || vaultIDValue == NULL ||
+            xpc_get_type(vaultIDValue) != XPC_TYPE_STRING ||
+            !PVIsVaultID(xpc_dictionary_get_string(message, "vaultId")) ||
+            !PVIsLowerHex(targetEndpointId, 32)) return PVRequestInvalid;
+        request->targetEndpointID = targetEndpointId;
     } else if (revokeGrant) {
         xpc_object_t grantValue =
             xpc_dictionary_get_value(message, "grantRef");
@@ -756,7 +767,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
                 challengeEnrollment || inspectEnrollment ||
                 authorizeEnrollment || activateEnrollment ||
                 enrollmentBootstrap || listGrants || listMembers || brokerKey ||
-                revokeGrant || refreshAuthority || sealObject ||
+                revokeGrant || removeEndpoint || refreshAuthority || sealObject ||
                 openObject || sealExport || openExport
             ? xpc_dictionary_get_string(message, "vaultId")
             : NULL;

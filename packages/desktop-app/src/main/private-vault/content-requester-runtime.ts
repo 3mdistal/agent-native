@@ -13,6 +13,7 @@ import {
   createPrivateVaultNativeServiceClient,
   type NativeListedContentGrantsResult,
   type NativeListedVaultMembersResult,
+  type NativePendingEndpointRemovalResult,
   type NativeCreatedContentGrantResult,
   type NativeRevokedContentGrantResult,
   type PrivateVaultNativeServiceClient,
@@ -254,6 +255,12 @@ export class PrivateVaultContentRequesterRuntime {
 
   listVaultMembers(vaultId: string): Promise<NativeListedVaultMembersResult> {
     return this.#native.listVaultMembers(vaultId);
+  }
+  removeVaultEndpoint(
+    vaultId: string,
+    targetEndpointId: string,
+  ): Promise<NativePendingEndpointRemovalResult> {
+    return this.#native.removeVaultEndpoint(vaultId, targetEndpointId);
   }
 
   async revokeContentGrant(

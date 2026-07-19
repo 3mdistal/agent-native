@@ -1888,6 +1888,41 @@ static void PVRefreshAuthority(xpc_connection_t peer, xpc_object_t message,
     }
 }
 
+static void PVRemoveEndpoint(xpc_connection_t peer, xpc_object_t message,
+                             const PVRequest *request) {
+    uint8_t vaultID[16] = {0}, targetEndpointID[16] = {0};
+    if (gRotationCoordinator == nil || gHostedAppendCandidates == nil ||
+        gHostedAppendRetry == nil || !PVDecodeVaultID(request->vaultID, vaultID) ||
+        !PVDecodeVaultID(request->targetEndpointID, targetEndpointID)) {
+        anc_pv_zeroize(vaultID, sizeof vaultID);
+        anc_pv_zeroize(targetEndpointID, sizeof targetEndpointID);
+        PVSendError(peer, message, "endpoint_removal_unavailable"); return;
+    }
+    NSData *vaultBytes = [NSData dataWithBytes:vaultID length:sizeof vaultID];
+    NSData *targetBytes = [NSData dataWithBytes:targetEndpointID length:sizeof targetEndpointID];
+    AncPrivateVaultPreparedEndpointRemoval *prepared = nil;
+    AncPrivateVaultRotationPreparationCheckpoint *checkpoint = nil;
+    AncPrivateVaultRotationCoordinatorStatus status =
+        [gRotationCoordinator startEndpointRemovalVaultId:vaultID
+                                         targetEndpointId:targetBytes
+                                                  prepared:&prepared
+                                                checkpoint:&checkpoint];
+    anc_pv_zeroize(vaultID, sizeof vaultID);
+    anc_pv_zeroize(targetEndpointID, sizeof targetEndpointID);
+    if (status != AncPrivateVaultRotationCoordinatorStatusOK || prepared == nil ||
+        checkpoint == nil || [gHostedAppendCandidates markPendingVaultId:vaultBytes] !=
+            AncPrivateVaultHostedAppendCandidateStatusOK) {
+        PVSendError(peer, message, "endpoint_removal_failed"); return;
+    }
+    [gHostedAppendRetry enqueueVaultId:vaultBytes];
+    xpc_object_t reply = PVCreateReply(message, request);
+    if (reply == NULL) return;
+    xpc_dictionary_set_string(reply, "state", "pending");
+    xpc_dictionary_set_string(reply, "vaultId", request->vaultID);
+    xpc_dictionary_set_string(reply, "targetEndpointId", request->targetEndpointID);
+    xpc_connection_send_message(peer, reply);
+}
+
 static void PVListContentGrants(xpc_connection_t peer, xpc_object_t message,
                                 const PVRequest *request) {
     @autoreleasepool {
@@ -3350,6 +3385,10 @@ static void PVHandleMessage(xpc_connection_t peer, xpc_object_t message) {
             }
             if (strcmp(request.operation, "refresh_head") == 0) {
                 PVRefreshAuthority(peer, message, &request);
+                return;
+            }
+            if (strcmp(request.operation, "remove_endpoint") == 0) {
+                PVRemoveEndpoint(peer, message, &request);
                 return;
             }
             if (strcmp(request.operation, "seal_export") == 0) {

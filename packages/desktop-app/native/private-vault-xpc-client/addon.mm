@@ -77,6 +77,7 @@ enum class PVOperation {
   ListMembers,
   BrokerKey,
   RevokeGrant,
+  RemoveEndpoint,
   RefreshAuthority,
   SealJob,
   OpenResult,
@@ -152,6 +153,7 @@ struct PVParsedReply {
   char jobHash[65] = {0};
   char grantRef[65] = {0};
   char recipientEndpointID[33] = {0};
+  char targetEndpointID[33] = {0};
   char subjectAgentID[33] = {0};
   char senderEndpointID[33] = {0};
   char jobID[33] = {0};
@@ -289,6 +291,7 @@ struct PVAsyncRequest {
   char jobID[33] = {0};
   char grantRef[65] = {0};
   char recipientEndpointID[33] = {0};
+  char targetEndpointID[33] = {0};
   char subjectAgentID[33] = {0};
   char senderEndpointID[33] = {0};
   char resultState[10] = {0};
@@ -930,6 +933,23 @@ PVParsedReply PVParseReply(xpc_object_t reply, PVOperation operation,
     memcpy(parsed.grantRef, grantRef, 65);
     parsed.failure = PVFailure::None;
     return parsed;
+  }
+
+  if (operation == PVOperation::RemoveEndpoint) {
+    const char *const keys[] = {"version", "ok", "requestId", "state", "vaultId", "targetEndpointId"};
+    const char *state = PVGetString(reply, "state");
+    const char *vaultID = PVGetString(reply, "vaultId");
+    const char *target = PVGetString(reply, "targetEndpointId");
+    if (!PVHasExactKeys(reply, keys, 6) || !PVRequestIDMatches(reply, requestID) ||
+        state == nullptr || strcmp(state, "pending") != 0 ||
+        !PVIsLowerHex(vaultID, 32) || expectedVaultID == nullptr ||
+        strcmp(vaultID, expectedVaultID) != 0 || !PVIsLowerHex(target, 32)) {
+      parsed.failure = PVFailure::MalformedReply; return parsed;
+    }
+    memcpy(parsed.state, state, strlen(state) + 1);
+    memcpy(parsed.vaultID, vaultID, 33);
+    memcpy(parsed.targetEndpointID, target, 33);
+    parsed.failure = PVFailure::None; return parsed;
   }
 
   if (operation == PVOperation::RefreshAuthority) {
@@ -2022,6 +2042,8 @@ void PVExecute(napi_env env, void *data) {
                               ? "create_grant"
                           : request->operation == PVOperation::RevokeGrant
                               ? "revoke_grant"
+                          : request->operation == PVOperation::RemoveEndpoint
+                              ? "remove_endpoint"
                           : request->operation == PVOperation::RefreshAuthority
                               ? "refresh_head"
                           : request->operation == PVOperation::ListGrants
@@ -2109,6 +2131,7 @@ void PVExecute(napi_env env, void *data) {
       request->operation == PVOperation::Unlock ||
       request->operation == PVOperation::CreateGrant ||
       request->operation == PVOperation::RevokeGrant ||
+      request->operation == PVOperation::RemoveEndpoint ||
       request->operation == PVOperation::RefreshAuthority ||
       request->operation == PVOperation::ListGrants ||
       request->operation == PVOperation::ListMembers ||
@@ -2161,6 +2184,8 @@ void PVExecute(napi_env env, void *data) {
   }
   if (request->operation == PVOperation::RevokeGrant)
     xpc_dictionary_set_string(message, "grantRef", request->grantRef);
+  if (request->operation == PVOperation::RemoveEndpoint)
+    xpc_dictionary_set_string(message, "targetEndpointId", request->targetEndpointID);
   if (request->operation == PVOperation::SealExport) {
     xpc_dictionary_set_string(message, "exportId", request->exportID);
     xpc_dictionary_set_uint64(message, "createdAt", request->exportCreatedAt);
@@ -2320,6 +2345,8 @@ void PVExecute(napi_env env, void *data) {
           ? 60LL * NSEC_PER_SEC
       : request->operation == PVOperation::RevokeGrant
           ? 22LL * NSEC_PER_SEC
+      : request->operation == PVOperation::RemoveEndpoint
+          ? 22LL * NSEC_PER_SEC
       : request->operation == PVOperation::RefreshAuthority
           ? 22LL * NSEC_PER_SEC
           : PV_REQUEST_TIMEOUT_NANOSECONDS;
@@ -2346,6 +2373,7 @@ void PVExecute(napi_env env, void *data) {
                 request->operation == PVOperation::OpenObject ||
                 request->operation == PVOperation::CreateGrant ||
                 request->operation == PVOperation::RevokeGrant ||
+                request->operation == PVOperation::RemoveEndpoint ||
                 request->operation == PVOperation::RefreshAuthority ||
                 request->operation == PVOperation::ListGrants ||
                 request->operation == PVOperation::ListMembers ||
@@ -2384,6 +2412,9 @@ void PVExecute(napi_env env, void *data) {
         request->operation == PVOperation::RevokeGrant &&
         strcmp(parsed.grantRef, request->grantRef) != 0)
       parsed.failure = PVFailure::MalformedReply;
+    if (parsed.failure == PVFailure::None && request->operation == PVOperation::RemoveEndpoint &&
+        strcmp(parsed.targetEndpointID, request->targetEndpointID) != 0)
+      parsed.failure = PVFailure::MalformedReply;
     if (parsed.failure == PVFailure::None &&
         request->operation == PVOperation::SealExport &&
         strcmp(parsed.exportID, request->exportID) != 0)
@@ -2405,6 +2436,7 @@ void PVExecute(napi_env env, void *data) {
     memcpy(request->state, parsed.state, sizeof(request->state));
     memcpy(request->rotationAckState, parsed.rotationAckState,
            sizeof(request->rotationAckState));
+    memcpy(request->targetEndpointID, parsed.targetEndpointID, sizeof(request->targetEndpointID));
     memcpy(request->vaultID, parsed.vaultID, sizeof(request->vaultID));
     memcpy(request->headHash, parsed.headHash, sizeof(request->headHash));
     memcpy(request->membershipHash, parsed.membershipHash,
@@ -2574,6 +2606,8 @@ void PVComplete(napi_env env, napi_status status, void *data) {
                     ? "create_grant"
                 : request->operation == PVOperation::RevokeGrant
                     ? "revoke_grant"
+                : request->operation == PVOperation::RemoveEndpoint
+                    ? "remove_endpoint"
                 : request->operation == PVOperation::RefreshAuthority
                     ? "refresh_head"
                 : request->operation == PVOperation::ListGrants
@@ -2683,6 +2717,9 @@ void PVComplete(napi_env env, napi_status status, void *data) {
     } else if (request->operation == PVOperation::RevokeGrant) {
       PVSetString(env, result, "vaultId", request->vaultID);
       PVSetString(env, result, "grantRef", request->grantRef);
+    } else if (request->operation == PVOperation::RemoveEndpoint) {
+      PVSetString(env, result, "vaultId", request->vaultID);
+      PVSetString(env, result, "targetEndpointId", request->targetEndpointID);
     } else if (request->operation == PVOperation::RefreshAuthority) {
       PVSetString(env, result, "vaultId", request->vaultID);
       PVSetSafeInteger(env, result, "sequence", request->sequence);
@@ -3159,6 +3196,8 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
     request->operation = PVOperation::CreateGrant;
   } else if (strcmp(operation, "revoke_grant") == 0) {
     request->operation = PVOperation::RevokeGrant;
+  } else if (strcmp(operation, "remove_endpoint") == 0) {
+    request->operation = PVOperation::RemoveEndpoint;
   } else if (strcmp(operation, "refresh_head") == 0) {
     request->operation = PVOperation::RefreshAuthority;
   } else if (strcmp(operation, "list_grants") == 0) {
@@ -3226,6 +3265,7 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
       : request->operation == PVOperation::EnrollmentBootstrap ? 3
       : request->operation == PVOperation::CreateGrant ? 5
       : request->operation == PVOperation::RevokeGrant ? 3
+      : request->operation == PVOperation::RemoveEndpoint ? 3
       : request->operation == PVOperation::RefreshAuthority ? 2
       : request->operation == PVOperation::ListGrants ? 2
       : request->operation == PVOperation::ListMembers ? 2
@@ -3261,6 +3301,7 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
       request->operation == PVOperation::EnrollmentBootstrap ||
       request->operation == PVOperation::CreateGrant ||
       request->operation == PVOperation::RevokeGrant ||
+      request->operation == PVOperation::RemoveEndpoint ||
       request->operation == PVOperation::RefreshAuthority ||
       request->operation == PVOperation::ListGrants ||
       request->operation == PVOperation::ListMembers ||
@@ -3366,6 +3407,16 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
       napi_throw_type_error(env, nullptr,
                             "Private Vault native service request failed");
       return nullptr;
+    }
+  }
+  if (request->operation == PVOperation::RemoveEndpoint) {
+    size_t targetLength = 0;
+    if (napi_typeof(env, argv[2], &argumentType) != napi_ok || argumentType != napi_string ||
+        napi_get_value_string_utf8(env, argv[2], request->targetEndpointID,
+                                   sizeof(request->targetEndpointID), &targetLength) != napi_ok ||
+        targetLength != 32 || !PVIsLowerHex(request->targetEndpointID, 32)) {
+      delete request; napi_throw_type_error(env, nullptr,
+        "Private Vault native service request failed"); return nullptr;
     }
   }
   if (request->operation == PVOperation::CreateGrant ||

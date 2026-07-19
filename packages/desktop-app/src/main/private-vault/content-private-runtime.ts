@@ -53,6 +53,10 @@ interface RequesterSurface {
   }): Promise<unknown>;
   listContentGrants(vaultId: string): Promise<unknown>;
   listVaultMembers(vaultId: string): Promise<unknown>;
+  removeVaultEndpoint(
+    vaultId: string,
+    targetEndpointId: string,
+  ): Promise<unknown>;
   revokeContentGrant(vaultId: string, grantRef: string): Promise<unknown>;
 }
 
@@ -251,6 +255,17 @@ export class PrivateVaultContentRuntime {
     if (!this.#active) throw new PrivateVaultContentRuntimeError();
     try {
       return await this.#requester.listVaultMembers(this.#active.vaultId);
+    } catch {
+      throw new PrivateVaultContentRuntimeError();
+    }
+  }
+  async removeVaultEndpoint(targetEndpointId: string) {
+    if (!this.#active) throw new PrivateVaultContentRuntimeError();
+    try {
+      return await this.#requester.removeVaultEndpoint(
+        this.#active.vaultId,
+        targetEndpointId,
+      );
     } catch {
       throw new PrivateVaultContentRuntimeError();
     }

@@ -162,6 +162,13 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.CONTENT_PRIVATE_RUNTIME_LIST_GRANTS),
     listMembers: (): Promise<DesktopPrivateContentResult<unknown>> =>
       ipcRenderer.invoke(IPC.CONTENT_PRIVATE_RUNTIME_LIST_MEMBERS),
+    removeEndpoint: (
+      targetEndpointId: string,
+    ): Promise<DesktopPrivateContentResult<unknown>> =>
+      ipcRenderer.invoke(
+        IPC.CONTENT_PRIVATE_RUNTIME_REMOVE_ENDPOINT,
+        targetEndpointId,
+      ),
     listDisclosures: (): Promise<DesktopPrivateContentResult<unknown>> =>
       ipcRenderer.invoke(IPC.CONTENT_PRIVATE_RUNTIME_LIST_DISCLOSURES),
     revokeGrant: (

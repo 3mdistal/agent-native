@@ -128,6 +128,21 @@ int main(void) {
          strcmp(parsed.vaultID, "00112233445566778899aabbccddeeff") == 0);
   xpc_release(refreshAuthority);
 
+  xpc_object_t removeEndpoint = PVMakeRequest(
+      PV_PROTOCOL_VERSION, "remove_endpoint", "request-remove-endpoint");
+  xpc_dictionary_set_string(removeEndpoint, "vaultId",
+                            "00112233445566778899aabbccddeeff");
+  xpc_dictionary_set_string(removeEndpoint, "targetEndpointId",
+                            "11112222333344445555666677778888");
+  assert(PVParseRequest(removeEndpoint, &parsed) == PVRequestValid &&
+         strcmp(parsed.operation, "remove_endpoint") == 0 &&
+         strcmp(parsed.targetEndpointID,
+                "11112222333344445555666677778888") == 0);
+  xpc_dictionary_set_string(removeEndpoint, "targetEndpointId",
+                            "1111222233334444555566667777888A");
+  assert(PVParseRequest(removeEndpoint, &parsed) == PVRequestInvalid);
+  xpc_release(removeEndpoint);
+
   xpc_object_t listGrants =
       PVMakeRequest(PV_PROTOCOL_VERSION, "list_grants", "request-list-grants");
   xpc_dictionary_set_string(listGrants, "vaultId",

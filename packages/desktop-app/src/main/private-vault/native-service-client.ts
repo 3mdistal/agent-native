@@ -61,6 +61,7 @@ type NativeOperation =
   | "recover_status"
   | "create_grant"
   | "revoke_grant"
+  | "remove_endpoint"
   | "refresh_head"
   | "list_grants"
   | "list_members"
@@ -107,6 +108,10 @@ export interface PrivateVaultNativeServiceClient
   revokeContentGrant(
     input: NativeRevokeContentGrantInput,
   ): Promise<NativeRevokedContentGrantResult>;
+  removeVaultEndpoint(
+    vaultId: string,
+    targetEndpointId: string,
+  ): Promise<NativePendingEndpointRemovalResult>;
   refreshAuthority(vaultId: string): Promise<NativeRefreshedAuthorityResult>;
   listContentGrants(vaultId: string): Promise<NativeListedContentGrantsResult>;
   listVaultMembers(vaultId: string): Promise<NativeListedVaultMembersResult>;
@@ -222,6 +227,14 @@ export interface NativeRevokedContentGrantResult {
   readonly state: "revoked";
   readonly vaultId: string;
   readonly grantRef: string;
+}
+export interface NativePendingEndpointRemovalResult {
+  readonly version: typeof SERVICE_VERSION;
+  readonly suite: typeof SERVICE_SUITE;
+  readonly operation: "remove_endpoint";
+  readonly state: "pending";
+  readonly vaultId: string;
+  readonly targetEndpointId: string;
 }
 
 export interface NativeRefreshedAuthorityResult {
@@ -1352,6 +1365,36 @@ function parseRefreshedAuthority(
     sequence: value.sequence as number,
   });
 }
+function parsePendingEndpointRemoval(
+  value: unknown,
+  vaultId: string,
+  targetEndpointId: string,
+): NativePendingEndpointRemovalResult {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "version",
+      "operation",
+      "state",
+      "vaultId",
+      "targetEndpointId",
+    ]) ||
+    value.version !== XPC_PROTOCOL_VERSION ||
+    value.operation !== "remove_endpoint" ||
+    value.state !== "pending" ||
+    value.vaultId !== vaultId ||
+    value.targetEndpointId !== targetEndpointId
+  )
+    throw new PrivateVaultNativeServiceClientError();
+  return Object.freeze({
+    version: SERVICE_VERSION,
+    suite: SERVICE_SUITE,
+    operation: "remove_endpoint" as const,
+    state: "pending" as const,
+    vaultId,
+    targetEndpointId,
+  });
+}
 
 function parseListedContentGrants(
   value: unknown,
@@ -2125,6 +2168,25 @@ class NativeServiceClient implements PrivateVaultNativeServiceClient {
         return parseRefreshedAuthority(
           await addon.request("refresh_head", vaultId),
           vaultId,
+        );
+      } catch {
+        throw new PrivateVaultNativeServiceClientError();
+      }
+    });
+  }
+  removeVaultEndpoint(
+    vaultId: string,
+    targetEndpointId: string,
+  ): Promise<NativePendingEndpointRemovalResult> {
+    if (!isLowerHex(vaultId, 32) || !isLowerHex(targetEndpointId, 32))
+      return Promise.reject(new PrivateVaultNativeServiceClientError());
+    return this.#enqueue(async () => {
+      try {
+        const addon = await this.#addon;
+        return parsePendingEndpointRemoval(
+          await addon.request("remove_endpoint", vaultId, targetEndpointId),
+          vaultId,
+          targetEndpointId,
         );
       } catch {
         throw new PrivateVaultNativeServiceClientError();

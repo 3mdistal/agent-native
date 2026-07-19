@@ -24,6 +24,10 @@ function fixture(allowed = true) {
     documents: vi.fn(() => documents),
     listAgentGrants: vi.fn(async () => ({ grants: [] })),
     listVaultMembers: vi.fn(async () => ({ members: [] })),
+    removeVaultEndpoint: vi.fn(async (targetEndpointId: string) => ({
+      state: "pending",
+      targetEndpointId,
+    })),
     listDisclosureActivity: vi.fn(async () => ({ disclosures: [] })),
     revokeAgentGrant: vi.fn(async (grantRef: string) => ({
       state: "revoked",
@@ -74,6 +78,7 @@ describe("signed Private Content IPC", () => {
     });
     await source.handlers.listGrants(event);
     await source.handlers.listMembers(event);
+    await source.handlers.removeEndpoint(event, "77".repeat(16));
     await source.handlers.listDisclosures(event);
     await source.handlers.revokeGrant(event, "44".repeat(32));
     await source.handlers.migrationCandidates(event);
@@ -120,6 +125,9 @@ describe("signed Private Content IPC", () => {
     );
     expect(source.runtime.listAgentGrants).toHaveBeenCalledOnce();
     expect(source.runtime.listVaultMembers).toHaveBeenCalledOnce();
+    expect(source.runtime.removeVaultEndpoint).toHaveBeenCalledWith(
+      "77".repeat(16),
+    );
     expect(source.runtime.listDisclosureActivity).toHaveBeenCalledOnce();
     expect(source.runtime.revokeAgentGrant).toHaveBeenCalledWith(
       "44".repeat(32),

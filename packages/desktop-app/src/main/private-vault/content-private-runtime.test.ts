@@ -29,6 +29,12 @@ function harness() {
     runAction: vi.fn(async () => ({ id: "result" })),
     listContentGrants: vi.fn(async () => ({ grants: [] })),
     listVaultMembers: vi.fn(async () => ({ members: [] })),
+    removeVaultEndpoint: vi.fn(
+      async (_vaultId: string, targetEndpointId: string) => ({
+        state: "pending",
+        targetEndpointId,
+      }),
+    ),
     revokeContentGrant: vi.fn(async (_vaultId: string, grantRef: string) => ({
       state: "revoked",
       grantRef,

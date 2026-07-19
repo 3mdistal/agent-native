@@ -420,6 +420,9 @@ export default function PrivateContentSurface({
     useState(false);
   const [cleaningMigration, setCleaningMigration] = useState(false);
   const [revokingGrantRef, setRevokingGrantRef] = useState<string | null>(null);
+  const [removingEndpointId, setRemovingEndpointId] = useState<string | null>(
+    null,
+  );
   const [restoringVersionId, setRestoringVersionId] = useState<string | null>(
     null,
   );
@@ -729,6 +732,20 @@ export default function PrivateContentSurface({
     setMessage("Agent access revoked. Future encrypted jobs will fail closed.");
     await loadGrants();
     setRevokingGrantRef(null);
+  };
+  const removeEndpoint = async (targetEndpointId: string) => {
+    setRemovingEndpointId(targetEndpointId);
+    const response =
+      await window.electronAPI.privateContent.removeEndpoint(targetEndpointId);
+    if (!response.ok) {
+      setRemovingEndpointId(null);
+      setMessage("That device could not be removed safely.");
+      return;
+    }
+    setMessage(
+      "Device removal is being committed with a fresh encrypted-key rotation.",
+    );
+    await loadMembers();
   };
 
   const enrollPersonalBroker = async () => {
@@ -1228,6 +1245,45 @@ export default function PrivateContentSurface({
                       {shortIdentity(member.endpointId)} ·{" "}
                       {member.unattended ? "unattended" : "attended"}
                     </span>
+                    {!member.current &&
+                    member.role === "endpoint" &&
+                    !member.unattended ? (
+                      <AlertDialog>
+                        <AlertDialogTrigger asChild>
+                          <button
+                            disabled={removingEndpointId === member.endpointId}
+                            type="button"
+                          >
+                            {removingEndpointId === member.endpointId
+                              ? "Removing…"
+                              : "Remove device"}
+                          </button>
+                        </AlertDialogTrigger>
+                        <AlertDialogContent>
+                          <AlertDialogHeader>
+                            <AlertDialogTitle>
+                              Remove this enrolled device?
+                            </AlertDialogTitle>
+                            <AlertDialogDescription>
+                              This Mac will sign the removal and rotate the
+                              vault key. Access stops only after the authority
+                              update commits; content already seen cannot be
+                              made unseen.
+                            </AlertDialogDescription>
+                          </AlertDialogHeader>
+                          <AlertDialogFooter>
+                            <AlertDialogCancel>Keep device</AlertDialogCancel>
+                            <AlertDialogAction
+                              onClick={() =>
+                                void removeEndpoint(member.endpointId)
+                              }
+                            >
+                              Remove and rotate
+                            </AlertDialogAction>
+                          </AlertDialogFooter>
+                        </AlertDialogContent>
+                      </AlertDialog>
+                    ) : null}
                   </div>
                 ))
               )}

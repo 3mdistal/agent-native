@@ -702,6 +702,11 @@ interface ElectronAPI {
     listMembers(): Promise<
       import("@shared/ipc-channels").DesktopPrivateContentResult<unknown>
     >;
+    removeEndpoint(
+      targetEndpointId: string,
+    ): Promise<
+      import("@shared/ipc-channels").DesktopPrivateContentResult<unknown>
+    >;
     listDisclosures(): Promise<
       import("@shared/ipc-channels").DesktopPrivateContentResult<unknown>
     >;

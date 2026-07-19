@@ -669,6 +669,35 @@ describe("Private Vault native service client", () => {
       new PrivateVaultNativeServiceClientError(),
     );
   });
+  it("starts endpoint removal without exposing signed rotation artifacts", async () => {
+    const vaultId = "00112233445566778899aabbccddeeff";
+    const targetEndpointId = "11112222333344445555666677778888";
+    const request = vi.fn(async () => ({
+      version: 3,
+      operation: "remove_endpoint",
+      state: "pending",
+      vaultId,
+      targetEndpointId,
+    }));
+    const client = createPrivateVaultNativeServiceClientForTest(async () => ({
+      request,
+    }));
+    await expect(
+      client.removeVaultEndpoint(vaultId, targetEndpointId),
+    ).resolves.toEqual({
+      version: 1,
+      suite: "anc/v1",
+      operation: "remove_endpoint",
+      state: "pending",
+      vaultId,
+      targetEndpointId,
+    });
+    expect(request).toHaveBeenCalledWith(
+      "remove_endpoint",
+      vaultId,
+      targetEndpointId,
+    );
+  });
 
   it("lists only content-free grant summaries through the native boundary", async () => {
     const vaultId = "00112233445566778899aabbccddeeff";
