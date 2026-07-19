@@ -4,8 +4,10 @@ const bridgeLegacyClaims = vi.hoisted(() => vi.fn());
 const deleteExpired = vi.hoisted(() => vi.fn());
 const deleteExpiredGenesisChallenges = vi.hoisted(() => vi.fn());
 const sweep = vi.hoisted(() => vi.fn());
+const sweepReplacementEvidence = vi.hoisted(() => vi.fn());
 const awaitContentDatabaseReady = vi.hoisted(() => vi.fn());
 const trackPluginInit = vi.hoisted(() => vi.fn());
+let startupSweep: (() => Promise<void>) | undefined;
 
 vi.mock("../lib/private-vault-endpoint-request-nonces.js", () => ({
   sqlPrivateVaultEndpointRequestNonceStore: {
@@ -16,6 +18,11 @@ vi.mock("../lib/private-vault-endpoint-request-nonces.js", () => ({
 vi.mock("../lib/private-vault-retention.js", () => ({
   privateVaultRetentionService: { sweep },
   PRIVATE_VAULT_RETENTION_SWEEP_INTERVAL_MS: 6 * 60 * 60 * 1_000,
+}));
+vi.mock("../lib/private-vault-broker-replacement-retention.js", () => ({
+  privateVaultReplacementRetentionService: {
+    sweep: sweepReplacementEvidence,
+  },
 }));
 vi.mock("../lib/private-vault-genesis-admission.js", () => ({
   deleteExpiredPrivateVaultGenesisChallenges: (...args: unknown[]) =>
@@ -33,9 +40,12 @@ describe("Content Private Vault retention startup", () => {
     deleteExpired.mockResolvedValue(0);
     deleteExpiredGenesisChallenges.mockResolvedValue(0);
     sweep.mockResolvedValue({});
-    vi.spyOn(globalThis, "setTimeout").mockReturnValue({
-      unref: vi.fn(),
-    } as unknown as ReturnType<typeof setTimeout>);
+    sweepReplacementEvidence.mockResolvedValue({});
+    startupSweep = undefined;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation((callback) => {
+      startupSweep = callback as () => Promise<void>;
+      return { unref: vi.fn() } as unknown as ReturnType<typeof setTimeout>;
+    });
     vi.spyOn(globalThis, "setInterval").mockReturnValue({
       unref: vi.fn(),
     } as unknown as ReturnType<typeof setInterval>);
@@ -68,5 +78,12 @@ describe("Content Private Vault retention startup", () => {
     expect(bridgeLegacyClaims).toHaveBeenCalledWith(expect.any(String));
     expect(setTimeout).toHaveBeenCalledTimes(1);
     expect(setInterval).toHaveBeenCalledTimes(1);
+    expect(setInterval).toHaveBeenCalledWith(
+      expect.any(Function),
+      6 * 60 * 60 * 1_000,
+    );
+    await startupSweep?.();
+    expect(sweep).toHaveBeenCalledTimes(1);
+    expect(sweepReplacementEvidence).toHaveBeenCalledTimes(1);
   });
 });
