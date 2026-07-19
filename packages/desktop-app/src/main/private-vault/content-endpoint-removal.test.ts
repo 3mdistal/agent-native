@@ -148,8 +148,9 @@ describe("Private Vault endpoint removal preparation", () => {
         ciphertextByteLength: 3,
       })),
     };
+    const pending = pendingRemovalResult();
     const native = {
-      removeVaultEndpoint: vi.fn(async () => pendingRemovalResult()),
+      removeVaultEndpoint: vi.fn(async () => pending),
     };
     const preparer = new PrivateVaultContentEndpointRemovalPreparer({
       native,
@@ -191,6 +192,26 @@ describe("Private Vault endpoint removal preparation", () => {
         },
       ],
     });
+    expect(result.liveRevisions).toEqual([
+      {
+        objectId: documentObjectId,
+        revision: 1,
+        priorRevisionId: oldRevisionOne,
+        rotatedRevisionId: newRevisionOne,
+      },
+      {
+        objectId: documentObjectId,
+        revision: 2,
+        priorRevisionId: oldRevisionTwo,
+        rotatedRevisionId: newRevisionTwo,
+      },
+    ]);
+    expect(result.ceremony).toMatchObject({
+      baseSequence: 4,
+      recipientEekWraps: pending.recipientEekWraps,
+    });
+    expect(result.ceremony.signedEntry).toEqual(pending.signedEntry);
+    expect(result.ceremony.signedEntry).not.toBe(pending.signedEntry);
     expect(transport.put).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({ parentRevisionIds: [newRevisionOne] }),

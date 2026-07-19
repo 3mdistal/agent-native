@@ -9,7 +9,10 @@ import type {
   PrivateVaultContentObjectTransport,
 } from "./content-object-transport.js";
 import type { EncryptedContentIndexStore } from "./encrypted-content-index-store.js";
-import type { PrivateVaultNativeServiceClient } from "./native-service-client.js";
+import type {
+  NativeEndpointRemovalEekWrap,
+  PrivateVaultNativeServiceClient,
+} from "./native-service-client.js";
 
 const MAXIMUM_ROTATION_REVISIONS = 10_000;
 
@@ -59,6 +62,22 @@ export interface PrivateVaultPreparedEndpointRemoval {
   }>;
   readonly liveObjectCount: number;
   readonly liveRevisionCount: number;
+  readonly liveRevisions: readonly Readonly<{
+    objectId: string;
+    revision: number;
+    priorRevisionId: string;
+    rotatedRevisionId: string;
+  }>[];
+  readonly ceremony: Readonly<{
+    ceremonyId: Uint8Array;
+    signedEntry: Uint8Array;
+    recoveryWrap: Uint8Array;
+    transcriptDigest: Uint8Array;
+    baseSequence: number;
+    baseHead: Uint8Array;
+    baseMembership: Uint8Array;
+    recipientEekWraps: readonly NativeEndpointRemovalEekWrap[];
+  }>;
 }
 
 /**
@@ -126,6 +145,12 @@ export class PrivateVaultContentEndpointRemovalPreparer {
         const targetEpoch = baseEpoch + 1;
         if (!Number.isSafeInteger(targetEpoch)) throw new Error();
         const revisionIdMap = new Map<string, string>();
+        const liveRevisions: Array<{
+          objectId: string;
+          revision: number;
+          priorRevisionId: string;
+          rotatedRevisionId: string;
+        }> = [];
         let revisionCount = 0;
         const documents = [] as PrivateVaultContentManifest["documents"];
 
@@ -182,6 +207,12 @@ export class PrivateVaultContentEndpointRemovalPreparer {
                 });
                 this.#assertStored(stored, rewrapped, parents);
                 revisionIdMap.set(revision.revisionId, rewrapped.revisionId);
+                liveRevisions.push({
+                  objectId: document.objectId,
+                  revision: revision.revision,
+                  priorRevisionId: revision.revisionId,
+                  rotatedRevisionId: rewrapped.revisionId,
+                });
                 revisions.push({
                   revision: revision.revision,
                   revisionId: rewrapped.revisionId,
@@ -267,6 +298,19 @@ export class PrivateVaultContentEndpointRemovalPreparer {
               }),
               liveObjectCount: documents.length,
               liveRevisionCount: revisionCount,
+              liveRevisions: Object.freeze(
+                liveRevisions.map((revision) => Object.freeze(revision)),
+              ),
+              ceremony: Object.freeze({
+                ceremonyId: started.ceremonyId.slice(),
+                signedEntry: started.signedEntry.slice(),
+                recoveryWrap: started.recoveryWrap.slice(),
+                transcriptDigest: started.transcriptDigest.slice(),
+                baseSequence: started.baseSequence,
+                baseHead: started.baseHead.slice(),
+                baseMembership: started.baseMembership.slice(),
+                recipientEekWraps: started.recipientEekWraps,
+              }),
             });
           } finally {
             sealed.ciphertext.fill(0);
