@@ -120,6 +120,7 @@ jobs:
           packages/desktop-app/native/private-vault-service/run-rotation-preparation-tests.sh
           packages/desktop-app/native/private-vault-service/run-continuity-coordinator-tests.sh
           packages/desktop-app/native/private-vault-service/run-isolated-root-enrollment-tests.sh
+          PRIVATE_VAULT_BUILD_ARCHITECTURES=universal packages/desktop-app/native/private-vault-service/run-h4-isolated-root-tests.sh
 
       - name: Build focused native hostile corpus
         env:
