@@ -89,6 +89,7 @@ type NativeOperation =
   | "seal_job_object"
   | "open_job_object"
   | "rewrap_revision"
+  | "seal_rot_mfst"
   | "seal_export"
   | "open_export";
 
@@ -203,6 +204,9 @@ export interface PrivateVaultNativeServiceClient
   rewrapContentObjectRevision(
     input: NativeRewrapContentObjectInput,
   ): Promise<NativeRewrappedContentObjectResult>;
+  sealRotationManifest(
+    input: NativeSealRotationManifestInput,
+  ): Promise<NativeSealedRotationManifestResult>;
   sealJobContentObjectRevision(
     input: NativeSealJobContentObjectInput,
   ): Promise<NativeSealedJobContentObjectResult>;
@@ -253,6 +257,7 @@ export interface NativePendingEndpointRemovalResult {
   readonly state: "pending";
   readonly vaultId: string;
   readonly targetEndpointId: string;
+  readonly createdAt: number;
 }
 
 export interface NativeRefreshedAuthorityResult {
@@ -409,6 +414,14 @@ export interface NativeRewrapContentObjectInput {
   readonly encodedRevision: Uint8Array;
 }
 
+export interface NativeSealRotationManifestInput {
+  readonly vaultId: string;
+  readonly targetEndpointId: string;
+  readonly objectId: string;
+  readonly revision: number;
+  readonly plaintext: Uint8Array;
+}
+
 export interface NativeContentObjectJobContext {
   readonly jobId: string;
   readonly jobHash: string;
@@ -452,6 +465,12 @@ export interface NativeOpenedContentObjectResult extends NativeContentObjectResu
 export interface NativeRewrappedContentObjectResult extends NativeContentObjectResultBase {
   readonly operation: "rewrap_revision";
   readonly state: "rewrapped";
+  readonly encodedRevision: Uint8Array;
+}
+
+export interface NativeSealedRotationManifestResult extends NativeContentObjectResultBase {
+  readonly operation: "seal_rot_mfst";
+  readonly state: "sealed";
   readonly encodedRevision: Uint8Array;
 }
 
@@ -1076,6 +1095,57 @@ function parseRewrappedContentObjectResult(
   });
 }
 
+function parseSealedRotationManifestResult(
+  value: unknown,
+  expected: NativeSealRotationManifestInput,
+): NativeSealedRotationManifestResult {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "version",
+      "operation",
+      "state",
+      "vaultId",
+      "objectId",
+      "contentType",
+      "revision",
+      "epoch",
+      "plaintextLength",
+      "revisionId",
+      "objectPayload",
+    ]) ||
+    value.version !== XPC_PROTOCOL_VERSION ||
+    value.operation !== "seal_rot_mfst" ||
+    value.state !== "sealed" ||
+    value.vaultId !== expected.vaultId ||
+    value.objectId !== expected.objectId ||
+    value.revision !== expected.revision ||
+    value.contentType !== CONTENT_MANIFEST_TYPE ||
+    value.plaintextLength !== expected.plaintext.byteLength ||
+    !isSafeInteger(value.epoch, true) ||
+    !(value.revisionId instanceof Uint8Array) ||
+    value.revisionId.byteLength !== 32
+  )
+    throw new PrivateVaultNativeServiceClientError();
+  return Object.freeze({
+    version: SERVICE_VERSION,
+    suite: SERVICE_SUITE,
+    operation: "seal_rot_mfst",
+    state: "sealed",
+    vaultId: expected.vaultId,
+    objectId: expected.objectId,
+    revision: expected.revision,
+    epoch: value.epoch,
+    revisionId: copyBoundedBytes(value.revisionId, 32),
+    contentType: CONTENT_MANIFEST_TYPE,
+    plaintextLength: value.plaintextLength,
+    encodedRevision: copyBoundedBytes(
+      value.objectPayload,
+      1024 * 1024 + 64 * 1024,
+    ),
+  });
+}
+
 function parseCommitGenesis(value: unknown): NativeCommitGenesisResult {
   if (
     !isRecord(value) ||
@@ -1528,12 +1598,14 @@ function parsePendingEndpointRemoval(
       "state",
       "vaultId",
       "targetEndpointId",
+      "createdAt",
     ]) ||
     value.version !== XPC_PROTOCOL_VERSION ||
     value.operation !== "remove_endpoint" ||
     value.state !== "pending" ||
     value.vaultId !== vaultId ||
-    value.targetEndpointId !== targetEndpointId
+    value.targetEndpointId !== targetEndpointId ||
+    !isSafeInteger(value.createdAt, true)
   )
     throw new PrivateVaultNativeServiceClientError();
   return Object.freeze({
@@ -1543,6 +1615,7 @@ function parsePendingEndpointRemoval(
     state: "pending" as const,
     vaultId,
     targetEndpointId,
+    createdAt: value.createdAt,
   });
 }
 
@@ -3035,6 +3108,44 @@ class NativeServiceClient implements PrivateVaultNativeServiceClient {
         throw new PrivateVaultNativeServiceClientError();
       } finally {
         encoded.fill(0);
+      }
+    });
+  }
+
+  sealRotationManifest(
+    input: NativeSealRotationManifestInput,
+  ): Promise<NativeSealedRotationManifestResult> {
+    if (
+      !isLowerHex(input.vaultId, 32) ||
+      !isLowerHex(input.targetEndpointId, 32) ||
+      !isLowerHex(input.objectId, 32) ||
+      !isSafeInteger(input.revision, true)
+    )
+      return Promise.reject(new PrivateVaultNativeServiceClientError());
+    let plaintext: Buffer;
+    try {
+      plaintext = Buffer.from(copyBoundedBytes(input.plaintext, 1024 * 1024));
+    } catch {
+      return Promise.reject(new PrivateVaultNativeServiceClientError());
+    }
+    return this.#enqueue(async () => {
+      try {
+        const addon = await this.#addon;
+        return parseSealedRotationManifestResult(
+          await addon.request(
+            "seal_rot_mfst",
+            input.vaultId,
+            input.targetEndpointId,
+            input.objectId,
+            input.revision,
+            plaintext,
+          ),
+          input,
+        );
+      } catch {
+        throw new PrivateVaultNativeServiceClientError();
+      } finally {
+        plaintext.fill(0);
       }
     });
   }

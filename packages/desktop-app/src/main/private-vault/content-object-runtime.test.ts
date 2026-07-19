@@ -56,6 +56,7 @@ describe("Private Vault Content object runtime", () => {
       })),
       openContentObjectRevision: vi.fn(),
       rewrapContentObjectRevision: vi.fn(),
+      sealRotationManifest: vi.fn(),
     };
     const hosted = transport();
     const runtime = new PrivateVaultContentObjectRuntime(native);
@@ -97,6 +98,7 @@ describe("Private Vault Content object runtime", () => {
       })),
       openContentObjectRevision: vi.fn(),
       rewrapContentObjectRevision: vi.fn(),
+      sealRotationManifest: vi.fn(),
     };
     const hosted = transport();
     let uploaded = new Uint8Array();
@@ -166,6 +168,7 @@ describe("Private Vault Content object runtime", () => {
       sealContentObjectRevision: vi.fn(),
       openContentObjectRevision: vi.fn(async () => opened),
       rewrapContentObjectRevision: vi.fn(),
+      sealRotationManifest: vi.fn(),
     };
     const hosted = transport();
     const runtime = new PrivateVaultContentObjectRuntime(native);
@@ -220,6 +223,7 @@ describe("Private Vault Content object runtime", () => {
         plaintextLength: 16,
         encodedRevision,
       })),
+      sealRotationManifest: vi.fn(),
     };
     const runtime = new PrivateVaultContentObjectRuntime(native);
     const source = Uint8Array.of(0xa4, 1, 2, 3);
@@ -284,6 +288,7 @@ describe("Private Vault Content object runtime", () => {
           ...mutation,
           encodedRevision,
         })),
+        sealRotationManifest: vi.fn(),
       });
       await expect(
         runtime.rewrapRevisionForPreparedRotation({
@@ -302,6 +307,7 @@ describe("Private Vault Content object runtime", () => {
       sealContentObjectRevision: vi.fn(),
       openContentObjectRevision: vi.fn(),
       rewrapContentObjectRevision: vi.fn(),
+      sealRotationManifest: vi.fn(),
     };
     const runtime = new PrivateVaultContentObjectRuntime(native);
     await expect(
@@ -315,5 +321,59 @@ describe("Private Vault Content object runtime", () => {
       }),
     ).rejects.toThrow("object rewrap binding failed");
     expect(native.rewrapContentObjectRevision).not.toHaveBeenCalled();
+  });
+
+  it("normalizes a prepared rotation manifest without retaining native bytes", async () => {
+    const encodedRevision = Uint8Array.of(0xa4, 7, 8, 9);
+    const plaintext = Uint8Array.from(Buffer.from('{"version":1}'));
+    const targetEndpointId = "ff".repeat(16);
+    const native = {
+      sealContentObjectRevision: vi.fn(),
+      openContentObjectRevision: vi.fn(),
+      rewrapContentObjectRevision: vi.fn(),
+      sealRotationManifest: vi.fn(async () => ({
+        version: 1 as const,
+        suite: "anc/v1" as const,
+        operation: "seal_rot_mfst" as const,
+        state: "sealed" as const,
+        vaultId,
+        objectId,
+        revision: 4,
+        epoch: 8,
+        revisionId: Buffer.from(revisionId, "hex"),
+        contentType:
+          "application/vnd.agent-native.content-vault-manifest+json" as const,
+        plaintextLength: plaintext.byteLength,
+        encodedRevision,
+      })),
+    };
+    const runtime = new PrivateVaultContentObjectRuntime(native);
+    const result = await runtime.sealManifestForPreparedRotation({
+      vaultId,
+      targetEndpointId,
+      objectId,
+      revision: 4,
+      plaintext,
+    });
+    expect(native.sealRotationManifest).toHaveBeenCalledWith({
+      vaultId,
+      targetEndpointId,
+      objectId,
+      revision: 4,
+      plaintext,
+    });
+    expect(result).toEqual({
+      revisionId,
+      revision: 4,
+      epoch: 8,
+      objectType: "vault-manifest",
+      plaintextLength: plaintext.byteLength,
+      ciphertext: Uint8Array.of(0xa4, 7, 8, 9),
+      ciphertextHash: createHash("sha256")
+        .update(Uint8Array.of(0xa4, 7, 8, 9))
+        .digest("hex"),
+      ciphertextByteLength: 4,
+    });
+    expect(encodedRevision).toEqual(new Uint8Array(4));
   });
 });

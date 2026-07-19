@@ -36,6 +36,8 @@
 #define PV_JOB_PAYLOAD_MAXIMUM_BYTES (16 * 1024 * 1024)
 #define PV_ENROLLMENT_CHALLENGE_MAXIMUM_BYTES (64 * 1024)
 #define PV_ENROLLMENT_AUTHORIZATION_MAXIMUM_BYTES (256 * 1024)
+#define PV_BROKER_DRAIN_ATTESTATION_MAXIMUM_BYTES 1024
+#define PV_ROTATION_ARTIFACT_MAXIMUM_BYTES (256 * 1024)
 #define PV_OBJECT_PLAINTEXT_MAXIMUM_BYTES (1024 * 1024)
 #define PV_OBJECT_REVISION_MAXIMUM_BYTES (1024 * 1024 + 64 * 1024)
 #define PV_EXPORT_PLAINTEXT_MAXIMUM_BYTES (256 * 1024 * 1024)
@@ -78,6 +80,7 @@ enum class PVOperation {
   BrokerKey,
   RevokeGrant,
   RemoveEndpoint,
+  ReplaceBroker,
   RefreshAuthority,
   SealJob,
   OpenResult,
@@ -97,6 +100,7 @@ enum class PVOperation {
   SealJobObject,
   OpenJobObject,
   RewrapRevision,
+  SealRotationManifest,
   SealExport,
   OpenExport,
 };
@@ -156,6 +160,8 @@ struct PVParsedReply {
   char grantRef[65] = {0};
   char recipientEndpointID[33] = {0};
   char targetEndpointID[33] = {0};
+  char oldBrokerEndpointID[33] = {0};
+  char candidateBrokerEndpointID[33] = {0};
   char subjectAgentID[33] = {0};
   char senderEndpointID[33] = {0};
   char jobID[33] = {0};
@@ -185,6 +191,12 @@ struct PVParsedReply {
   uint64_t objectRevision = 0;
   uint64_t plaintextLength = 0;
   uint64_t exportObjectCount = 0;
+  uint64_t preparationGeneration = 0;
+  uint64_t fenceGeneration = 0;
+  uint64_t baseSequence = 0;
+  uint64_t baseEpoch = 0;
+  uint64_t baseRecoveryGeneration = 0;
+  uint64_t pendingEpoch = 0;
   bool complete = false;
   std::vector<uint8_t> body;
   std::vector<uint8_t> grantID;
@@ -199,6 +211,13 @@ struct PVParsedReply {
   std::vector<uint8_t> manifestCheckpoint;
   std::vector<uint8_t> manifestAuthorization;
   std::vector<uint8_t> checkpointDigest;
+  std::vector<uint8_t> signedEntry;
+  std::vector<uint8_t> recoveryWrap;
+  std::vector<uint8_t> transcriptDigest;
+  std::vector<uint8_t> drainAttestationHash;
+  std::vector<uint8_t> ceremonyID;
+  std::vector<uint8_t> baseHead;
+  std::vector<uint8_t> baseMembership;
   std::vector<PVCandidate> candidates;
   std::vector<PVGrantSummary> grants;
   std::vector<PVMemberSummary> members;
@@ -297,6 +316,8 @@ struct PVAsyncRequest {
   char grantRef[65] = {0};
   char recipientEndpointID[33] = {0};
   char targetEndpointID[33] = {0};
+  char oldBrokerEndpointID[33] = {0};
+  char candidateBrokerEndpointID[33] = {0};
   char subjectAgentID[33] = {0};
   char senderEndpointID[33] = {0};
   char resultState[10] = {0};
@@ -331,6 +352,12 @@ struct PVAsyncRequest {
   uint64_t plaintextLength = 0;
   uint64_t exportCreatedAt = 0;
   uint64_t exportObjectCount = 0;
+  uint64_t preparationGeneration = 0;
+  uint64_t fenceGeneration = 0;
+  uint64_t baseSequence = 0;
+  uint64_t baseEpoch = 0;
+  uint64_t baseRecoveryGeneration = 0;
+  uint64_t pendingEpoch = 0;
   bool complete = false;
   std::vector<uint8_t> recoveryConfirmation;
   std::vector<uint8_t> bootstrapTranscript;
@@ -360,6 +387,17 @@ struct PVAsyncRequest {
   std::vector<uint8_t> revisionID;
   std::vector<uint8_t> sasTranscriptHash;
   std::vector<uint8_t> checkpointDigest;
+  std::vector<uint8_t> candidateSigningPublicKey;
+  std::vector<uint8_t> candidateKeyAgreementPublicKey;
+  std::vector<uint8_t> candidateEnrollmentRef;
+  std::vector<uint8_t> drainAttestation;
+  std::vector<uint8_t> signedEntry;
+  std::vector<uint8_t> recoveryWrap;
+  std::vector<uint8_t> transcriptDigest;
+  std::vector<uint8_t> drainAttestationHash;
+  std::vector<uint8_t> ceremonyID;
+  std::vector<uint8_t> baseHead;
+  std::vector<uint8_t> baseMembership;
   std::vector<PVCandidate> candidates;
   std::vector<PVGrantSummary> grants;
   std::vector<PVMemberSummary> members;
@@ -419,6 +457,28 @@ struct PVAsyncRequest {
       PVClearBytes(revisionID);
     if (!sasTranscriptHash.empty())
       PVClearBytes(sasTranscriptHash);
+    if (!candidateSigningPublicKey.empty())
+      PVClearBytes(candidateSigningPublicKey);
+    if (!candidateKeyAgreementPublicKey.empty())
+      PVClearBytes(candidateKeyAgreementPublicKey);
+    if (!candidateEnrollmentRef.empty())
+      PVClearBytes(candidateEnrollmentRef);
+    if (!drainAttestation.empty())
+      PVClearBytes(drainAttestation);
+    if (!signedEntry.empty())
+      PVClearBytes(signedEntry);
+    if (!recoveryWrap.empty())
+      PVClearBytes(recoveryWrap);
+    if (!transcriptDigest.empty())
+      PVClearBytes(transcriptDigest);
+    if (!drainAttestationHash.empty())
+      PVClearBytes(drainAttestationHash);
+    if (!ceremonyID.empty())
+      PVClearBytes(ceremonyID);
+    if (!baseHead.empty())
+      PVClearBytes(baseHead);
+    if (!baseMembership.empty())
+      PVClearBytes(baseMembership);
     for (auto &candidate : candidates)
       PVClearBytes(candidate.candidate);
   }
@@ -540,6 +600,14 @@ bool PVGenerateRequestID(char requestID[37]) {
 PVParsedReply PVParseReply(xpc_object_t reply, PVOperation operation,
                            const char *requestID,
                            const char *expectedVaultID);
+
+bool PVBrokerReplacementReplyMatchesRequest(const PVParsedReply &reply,
+                                            const char *oldBrokerEndpointID,
+                                            const char *candidateEndpointID) {
+  return oldBrokerEndpointID != nullptr && candidateEndpointID != nullptr &&
+         strcmp(reply.oldBrokerEndpointID, oldBrokerEndpointID) == 0 &&
+         strcmp(reply.candidateBrokerEndpointID, candidateEndpointID) == 0;
+}
 
 bool PVPrepareTrustedGenesis(PVAsyncRequest *request) {
   char requestID[37] = {0};
@@ -948,20 +1016,127 @@ PVParsedReply PVParseReply(xpc_object_t reply, PVOperation operation,
   }
 
   if (operation == PVOperation::RemoveEndpoint) {
-    const char *const keys[] = {"version", "ok", "requestId", "state", "vaultId", "targetEndpointId"};
+    const char *const keys[] = {"version", "ok", "requestId", "state", "vaultId", "targetEndpointId", "createdAt"};
     const char *state = PVGetString(reply, "state");
     const char *vaultID = PVGetString(reply, "vaultId");
     const char *target = PVGetString(reply, "targetEndpointId");
-    if (!PVHasExactKeys(reply, keys, 6) || !PVRequestIDMatches(reply, requestID) ||
+    xpc_object_t createdAtValue = xpc_dictionary_get_value(reply, "createdAt");
+    uint64_t createdAt = createdAtValue != nullptr &&
+                                 xpc_get_type(createdAtValue) == XPC_TYPE_UINT64
+                             ? xpc_dictionary_get_uint64(reply, "createdAt")
+                             : 0;
+    if (!PVHasExactKeys(reply, keys, 7) || !PVRequestIDMatches(reply, requestID) ||
         state == nullptr || strcmp(state, "pending") != 0 ||
         !PVIsLowerHex(vaultID, 32) || expectedVaultID == nullptr ||
-        strcmp(vaultID, expectedVaultID) != 0 || !PVIsLowerHex(target, 32)) {
+        strcmp(vaultID, expectedVaultID) != 0 || !PVIsLowerHex(target, 32) ||
+        createdAt == 0 || createdAt > UINT64_C(9007199254740991)) {
       parsed.failure = PVFailure::MalformedReply; return parsed;
     }
     memcpy(parsed.state, state, strlen(state) + 1);
     memcpy(parsed.vaultID, vaultID, 33);
     memcpy(parsed.targetEndpointID, target, 33);
+    parsed.issuedAt = createdAt;
     parsed.failure = PVFailure::None; return parsed;
+  }
+
+  if (operation == PVOperation::ReplaceBroker) {
+    const char *const keys[] = {
+        "version", "ok", "requestId", "state", "vaultId",
+        "oldBrokerEndpointId", "candidateBrokerEndpointId", "signedEntry",
+        "recoveryWrap", "transcriptDigest", "drainAttestationHash",
+        "preparationGeneration", "fenceGeneration", "checkpointDigest",
+        "ceremonyId", "baseSequence", "baseHead", "baseMembership",
+        "baseEpoch", "baseRecoveryGeneration", "pendingEpoch",
+    };
+    const char *state = PVGetString(reply, "state");
+    const char *vaultID = PVGetString(reply, "vaultId");
+    const char *oldBroker = PVGetString(reply, "oldBrokerEndpointId");
+    const char *candidateBroker =
+        PVGetString(reply, "candidateBrokerEndpointId");
+    xpc_object_t preparationGeneration =
+        xpc_dictionary_get_value(reply, "preparationGeneration");
+    xpc_object_t fenceGeneration =
+        xpc_dictionary_get_value(reply, "fenceGeneration");
+    xpc_object_t baseSequence =
+        xpc_dictionary_get_value(reply, "baseSequence");
+    xpc_object_t baseEpoch = xpc_dictionary_get_value(reply, "baseEpoch");
+    xpc_object_t baseRecoveryGeneration =
+        xpc_dictionary_get_value(reply, "baseRecoveryGeneration");
+    xpc_object_t pendingEpoch =
+        xpc_dictionary_get_value(reply, "pendingEpoch");
+    if (!PVHasExactKeys(reply, keys, 21) ||
+        !PVRequestIDMatches(reply, requestID) || state == nullptr ||
+        strcmp(state, "prepared") != 0 || !PVIsLowerHex(vaultID, 32) ||
+        expectedVaultID == nullptr || strcmp(vaultID, expectedVaultID) != 0 ||
+        !PVIsLowerHex(oldBroker, 32) ||
+        !PVIsLowerHex(candidateBroker, 32) ||
+        preparationGeneration == nullptr ||
+        xpc_get_type(preparationGeneration) != XPC_TYPE_UINT64 ||
+        fenceGeneration == nullptr ||
+        xpc_get_type(fenceGeneration) != XPC_TYPE_UINT64 ||
+        baseSequence == nullptr ||
+        xpc_get_type(baseSequence) != XPC_TYPE_UINT64 || baseEpoch == nullptr ||
+        xpc_get_type(baseEpoch) != XPC_TYPE_UINT64 ||
+        baseRecoveryGeneration == nullptr ||
+        xpc_get_type(baseRecoveryGeneration) != XPC_TYPE_UINT64 ||
+        pendingEpoch == nullptr ||
+        xpc_get_type(pendingEpoch) != XPC_TYPE_UINT64 ||
+        xpc_dictionary_get_uint64(reply, "preparationGeneration") == 0 ||
+        xpc_dictionary_get_uint64(reply, "preparationGeneration") >
+            UINT64_C(9007199254740991) ||
+        xpc_dictionary_get_uint64(reply, "fenceGeneration") == 0 ||
+        xpc_dictionary_get_uint64(reply, "fenceGeneration") >
+            UINT64_C(9007199254740991) ||
+        xpc_dictionary_get_uint64(reply, "baseSequence") >
+            UINT64_C(9007199254740991) ||
+        xpc_dictionary_get_uint64(reply, "baseEpoch") == 0 ||
+        xpc_dictionary_get_uint64(reply, "baseEpoch") >
+            UINT64_C(9007199254740991) ||
+        xpc_dictionary_get_uint64(reply, "baseRecoveryGeneration") == 0 ||
+        xpc_dictionary_get_uint64(reply, "baseRecoveryGeneration") >
+            UINT64_C(9007199254740991) ||
+        xpc_dictionary_get_uint64(reply, "pendingEpoch") !=
+            xpc_dictionary_get_uint64(reply, "baseEpoch") + 1 ||
+        !PVCopyBoundedData(reply, "signedEntry",
+                           PV_ROTATION_ARTIFACT_MAXIMUM_BYTES,
+                           parsed.signedEntry) ||
+        !PVCopyBoundedData(reply, "recoveryWrap",
+                           PV_ROTATION_ARTIFACT_MAXIMUM_BYTES,
+                           parsed.recoveryWrap) ||
+        !PVCopyBoundedData(reply, "transcriptDigest", 32,
+                           parsed.transcriptDigest) ||
+        parsed.transcriptDigest.size() != 32 ||
+        !PVCopyBoundedData(reply, "drainAttestationHash", 32,
+                           parsed.drainAttestationHash) ||
+        parsed.drainAttestationHash.size() != 32 ||
+        !PVCopyBoundedData(reply, "checkpointDigest", 32,
+                           parsed.checkpointDigest) ||
+        parsed.checkpointDigest.size() != 32 ||
+        !PVCopyBoundedData(reply, "ceremonyId", 16, parsed.ceremonyID) ||
+        parsed.ceremonyID.size() != 16 ||
+        !PVCopyBoundedData(reply, "baseHead", 32, parsed.baseHead) ||
+        parsed.baseHead.size() != 32 ||
+        !PVCopyBoundedData(reply, "baseMembership", 32,
+                           parsed.baseMembership) ||
+        parsed.baseMembership.size() != 32) {
+      parsed.failure = PVFailure::MalformedReply;
+      return parsed;
+    }
+    memcpy(parsed.state, state, strlen(state) + 1);
+    memcpy(parsed.vaultID, vaultID, 33);
+    memcpy(parsed.oldBrokerEndpointID, oldBroker, 33);
+    memcpy(parsed.candidateBrokerEndpointID, candidateBroker, 33);
+    parsed.preparationGeneration =
+        xpc_dictionary_get_uint64(reply, "preparationGeneration");
+    parsed.fenceGeneration =
+        xpc_dictionary_get_uint64(reply, "fenceGeneration");
+    parsed.baseSequence = xpc_dictionary_get_uint64(reply, "baseSequence");
+    parsed.baseEpoch = xpc_dictionary_get_uint64(reply, "baseEpoch");
+    parsed.baseRecoveryGeneration =
+        xpc_dictionary_get_uint64(reply, "baseRecoveryGeneration");
+    parsed.pendingEpoch = xpc_dictionary_get_uint64(reply, "pendingEpoch");
+    parsed.failure = PVFailure::None;
+    return parsed;
   }
 
   if (operation == PVOperation::RefreshAuthority) {
@@ -1280,10 +1455,12 @@ PVParsedReply PVParseReply(xpc_object_t reply, PVOperation operation,
       operation == PVOperation::OpenObject ||
       operation == PVOperation::SealJobObject ||
       operation == PVOperation::OpenJobObject ||
-      operation == PVOperation::RewrapRevision) {
+      operation == PVOperation::RewrapRevision ||
+      operation == PVOperation::SealRotationManifest) {
     const bool sealing = operation == PVOperation::SealObject ||
                          operation == PVOperation::SealJobObject ||
-                         operation == PVOperation::RewrapRevision;
+                         operation == PVOperation::RewrapRevision ||
+                         operation == PVOperation::SealRotationManifest;
     const char *expectedState = operation == PVOperation::RewrapRevision
                                     ? "rewrapped"
                                     : sealing ? "sealed" : "opened";
@@ -2090,6 +2267,8 @@ void PVExecute(napi_env env, void *data) {
                               ? "revoke_grant"
                           : request->operation == PVOperation::RemoveEndpoint
                               ? "remove_endpoint"
+                          : request->operation == PVOperation::ReplaceBroker
+                              ? "replace_broker"
                           : request->operation == PVOperation::RefreshAuthority
                               ? "refresh_head"
                           : request->operation == PVOperation::ListGrants
@@ -2132,6 +2311,8 @@ void PVExecute(napi_env env, void *data) {
                               ? "open_job_object"
                           : request->operation == PVOperation::RewrapRevision
                               ? "rewrap_revision"
+                          : request->operation == PVOperation::SealRotationManifest
+                              ? "seal_rot_mfst"
                           : request->operation == PVOperation::SealExport
                               ? "seal_export"
                           : request->operation == PVOperation::OpenExport
@@ -2182,6 +2363,7 @@ void PVExecute(napi_env env, void *data) {
       request->operation == PVOperation::CreateGrant ||
       request->operation == PVOperation::RevokeGrant ||
       request->operation == PVOperation::RemoveEndpoint ||
+      request->operation == PVOperation::ReplaceBroker ||
       request->operation == PVOperation::RefreshAuthority ||
       request->operation == PVOperation::ListGrants ||
       request->operation == PVOperation::ListMembers ||
@@ -2202,10 +2384,20 @@ void PVExecute(napi_env env, void *data) {
       request->operation == PVOperation::OpenObject ||
       request->operation == PVOperation::SealJobObject ||
       request->operation == PVOperation::OpenJobObject ||
-      request->operation == PVOperation::RewrapRevision)
+      request->operation == PVOperation::RewrapRevision ||
+      request->operation == PVOperation::SealRotationManifest)
     xpc_dictionary_set_string(message, "vaultId", request->vaultID);
   if (request->operation == PVOperation::RewrapRevision) {
     xpc_dictionary_set_string(message, "objectId", request->objectID);
+    xpc_dictionary_set_data(message, "objectPayload",
+                            request->objectPayload.data(),
+                            request->objectPayload.size());
+  } else if (request->operation == PVOperation::SealRotationManifest) {
+    xpc_dictionary_set_string(message, "targetEndpointId",
+                              request->targetEndpointID);
+    xpc_dictionary_set_string(message, "objectId", request->objectID);
+    xpc_dictionary_set_int64(
+        message, "revision", static_cast<int64_t>(request->objectRevision));
     xpc_dictionary_set_data(message, "objectPayload",
                             request->objectPayload.data(),
                             request->objectPayload.size());
@@ -2242,6 +2434,24 @@ void PVExecute(napi_env env, void *data) {
     xpc_dictionary_set_string(message, "grantRef", request->grantRef);
   if (request->operation == PVOperation::RemoveEndpoint)
     xpc_dictionary_set_string(message, "targetEndpointId", request->targetEndpointID);
+  if (request->operation == PVOperation::ReplaceBroker) {
+    xpc_dictionary_set_string(message, "oldBrokerEndpointId",
+                              request->oldBrokerEndpointID);
+    xpc_dictionary_set_string(message, "candidateBrokerEndpointId",
+                              request->candidateBrokerEndpointID);
+    xpc_dictionary_set_data(message, "candidateSigningPublicKey",
+                            request->candidateSigningPublicKey.data(),
+                            request->candidateSigningPublicKey.size());
+    xpc_dictionary_set_data(message, "candidateKeyAgreementPublicKey",
+                            request->candidateKeyAgreementPublicKey.data(),
+                            request->candidateKeyAgreementPublicKey.size());
+    xpc_dictionary_set_data(message, "candidateEnrollmentRef",
+                            request->candidateEnrollmentRef.data(),
+                            request->candidateEnrollmentRef.size());
+    xpc_dictionary_set_data(message, "drainAttestation",
+                            request->drainAttestation.data(),
+                            request->drainAttestation.size());
+  }
   if (request->operation == PVOperation::SealExport) {
     xpc_dictionary_set_string(message, "exportId", request->exportID);
     xpc_dictionary_set_uint64(message, "createdAt", request->exportCreatedAt);
@@ -2419,6 +2629,8 @@ void PVExecute(napi_env env, void *data) {
           ? 22LL * NSEC_PER_SEC
       : request->operation == PVOperation::RemoveEndpoint
           ? 22LL * NSEC_PER_SEC
+      : request->operation == PVOperation::ReplaceBroker
+          ? 22LL * NSEC_PER_SEC
       : request->operation == PVOperation::RefreshAuthority
           ? 22LL * NSEC_PER_SEC
           : PV_REQUEST_TIMEOUT_NANOSECONDS;
@@ -2445,9 +2657,11 @@ void PVExecute(napi_env env, void *data) {
                 request->operation == PVOperation::SealObject ||
                 request->operation == PVOperation::OpenObject ||
                 request->operation == PVOperation::RewrapRevision ||
+                request->operation == PVOperation::SealRotationManifest ||
                 request->operation == PVOperation::CreateGrant ||
                 request->operation == PVOperation::RevokeGrant ||
                 request->operation == PVOperation::RemoveEndpoint ||
+                request->operation == PVOperation::ReplaceBroker ||
                 request->operation == PVOperation::RefreshAuthority ||
                 request->operation == PVOperation::ListGrants ||
                 request->operation == PVOperation::ListMembers ||
@@ -2480,6 +2694,12 @@ void PVExecute(napi_env env, void *data) {
         strcmp(parsed.objectID, request->objectID) != 0)
       parsed.failure = PVFailure::MalformedReply;
     if (parsed.failure == PVFailure::None &&
+        request->operation == PVOperation::SealRotationManifest &&
+        (strcmp(parsed.objectID, request->objectID) != 0 ||
+         parsed.objectRevision != request->objectRevision ||
+         parsed.plaintextLength != request->objectPayload.size()))
+      parsed.failure = PVFailure::MalformedReply;
+    if (parsed.failure == PVFailure::None &&
         request->operation == PVOperation::CreateGrant &&
         (strcmp(parsed.recipientEndpointID,
                 request->recipientEndpointID) != 0 ||
@@ -2492,6 +2712,12 @@ void PVExecute(napi_env env, void *data) {
       parsed.failure = PVFailure::MalformedReply;
     if (parsed.failure == PVFailure::None && request->operation == PVOperation::RemoveEndpoint &&
         strcmp(parsed.targetEndpointID, request->targetEndpointID) != 0)
+      parsed.failure = PVFailure::MalformedReply;
+    if (parsed.failure == PVFailure::None &&
+        request->operation == PVOperation::ReplaceBroker &&
+        !PVBrokerReplacementReplyMatchesRequest(
+            parsed, request->oldBrokerEndpointID,
+            request->candidateBrokerEndpointID))
       parsed.failure = PVFailure::MalformedReply;
     if (parsed.failure == PVFailure::None &&
         request->operation == PVOperation::SealExport &&
@@ -2515,6 +2741,10 @@ void PVExecute(napi_env env, void *data) {
     memcpy(request->rotationAckState, parsed.rotationAckState,
            sizeof(request->rotationAckState));
     memcpy(request->targetEndpointID, parsed.targetEndpointID, sizeof(request->targetEndpointID));
+    memcpy(request->oldBrokerEndpointID, parsed.oldBrokerEndpointID,
+           sizeof(request->oldBrokerEndpointID));
+    memcpy(request->candidateBrokerEndpointID, parsed.candidateBrokerEndpointID,
+           sizeof(request->candidateBrokerEndpointID));
     memcpy(request->vaultID, parsed.vaultID, sizeof(request->vaultID));
     memcpy(request->headHash, parsed.headHash, sizeof(request->headHash));
     memcpy(request->membershipHash, parsed.membershipHash,
@@ -2574,6 +2804,12 @@ void PVExecute(napi_env env, void *data) {
     request->objectRevision = parsed.objectRevision;
     request->plaintextLength = parsed.plaintextLength;
     request->exportObjectCount = parsed.exportObjectCount;
+    request->preparationGeneration = parsed.preparationGeneration;
+    request->fenceGeneration = parsed.fenceGeneration;
+    request->baseSequence = parsed.baseSequence;
+    request->baseEpoch = parsed.baseEpoch;
+    request->baseRecoveryGeneration = parsed.baseRecoveryGeneration;
+    request->pendingEpoch = parsed.pendingEpoch;
     request->revisionID = std::move(parsed.revisionID);
     request->grantID = std::move(parsed.grantID);
     request->grantRefBytes = std::move(parsed.grantRefBytes);
@@ -2586,6 +2822,14 @@ void PVExecute(napi_env env, void *data) {
     request->manifestCheckpoint = std::move(parsed.manifestCheckpoint);
     request->manifestAuthorization = std::move(parsed.manifestAuthorization);
     request->checkpointDigest = std::move(parsed.checkpointDigest);
+    request->signedEntry = std::move(parsed.signedEntry);
+    request->recoveryWrap = std::move(parsed.recoveryWrap);
+    request->transcriptDigest = std::move(parsed.transcriptDigest);
+    request->drainAttestationHash =
+        std::move(parsed.drainAttestationHash);
+    request->ceremonyID = std::move(parsed.ceremonyID);
+    request->baseHead = std::move(parsed.baseHead);
+    request->baseMembership = std::move(parsed.baseMembership);
     request->writerEndpointID = std::move(parsed.writerEndpointID);
     request->candidates = std::move(parsed.candidates);
   }
@@ -2689,6 +2933,8 @@ void PVComplete(napi_env env, napi_status status, void *data) {
                     ? "revoke_grant"
                 : request->operation == PVOperation::RemoveEndpoint
                     ? "remove_endpoint"
+                : request->operation == PVOperation::ReplaceBroker
+                    ? "replace_broker"
                 : request->operation == PVOperation::RefreshAuthority
                     ? "refresh_head"
                 : request->operation == PVOperation::ListGrants
@@ -2733,6 +2979,8 @@ void PVComplete(napi_env env, napi_status status, void *data) {
                     ? "open_job_object"
                 : request->operation == PVOperation::RewrapRevision
                     ? "rewrap_revision"
+                : request->operation == PVOperation::SealRotationManifest
+                    ? "seal_rot_mfst"
                 : request->operation == PVOperation::SealExport
                     ? "seal_export"
                 : request->operation == PVOperation::OpenExport
@@ -2805,6 +3053,44 @@ void PVComplete(napi_env env, napi_status status, void *data) {
     } else if (request->operation == PVOperation::RemoveEndpoint) {
       PVSetString(env, result, "vaultId", request->vaultID);
       PVSetString(env, result, "targetEndpointId", request->targetEndpointID);
+      PVSetSafeInteger(env, result, "createdAt", request->issuedAt);
+    } else if (request->operation == PVOperation::ReplaceBroker) {
+      PVSetString(env, result, "vaultId", request->vaultID);
+      PVSetString(env, result, "oldBrokerEndpointId",
+                  request->oldBrokerEndpointID);
+      PVSetString(env, result, "candidateBrokerEndpointId",
+                  request->candidateBrokerEndpointID);
+      PVSetSafeInteger(env, result, "preparationGeneration",
+                       request->preparationGeneration);
+      PVSetSafeInteger(env, result, "fenceGeneration",
+                       request->fenceGeneration);
+      PVSetSafeInteger(env, result, "baseSequence", request->baseSequence);
+      PVSetSafeInteger(env, result, "baseEpoch", request->baseEpoch);
+      PVSetSafeInteger(env, result, "baseRecoveryGeneration",
+                       request->baseRecoveryGeneration);
+      PVSetSafeInteger(env, result, "pendingEpoch", request->pendingEpoch);
+      if (!PVSetBuffer(env, result, "signedEntry", request->signedEntry) ||
+          !PVSetBuffer(env, result, "recoveryWrap", request->recoveryWrap) ||
+          !PVSetBuffer(env, result, "transcriptDigest",
+                       request->transcriptDigest) ||
+          !PVSetBuffer(env, result, "drainAttestationHash",
+                       request->drainAttestationHash) ||
+          !PVSetBuffer(env, result, "checkpointDigest",
+                       request->checkpointDigest) ||
+          !PVSetBuffer(env, result, "ceremonyId", request->ceremonyID) ||
+          !PVSetBuffer(env, result, "baseHead", request->baseHead) ||
+          !PVSetBuffer(env, result, "baseMembership",
+                       request->baseMembership)) {
+        napi_value message;
+        napi_value error;
+        PVCreateString(env, "Private Vault native service request failed",
+                       &message);
+        napi_create_error(env, nullptr, message, &error);
+        napi_reject_deferred(env, request->deferred, error);
+        napi_delete_async_work(env, request->work);
+        delete request;
+        return;
+      }
     } else if (request->operation == PVOperation::RefreshAuthority) {
       PVSetString(env, result, "vaultId", request->vaultID);
       PVSetSafeInteger(env, result, "sequence", request->sequence);
@@ -3030,7 +3316,8 @@ void PVComplete(napi_env env, napi_status status, void *data) {
                request->operation == PVOperation::OpenObject ||
                request->operation == PVOperation::SealJobObject ||
                request->operation == PVOperation::OpenJobObject ||
-               request->operation == PVOperation::RewrapRevision) {
+               request->operation == PVOperation::RewrapRevision ||
+               request->operation == PVOperation::SealRotationManifest) {
       const bool opening = request->operation == PVOperation::OpenObject ||
                            request->operation == PVOperation::OpenJobObject;
       PVSetString(env, result, "vaultId", request->vaultID);
@@ -3229,8 +3516,8 @@ void PVComplete(napi_env env, napi_status status, void *data) {
 }
 
 napi_value PVRequest(napi_env env, napi_callback_info info) {
-  size_t argc = 7;
-  napi_value argv[7];
+  size_t argc = 8;
+  napi_value argv[8];
   napi_value promise;
   auto *request = new PVAsyncRequest();
   const uint8_t *genesisInputs[3] = {nullptr, nullptr, nullptr};
@@ -3239,7 +3526,7 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
   size_t ceremonyInputLengths[2] = {0, 0};
 
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok ||
-      argc < 1 || argc > 7) {
+      argc < 1 || argc > 8) {
     delete request;
     napi_throw_type_error(env, nullptr,
                           "Private Vault native service request failed");
@@ -3303,6 +3590,8 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
     request->operation = PVOperation::RevokeGrant;
   } else if (strcmp(operation, "remove_endpoint") == 0) {
     request->operation = PVOperation::RemoveEndpoint;
+  } else if (strcmp(operation, "replace_broker") == 0) {
+    request->operation = PVOperation::ReplaceBroker;
   } else if (strcmp(operation, "refresh_head") == 0) {
     request->operation = PVOperation::RefreshAuthority;
   } else if (strcmp(operation, "list_grants") == 0) {
@@ -3347,6 +3636,8 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
     request->operation = PVOperation::OpenJobObject;
   } else if (strcmp(operation, "rewrap_revision") == 0) {
     request->operation = PVOperation::RewrapRevision;
+  } else if (strcmp(operation, "seal_rot_mfst") == 0) {
+    request->operation = PVOperation::SealRotationManifest;
   } else if (strcmp(operation, "seal_export") == 0) {
     request->operation = PVOperation::SealExport;
   } else if (strcmp(operation, "open_export") == 0) {
@@ -3375,6 +3666,7 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
       : request->operation == PVOperation::CreateGrant ? 5
       : request->operation == PVOperation::RevokeGrant ? 3
       : request->operation == PVOperation::RemoveEndpoint ? 3
+      : request->operation == PVOperation::ReplaceBroker ? 8
       : request->operation == PVOperation::RefreshAuthority ? 2
       : request->operation == PVOperation::ListGrants ? 2
       : request->operation == PVOperation::ListMembers ? 2
@@ -3397,6 +3689,7 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
       : request->operation == PVOperation::SealJobObject ? 8
       : request->operation == PVOperation::OpenJobObject ? 7
       : request->operation == PVOperation::RewrapRevision ? 4
+      : request->operation == PVOperation::SealRotationManifest ? 6
       : request->operation == PVOperation::SealExport ? 7
       : request->operation == PVOperation::OpenExport ? 3
           : 1;
@@ -3413,6 +3706,7 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
       request->operation == PVOperation::CreateGrant ||
       request->operation == PVOperation::RevokeGrant ||
       request->operation == PVOperation::RemoveEndpoint ||
+      request->operation == PVOperation::ReplaceBroker ||
       request->operation == PVOperation::RefreshAuthority ||
       request->operation == PVOperation::ListGrants ||
       request->operation == PVOperation::ListMembers ||
@@ -3434,6 +3728,7 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
       request->operation == PVOperation::SealJobObject ||
       request->operation == PVOperation::OpenJobObject ||
       request->operation == PVOperation::RewrapRevision ||
+      request->operation == PVOperation::SealRotationManifest ||
       request->operation == PVOperation::SealExport ||
       request->operation == PVOperation::OpenExport) {
     size_t vaultLength = 0;
@@ -3530,6 +3825,88 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
         targetLength != 32 || !PVIsLowerHex(request->targetEndpointID, 32)) {
       delete request; napi_throw_type_error(env, nullptr,
         "Private Vault native service request failed"); return nullptr;
+    }
+  }
+  if (request->operation == PVOperation::ReplaceBroker) {
+    size_t oldBrokerLength = 0;
+    size_t candidateBrokerLength = 0;
+    void *candidateSigningBytes = nullptr;
+    void *candidateAgreementBytes = nullptr;
+    void *candidateEnrollmentBytes = nullptr;
+    void *drainAttestationBytes = nullptr;
+    size_t candidateSigningLength = 0;
+    size_t candidateAgreementLength = 0;
+    size_t candidateEnrollmentLength = 0;
+    size_t drainAttestationLength = 0;
+    bool isBuffer = false;
+    bool valid =
+        napi_typeof(env, argv[2], &argumentType) == napi_ok &&
+        argumentType == napi_string &&
+        napi_get_value_string_utf8(
+            env, argv[2], request->oldBrokerEndpointID,
+            sizeof(request->oldBrokerEndpointID), &oldBrokerLength) == napi_ok &&
+        oldBrokerLength == 32 &&
+        PVIsLowerHex(request->oldBrokerEndpointID, 32) &&
+        napi_typeof(env, argv[3], &argumentType) == napi_ok &&
+        argumentType == napi_string &&
+        napi_get_value_string_utf8(
+            env, argv[3], request->candidateBrokerEndpointID,
+            sizeof(request->candidateBrokerEndpointID),
+            &candidateBrokerLength) == napi_ok &&
+        candidateBrokerLength == 32 &&
+        PVIsLowerHex(request->candidateBrokerEndpointID, 32) &&
+        napi_is_buffer(env, argv[4], &isBuffer) == napi_ok && isBuffer &&
+        napi_get_buffer_info(env, argv[4], &candidateSigningBytes,
+                             &candidateSigningLength) == napi_ok &&
+        candidateSigningBytes != nullptr && candidateSigningLength == 32;
+    isBuffer = false;
+    valid = valid && napi_is_buffer(env, argv[5], &isBuffer) == napi_ok &&
+            isBuffer &&
+            napi_get_buffer_info(env, argv[5], &candidateAgreementBytes,
+                                 &candidateAgreementLength) == napi_ok &&
+            candidateAgreementBytes != nullptr &&
+            candidateAgreementLength == 32;
+    isBuffer = false;
+    valid = valid && napi_is_buffer(env, argv[6], &isBuffer) == napi_ok &&
+            isBuffer &&
+            napi_get_buffer_info(env, argv[6], &candidateEnrollmentBytes,
+                                 &candidateEnrollmentLength) == napi_ok &&
+            candidateEnrollmentBytes != nullptr &&
+            candidateEnrollmentLength == 16;
+    isBuffer = false;
+    valid = valid && napi_is_buffer(env, argv[7], &isBuffer) == napi_ok &&
+            isBuffer &&
+            napi_get_buffer_info(env, argv[7], &drainAttestationBytes,
+                                 &drainAttestationLength) == napi_ok &&
+            drainAttestationBytes != nullptr && drainAttestationLength > 0 &&
+            drainAttestationLength <=
+                PV_BROKER_DRAIN_ATTESTATION_MAXIMUM_BYTES;
+    if (!valid) {
+      delete request;
+      napi_throw_type_error(env, nullptr,
+                            "Private Vault native service request failed");
+      return nullptr;
+    }
+    try {
+      const auto *signing =
+          static_cast<const uint8_t *>(candidateSigningBytes);
+      const auto *agreement =
+          static_cast<const uint8_t *>(candidateAgreementBytes);
+      const auto *enrollment =
+          static_cast<const uint8_t *>(candidateEnrollmentBytes);
+      const auto *attestation =
+          static_cast<const uint8_t *>(drainAttestationBytes);
+      request->candidateSigningPublicKey.assign(signing, signing + 32);
+      request->candidateKeyAgreementPublicKey.assign(agreement,
+                                                       agreement + 32);
+      request->candidateEnrollmentRef.assign(enrollment, enrollment + 16);
+      request->drainAttestation.assign(
+          attestation, attestation + drainAttestationLength);
+    } catch (...) {
+      delete request;
+      napi_throw_error(env, nullptr,
+                       "Private Vault native service request failed");
+      return nullptr;
     }
   }
   if (request->operation == PVOperation::CreateGrant ||
@@ -3629,7 +4006,40 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
   }
   const uint8_t *objectPayload = nullptr;
   size_t objectPayloadLength = 0;
-  if (request->operation == PVOperation::RewrapRevision) {
+  if (request->operation == PVOperation::SealRotationManifest) {
+    size_t targetLength = 0, objectLength = 0;
+    double revision = 0;
+    void *bytes = nullptr;
+    bool isBuffer = false;
+    if (napi_typeof(env, argv[2], &argumentType) != napi_ok ||
+        argumentType != napi_string ||
+        napi_get_value_string_utf8(env, argv[2], request->targetEndpointID,
+                                   sizeof(request->targetEndpointID),
+                                   &targetLength) != napi_ok ||
+        targetLength != 32 ||
+        !PVIsLowerHex(request->targetEndpointID, 32) ||
+        napi_typeof(env, argv[3], &argumentType) != napi_ok ||
+        argumentType != napi_string ||
+        napi_get_value_string_utf8(env, argv[3], request->objectID,
+                                   sizeof(request->objectID),
+                                   &objectLength) != napi_ok ||
+        objectLength != 32 || !PVIsLowerHex(request->objectID, 32) ||
+        napi_get_value_double(env, argv[4], &revision) != napi_ok ||
+        !std::isfinite(revision) || std::floor(revision) != revision ||
+        revision < 1 || revision > 9007199254740991.0 ||
+        napi_is_buffer(env, argv[5], &isBuffer) != napi_ok || !isBuffer ||
+        napi_get_buffer_info(env, argv[5], &bytes,
+                             &objectPayloadLength) != napi_ok ||
+        bytes == nullptr || objectPayloadLength == 0 ||
+        objectPayloadLength > PV_OBJECT_PLAINTEXT_MAXIMUM_BYTES) {
+      delete request;
+      napi_throw_type_error(env, nullptr,
+                            "Private Vault native service request failed");
+      return nullptr;
+    }
+    request->objectRevision = static_cast<uint64_t>(revision);
+    objectPayload = static_cast<const uint8_t *>(bytes);
+  } else if (request->operation == PVOperation::RewrapRevision) {
     size_t objectLength = 0;
     void *bytes = nullptr;
     bool isBuffer = false;
@@ -4134,6 +4544,7 @@ napi_value PVRequest(napi_env env, napi_callback_info info) {
   if (request->operation == PVOperation::AuthorizeEnrollment ||
       request->operation == PVOperation::VerifyManifest ||
       request->operation == PVOperation::RewrapRevision ||
+      request->operation == PVOperation::SealRotationManifest ||
       request->operation == PVOperation::SealObject ||
       request->operation == PVOperation::OpenObject ||
       request->operation == PVOperation::SealJobObject ||

@@ -36,6 +36,7 @@ export class PrivateVaultContentObjectRuntime {
     | "sealContentObjectRevision"
     | "openContentObjectRevision"
     | "rewrapContentObjectRevision"
+    | "sealRotationManifest"
   >;
 
   constructor(
@@ -44,6 +45,7 @@ export class PrivateVaultContentObjectRuntime {
       | "sealContentObjectRevision"
       | "openContentObjectRevision"
       | "rewrapContentObjectRevision"
+      | "sealRotationManifest"
     >,
   ) {
     this.#native = native;
@@ -199,6 +201,46 @@ export class PrivateVaultContentObjectRuntime {
       });
     } finally {
       rewrapped.encodedRevision.fill(0);
+    }
+  }
+
+  async sealManifestForPreparedRotation(input: {
+    readonly vaultId: string;
+    readonly targetEndpointId: string;
+    readonly objectId: string;
+    readonly revision: number;
+    readonly plaintext: Uint8Array;
+  }): Promise<{
+    readonly revisionId: string;
+    readonly revision: number;
+    readonly epoch: number;
+    readonly objectType: "vault-manifest";
+    readonly plaintextLength: number;
+    readonly ciphertext: Uint8Array;
+    readonly ciphertextHash: string;
+    readonly ciphertextByteLength: number;
+  }> {
+    const sealed = await this.#native.sealRotationManifest(input);
+    try {
+      if (
+        sealed.contentType !== PRIVATE_VAULT_MANIFEST_CONTENT_TYPE ||
+        sealed.revision !== input.revision ||
+        sealed.plaintextLength !== input.plaintext.byteLength
+      )
+        throw new Error("rotation manifest binding failed");
+      const ciphertext = sealed.encodedRevision.slice();
+      return Object.freeze({
+        revisionId: hex(sealed.revisionId),
+        revision: sealed.revision,
+        epoch: sealed.epoch,
+        objectType: "vault-manifest" as const,
+        plaintextLength: sealed.plaintextLength,
+        ciphertext,
+        ciphertextHash: createHash("sha256").update(ciphertext).digest("hex"),
+        ciphertextByteLength: ciphertext.byteLength,
+      });
+    } finally {
+      sealed.encodedRevision.fill(0);
     }
   }
 }

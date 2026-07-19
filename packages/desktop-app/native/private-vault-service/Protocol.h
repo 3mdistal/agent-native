@@ -26,6 +26,7 @@
 #define PV_ENROLLMENT_AUTHORIZATION_MAXIMUM_BYTES (256 * 1024)
 #define PV_MANIFEST_CHECKPOINT_MAXIMUM_BYTES 1024
 #define PV_MANIFEST_AUTHORIZATION_MAXIMUM_BYTES 1024
+#define PV_BROKER_DRAIN_ATTESTATION_MAXIMUM_BYTES 1024
 #define PV_OBJECT_PLAINTEXT_MAXIMUM_BYTES (1024 * 1024)
 #define PV_OBJECT_REVISION_MAXIMUM_BYTES (1024 * 1024 + 64 * 1024)
 #define PV_EXPORT_PLAINTEXT_MAXIMUM_BYTES (256 * 1024 * 1024)
@@ -47,6 +48,8 @@ typedef struct {
     const char *grantRef;
     const char *recipientEndpointID;
     const char *targetEndpointID;
+    const char *oldBrokerEndpointID;
+    const char *candidateBrokerEndpointID;
     const char *subjectAgentID;
     const char *senderEndpointID;
     const char *algorithmID;
@@ -99,6 +102,14 @@ typedef struct {
     size_t manifestCheckpointLength;
     const void *manifestAuthorization;
     size_t manifestAuthorizationLength;
+    const void *candidateSigningPublicKey;
+    size_t candidateSigningPublicKeyLength;
+    const void *candidateKeyAgreementPublicKey;
+    size_t candidateKeyAgreementPublicKeyLength;
+    const void *candidateEnrollmentRef;
+    size_t candidateEnrollmentRefLength;
+    const void *drainAttestation;
+    size_t drainAttestationLength;
     const void *objectPayload;
     size_t objectPayloadLength;
     const void *exportPlaintext;

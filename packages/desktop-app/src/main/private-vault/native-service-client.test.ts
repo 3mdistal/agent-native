@@ -49,6 +49,8 @@ describe("Private Vault native service client", () => {
     expect(webviewPreloadSource).not.toContain("OPEN_OBJECT");
     expect(webviewPreloadSource).not.toContain("rewrapContentObjectRevision");
     expect(webviewPreloadSource).not.toContain("rewrap_revision");
+    expect(webviewPreloadSource).not.toContain("sealRotationManifest");
+    expect(webviewPreloadSource).not.toContain("seal_rot_mfst");
   });
 
   it("normalizes the exact health, lock, and unlock service contracts", async () => {
@@ -747,6 +749,78 @@ describe("Private Vault native service client", () => {
     ).rejects.toEqual(new PrivateVaultNativeServiceClientError());
   });
 
+  it("seals a rotation manifest only through the prepared native ceremony", async () => {
+    const vaultId = "00112233445566778899aabbccddeeff";
+    const targetEndpointId = "ffeeddccbbaa99887766554433221100";
+    const objectId = "11223344556677889900aabbccddeeff";
+    const plaintext = Uint8Array.from(Buffer.from('{"version":1}'));
+    let transferred: Buffer | undefined;
+    const request = vi.fn(async (...arguments_: unknown[]) => {
+      transferred = arguments_[5] as Buffer;
+      return {
+        version: 3,
+        operation: "seal_rot_mfst",
+        state: "sealed",
+        vaultId,
+        objectId,
+        contentType: "application/vnd.agent-native.content-vault-manifest+json",
+        revision: 6,
+        epoch: 8,
+        plaintextLength: plaintext.byteLength,
+        revisionId: Buffer.alloc(32, 9),
+        objectPayload: Buffer.from([0xa4, 4, 5, 6]),
+      };
+    });
+    const client = createPrivateVaultNativeServiceClientForTest(async () => ({
+      request,
+    }));
+    await expect(
+      client.sealRotationManifest({
+        vaultId,
+        targetEndpointId,
+        objectId,
+        revision: 6,
+        plaintext,
+      }),
+    ).resolves.toMatchObject({
+      operation: "seal_rot_mfst",
+      state: "sealed",
+      revision: 6,
+      epoch: 8,
+      contentType: "application/vnd.agent-native.content-vault-manifest+json",
+    });
+    expect(request).toHaveBeenCalledWith(
+      "seal_rot_mfst",
+      vaultId,
+      targetEndpointId,
+      objectId,
+      6,
+      expect.any(Buffer),
+    );
+    expect(transferred).toEqual(Buffer.alloc(plaintext.byteLength));
+    await expect(
+      clientFor({
+        version: 3,
+        operation: "seal_rot_mfst",
+        state: "sealed",
+        vaultId,
+        objectId,
+        contentType: "application/vnd.agent-native.content-document+json",
+        revision: 6,
+        epoch: 8,
+        plaintextLength: plaintext.byteLength,
+        revisionId: Buffer.alloc(32, 9),
+        objectPayload: Buffer.from([1]),
+      }).sealRotationManifest({
+        vaultId,
+        targetEndpointId,
+        objectId,
+        revision: 6,
+        plaintext,
+      }),
+    ).rejects.toEqual(new PrivateVaultNativeServiceClientError());
+  });
+
   it("issues requester grants only through the native vault boundary", async () => {
     const vaultId = "00112233445566778899aabbccddeeff";
     const recipientEndpointId = "11112222333344445555666677778888";
@@ -873,6 +947,7 @@ describe("Private Vault native service client", () => {
       state: "pending",
       vaultId,
       targetEndpointId,
+      createdAt: 1_721_296_802,
     }));
     const client = createPrivateVaultNativeServiceClientForTest(async () => ({
       request,
@@ -886,6 +961,7 @@ describe("Private Vault native service client", () => {
       state: "pending",
       vaultId,
       targetEndpointId,
+      createdAt: 1_721_296_802,
     });
     expect(request).toHaveBeenCalledWith(
       "remove_endpoint",

@@ -143,6 +143,66 @@ int main(void) {
   assert(PVParseRequest(removeEndpoint, &parsed) == PVRequestInvalid);
   xpc_release(removeEndpoint);
 
+  const uint8_t candidateSigningPublicKey[32] = {0x31};
+  const uint8_t candidateAgreementPublicKey[32] = {0x41};
+  const uint8_t candidateEnrollmentRef[16] = {0x51};
+  const uint8_t drainAttestation[] = {0xa1, 0x01, 0x02};
+  xpc_object_t replaceBroker = PVMakeRequest(
+      PV_PROTOCOL_VERSION, "replace_broker", "request-replace-broker");
+  xpc_dictionary_set_string(replaceBroker, "vaultId",
+                            "00112233445566778899aabbccddeeff");
+  xpc_dictionary_set_string(replaceBroker, "oldBrokerEndpointId",
+                            "11112222333344445555666677778888");
+  xpc_dictionary_set_string(replaceBroker, "candidateBrokerEndpointId",
+                            "9999aaaabbbbccccddddeeeeffff0000");
+  xpc_dictionary_set_data(replaceBroker, "candidateSigningPublicKey",
+                          candidateSigningPublicKey,
+                          sizeof candidateSigningPublicKey);
+  xpc_dictionary_set_data(replaceBroker, "candidateKeyAgreementPublicKey",
+                          candidateAgreementPublicKey,
+                          sizeof candidateAgreementPublicKey);
+  xpc_dictionary_set_data(replaceBroker, "candidateEnrollmentRef",
+                          candidateEnrollmentRef,
+                          sizeof candidateEnrollmentRef);
+  xpc_dictionary_set_data(replaceBroker, "drainAttestation",
+                          drainAttestation, sizeof drainAttestation);
+  assert(PVParseRequest(replaceBroker, &parsed) == PVRequestValid &&
+         strcmp(parsed.operation, "replace_broker") == 0 &&
+         strcmp(parsed.oldBrokerEndpointID,
+                "11112222333344445555666677778888") == 0 &&
+         strcmp(parsed.candidateBrokerEndpointID,
+                "9999aaaabbbbccccddddeeeeffff0000") == 0 &&
+         parsed.candidateSigningPublicKeyLength == 32 &&
+         parsed.candidateKeyAgreementPublicKeyLength == 32 &&
+         parsed.candidateEnrollmentRefLength == 16 &&
+         parsed.drainAttestationLength == sizeof drainAttestation);
+
+  xpc_object_t missingReplacement = xpc_copy(replaceBroker);
+  xpc_dictionary_set_value(missingReplacement, "candidateEnrollmentRef",
+                           NULL);
+  assert(PVParseRequest(missingReplacement, &parsed) == PVRequestInvalid);
+  xpc_release(missingReplacement);
+
+  xpc_object_t substitutedReplacement = xpc_copy(replaceBroker);
+  xpc_dictionary_set_string(substitutedReplacement,
+                            "candidateSigningPublicKey",
+                            "not-key-material");
+  assert(PVParseRequest(substitutedReplacement, &parsed) == PVRequestInvalid);
+  xpc_release(substitutedReplacement);
+
+  uint8_t oversizedDrain[PV_BROKER_DRAIN_ATTESTATION_MAXIMUM_BYTES + 1] = {0};
+  xpc_object_t oversizedReplacement = xpc_copy(replaceBroker);
+  xpc_dictionary_set_data(oversizedReplacement, "drainAttestation",
+                          oversizedDrain, sizeof oversizedDrain);
+  assert(PVParseRequest(oversizedReplacement, &parsed) == PVRequestInvalid);
+  xpc_release(oversizedReplacement);
+
+  xpc_object_t extraReplacement = xpc_copy(replaceBroker);
+  xpc_dictionary_set_string(extraReplacement, "callerPath", "/tmp/caller");
+  assert(PVParseRequest(extraReplacement, &parsed) == PVRequestInvalid);
+  xpc_release(extraReplacement);
+  xpc_release(replaceBroker);
+
   xpc_object_t listGrants =
       PVMakeRequest(PV_PROTOCOL_VERSION, "list_grants", "request-list-grants");
   xpc_dictionary_set_string(listGrants, "vaultId",
@@ -716,6 +776,23 @@ int main(void) {
                           sizeof objectCiphertext);
   assert(PVParseRequest(forgedRewrap, &parsed) == PVRequestInvalid);
   xpc_release(forgedRewrap);
+
+  xpc_object_t sealRotationManifest = PVMakeRequest(
+      PV_PROTOCOL_VERSION, "seal_rot_mfst", "request-seal-rotation-manifest");
+  xpc_dictionary_set_string(sealRotationManifest, "vaultId", enrollmentVault);
+  xpc_dictionary_set_string(sealRotationManifest, "targetEndpointId",
+                            "ffeeddccbbaa99887766554433221100");
+  xpc_dictionary_set_string(sealRotationManifest, "objectId", objectID);
+  xpc_dictionary_set_int64(sealRotationManifest, "revision", 6);
+  xpc_dictionary_set_data(sealRotationManifest, "objectPayload",
+                          objectPlaintext, sizeof objectPlaintext);
+  assert(PVParseRequest(sealRotationManifest, &parsed) == PVRequestValid &&
+         strcmp(parsed.targetEndpointID,
+                "ffeeddccbbaa99887766554433221100") == 0 &&
+         strcmp(parsed.objectID, objectID) == 0 &&
+         parsed.objectRevision == 6 &&
+         parsed.objectPayloadLength == sizeof objectPlaintext);
+  xpc_release(sealRotationManifest);
 
   const char *objectJobID = "ffeeddccbbaa99887766554433221100";
   const char *objectJobHash =

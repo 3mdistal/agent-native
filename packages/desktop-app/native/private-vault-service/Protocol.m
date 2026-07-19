@@ -68,6 +68,12 @@ static bool PVHasOnlyProtocolKeys(xpc_object_t message,
                 strcmp(key, "grantRef") == 0 ||
                 strcmp(key, "recipientEndpointId") == 0 ||
                 strcmp(key, "targetEndpointId") == 0 ||
+                strcmp(key, "oldBrokerEndpointId") == 0 ||
+                strcmp(key, "candidateBrokerEndpointId") == 0 ||
+                strcmp(key, "candidateSigningPublicKey") == 0 ||
+                strcmp(key, "candidateKeyAgreementPublicKey") == 0 ||
+                strcmp(key, "candidateEnrollmentRef") == 0 ||
+                strcmp(key, "drainAttestation") == 0 ||
                 strcmp(key, "subjectAgentId") == 0 ||
                 strcmp(key, "senderEndpointId") == 0 ||
                 strcmp(key, "expiresAt") == 0 ||
@@ -209,6 +215,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
     bool brokerKey = strcmp(operation, "broker_key") == 0;
     bool revokeGrant = strcmp(operation, "revoke_grant") == 0;
     bool removeEndpoint = strcmp(operation, "remove_endpoint") == 0;
+    bool replaceBroker = strcmp(operation, "replace_broker") == 0;
     bool refreshAuthority = strcmp(operation, "refresh_head") == 0;
     bool sealJob = strcmp(operation, "seal_job") == 0;
     bool openResult = strcmp(operation, "open_result") == 0;
@@ -227,6 +234,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
     bool sealObject = strcmp(operation, "seal_object") == 0;
     bool openObject = strcmp(operation, "open_object") == 0;
     bool rewrapRevision = strcmp(operation, "rewrap_revision") == 0;
+    bool sealRotationManifest = strcmp(operation, "seal_rot_mfst") == 0;
     bool sealJobObject = strcmp(operation, "seal_job_object") == 0;
     bool openJobObject = strcmp(operation, "open_job_object") == 0;
     bool sealExport = strcmp(operation, "seal_export") == 0;
@@ -237,13 +245,14 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
         !authorizeAdmission && !acceptAdmission && !finalizeGenesis &&
         !acceptBootstrap && !recoverBegin && !recoverPage && !recoverStatus &&
         !openJob && !createGrant && !listGrants && !listMembers && !brokerKey &&
-        !revokeGrant && !removeEndpoint && !refreshAuthority && !sealJob && !openResult && !sealResult &&
+        !revokeGrant && !removeEndpoint && !replaceBroker && !refreshAuthority && !sealJob && !openResult && !sealResult &&
         !completeResult && !pendingResult &&
         !signRequest && !prepareEnrollment && !challengeEnrollment &&
         !inspectEnrollment && !decideEnrollment && !authorizeEnrollment &&
         !activateEnrollment && !verifyManifest && !enrollmentBootstrap && !sealObject &&
         !openObject && !sealJobObject &&
-        !openJobObject && !rewrapRevision && !sealExport && !openExport) {
+        !openJobObject && !rewrapRevision && !sealRotationManifest &&
+        !sealExport && !openExport) {
         return PVRequestUnsupportedOperation;
     }
 
@@ -352,6 +361,46 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
             !PVIsVaultID(xpc_dictionary_get_string(message, "vaultId")) ||
             !PVIsLowerHex(targetEndpointId, 32)) return PVRequestInvalid;
         request->targetEndpointID = targetEndpointId;
+    } else if (replaceBroker) {
+        xpc_object_t oldValue =
+            xpc_dictionary_get_value(message, "oldBrokerEndpointId");
+        xpc_object_t candidateValue =
+            xpc_dictionary_get_value(message, "candidateBrokerEndpointId");
+        const char *oldBrokerEndpointId =
+            oldValue != NULL && xpc_get_type(oldValue) == XPC_TYPE_STRING
+                ? xpc_dictionary_get_string(message, "oldBrokerEndpointId")
+                : NULL;
+        const char *candidateBrokerEndpointId =
+            candidateValue != NULL &&
+                    xpc_get_type(candidateValue) == XPC_TYPE_STRING
+                ? xpc_dictionary_get_string(message,
+                                            "candidateBrokerEndpointId")
+                : NULL;
+        if (fieldCount != 10 || vaultIDValue == NULL ||
+            xpc_get_type(vaultIDValue) != XPC_TYPE_STRING ||
+            !PVIsVaultID(xpc_dictionary_get_string(message, "vaultId")) ||
+            !PVIsLowerHex(oldBrokerEndpointId, 32) ||
+            !PVIsLowerHex(candidateBrokerEndpointId, 32) ||
+            !PVReadBoundedData(message, "candidateSigningPublicKey", 32,
+                               &request->candidateSigningPublicKey,
+                               &request->candidateSigningPublicKeyLength) ||
+            request->candidateSigningPublicKeyLength != 32 ||
+            !PVReadBoundedData(message, "candidateKeyAgreementPublicKey", 32,
+                               &request->candidateKeyAgreementPublicKey,
+                               &request->candidateKeyAgreementPublicKeyLength) ||
+            request->candidateKeyAgreementPublicKeyLength != 32 ||
+            !PVReadBoundedData(message, "candidateEnrollmentRef", 16,
+                               &request->candidateEnrollmentRef,
+                               &request->candidateEnrollmentRefLength) ||
+            request->candidateEnrollmentRefLength != 16 ||
+            !PVReadBoundedData(message, "drainAttestation",
+                               PV_BROKER_DRAIN_ATTESTATION_MAXIMUM_BYTES,
+                               &request->drainAttestation,
+                               &request->drainAttestationLength)) {
+            return PVRequestInvalid;
+        }
+        request->oldBrokerEndpointID = oldBrokerEndpointId;
+        request->candidateBrokerEndpointID = candidateBrokerEndpointId;
     } else if (revokeGrant) {
         xpc_object_t grantValue =
             xpc_dictionary_get_value(message, "grantRef");
@@ -434,6 +483,42 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
         request->grantRef = grantRef;
         request->recipientEndpointID = recipient;
         request->expiresAt = (uint64_t)expires;
+    } else if (sealRotationManifest) {
+        xpc_object_t targetValue =
+            xpc_dictionary_get_value(message, "targetEndpointId");
+        xpc_object_t objectIDValue =
+            xpc_dictionary_get_value(message, "objectId");
+        xpc_object_t revisionValue =
+            xpc_dictionary_get_value(message, "revision");
+        const char *targetEndpointId =
+            targetValue != NULL && xpc_get_type(targetValue) == XPC_TYPE_STRING
+                ? xpc_dictionary_get_string(message, "targetEndpointId")
+                : NULL;
+        const char *objectID =
+            objectIDValue != NULL &&
+                    xpc_get_type(objectIDValue) == XPC_TYPE_STRING
+                ? xpc_dictionary_get_string(message, "objectId")
+                : NULL;
+        int64_t revision =
+            revisionValue != NULL &&
+                    xpc_get_type(revisionValue) == XPC_TYPE_INT64
+                ? xpc_dictionary_get_int64(message, "revision")
+                : 0;
+        if (fieldCount != 8 || vaultIDValue == NULL ||
+            xpc_get_type(vaultIDValue) != XPC_TYPE_STRING ||
+            !PVIsVaultID(xpc_dictionary_get_string(message, "vaultId")) ||
+            !PVIsLowerHex(targetEndpointId, 32) ||
+            !PVIsLowerHex(objectID, 32) || revision <= 0 ||
+            revision > INT64_C(9007199254740991) ||
+            !PVReadBoundedData(message, "objectPayload",
+                               PV_OBJECT_PLAINTEXT_MAXIMUM_BYTES,
+                               &request->objectPayload,
+                               &request->objectPayloadLength)) {
+            return PVRequestInvalid;
+        }
+        request->targetEndpointID = targetEndpointId;
+        request->objectID = objectID;
+        request->objectRevision = (uint64_t)revision;
     } else if (rewrapRevision) {
         xpc_object_t objectIDValue =
             xpc_dictionary_get_value(message, "objectId");
@@ -821,7 +906,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
                 challengeEnrollment || inspectEnrollment ||
                 authorizeEnrollment || verifyManifest || activateEnrollment ||
                 enrollmentBootstrap || listGrants || listMembers || brokerKey ||
-                revokeGrant || removeEndpoint || refreshAuthority || sealObject ||
+                revokeGrant || removeEndpoint || replaceBroker || refreshAuthority || sealObject ||
                 openObject || sealExport || openExport
             ? xpc_dictionary_get_string(message, "vaultId")
             : NULL;
