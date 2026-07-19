@@ -1541,6 +1541,71 @@ const runContentMigrations = runMigrations(
       ALTER TABLE content_encrypted_vault_enrollment_ceremonies
         ADD COLUMN IF NOT EXISTS manifest_authorization_bytes_base64url TEXT`,
     },
+    {
+      version: 114,
+      name: "content-private-vault-broker-replacement-transcript",
+      sql: `CREATE TABLE IF NOT EXISTS content_encrypted_vault_broker_replacement_transcripts (
+        id TEXT PRIMARY KEY,
+        transcript_id TEXT NOT NULL,
+        owner_email TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        org_id TEXT NOT NULL DEFAULT '',
+        workspace_id TEXT NOT NULL,
+        vault_id TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        phase TEXT NOT NULL DEFAULT 'offer',
+        active_key TEXT,
+        old_broker_endpoint_id TEXT NOT NULL,
+        new_broker_endpoint_id TEXT NOT NULL,
+        authorizer_endpoint_id TEXT NOT NULL,
+        offer_hash TEXT NOT NULL,
+        offer_bytes_base64url TEXT NOT NULL,
+        challenge_hash TEXT,
+        challenge_bytes_base64url TEXT,
+        sas_hash TEXT,
+        sas_bytes_base64url TEXT,
+        authorization_hash TEXT,
+        authorization_bytes_base64url TEXT,
+        approval_hash TEXT,
+        approval_bytes_base64url TEXT,
+        drain_id TEXT,
+        drain_generation TEXT,
+        drain_total_count INTEGER,
+        drain_completed_count INTEGER,
+        drain_failed_count INTEGER,
+        drain_cancelled_count INTEGER,
+        drain_digest TEXT,
+        drain_attestation_hash TEXT,
+        drain_attestation_bytes_base64url TEXT,
+        rotation_control_entry_id TEXT,
+        rotation_control_entry_hash TEXT,
+        rotation_control_sequence INTEGER,
+        rotation_receipt_hash TEXT,
+        rotation_receipt_bytes_base64url TEXT,
+        expires_at TEXT NOT NULL,
+        offered_at TEXT NOT NULL,
+        challenged_at TEXT,
+        candidate_confirmed_at TEXT,
+        authorized_at TEXT,
+        draining_at TEXT,
+        drained_at TEXT,
+        rotation_committed_at TEXT,
+        activated_at TEXT,
+        terminated_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (vault_id, owner_email, org_id)
+          REFERENCES content_encrypted_vaults(vault_id, owner_email, org_id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS content_encrypted_vault_broker_replacement_transcripts_scope_unique
+        ON content_encrypted_vault_broker_replacement_transcripts
+        (owner_email, account_id, org_id, workspace_id, vault_id, transcript_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS content_encrypted_vault_broker_replacement_transcripts_active_unique
+        ON content_encrypted_vault_broker_replacement_transcripts (active_key);
+      CREATE INDEX IF NOT EXISTS content_encrypted_vault_broker_replacement_transcripts_scope_phase_idx
+        ON content_encrypted_vault_broker_replacement_transcripts
+        (owner_email, account_id, org_id, workspace_id, vault_id, phase, expires_at)`,
+    },
   ],
   { table: "content_migrations" },
 );

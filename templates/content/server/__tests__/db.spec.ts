@@ -192,6 +192,23 @@ describe("content database migrations", () => {
     expect(source).not.toContain("content_encrypted_vault_shares");
   });
 
+  it("adds the hosted broker replacement transcript in named migration 114", () => {
+    const source = readFileSync(
+      join(__dirname, "..", "plugins", "db.ts"),
+      "utf8",
+    );
+
+    expect(source).toContain("version: 114");
+    expect(
+      source.match(/content-private-vault-broker-replacement-transcript/g),
+    ).toHaveLength(1);
+    expect(source).toContain(
+      "CREATE TABLE IF NOT EXISTS content_encrypted_vault_broker_replacement_transcripts",
+    );
+    expect(source).toContain("rotation_control_entry_hash TEXT");
+    expect(source).toContain("drain_attestation_bytes_base64url TEXT");
+  });
+
   it("binds child rows to the same physical tenant scope with composite foreign keys", () => {
     const source = readFileSync(
       join(__dirname, "..", "plugins", "db.ts"),
@@ -201,7 +218,7 @@ describe("content database migrations", () => {
     expect(source).toContain("content_encrypted_vaults_vault_scope_unique");
     expect(
       source.match(/FOREIGN KEY \(vault_id, owner_email, org_id\)/g),
-    ).toHaveLength(20);
+    ).toHaveLength(21);
     expect(source).toContain(
       "REFERENCES content_encrypted_vaults(vault_id, owner_email, org_id) ON DELETE CASCADE",
     );

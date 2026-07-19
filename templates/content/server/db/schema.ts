@@ -1252,6 +1252,95 @@ export const contentEncryptedVaultBrokerReplacementDrainJobs = table(
   ],
 );
 
+/**
+ * Public, content-free transcript for an attended hosted broker replacement.
+ *
+ * This is deliberately separate from ordinary endpoint enrollment: a vault
+ * keeps exactly one active broker until a later, signed rotation control-log
+ * entry commits the replacement. Public ceremony frames are bounded by the
+ * broker-replacement service before they reach these columns.
+ */
+export const contentEncryptedVaultBrokerReplacementTranscripts = table(
+  "content_encrypted_vault_broker_replacement_transcripts",
+  {
+    id: text("id").primaryKey(),
+    transcriptId: text("transcript_id").notNull(),
+    ownerEmail: text("owner_email").notNull(),
+    accountId: text("account_id").notNull(),
+    orgId: text("org_id").notNull().default(""),
+    workspaceId: text("workspace_id").notNull(),
+    vaultId: text("vault_id").notNull(),
+    version: integer("version").notNull().default(1),
+    phase: text("phase").notNull().default("offer"),
+    activeKey: text("active_key"),
+    oldBrokerEndpointId: text("old_broker_endpoint_id").notNull(),
+    newBrokerEndpointId: text("new_broker_endpoint_id").notNull(),
+    authorizerEndpointId: text("authorizer_endpoint_id").notNull(),
+    offerHash: text("offer_hash").notNull(),
+    offerBytesBase64url: text("offer_bytes_base64url").notNull(),
+    challengeHash: text("challenge_hash"),
+    challengeBytesBase64url: text("challenge_bytes_base64url"),
+    sasHash: text("sas_hash"),
+    sasBytesBase64url: text("sas_bytes_base64url"),
+    authorizationHash: text("authorization_hash"),
+    authorizationBytesBase64url: text("authorization_bytes_base64url"),
+    approvalHash: text("approval_hash"),
+    approvalBytesBase64url: text("approval_bytes_base64url"),
+    drainId: text("drain_id"),
+    drainGeneration: text("drain_generation"),
+    drainTotalCount: integer("drain_total_count"),
+    drainCompletedCount: integer("drain_completed_count"),
+    drainFailedCount: integer("drain_failed_count"),
+    drainCancelledCount: integer("drain_cancelled_count"),
+    drainDigest: text("drain_digest"),
+    drainAttestationHash: text("drain_attestation_hash"),
+    drainAttestationBytesBase64url: text("drain_attestation_bytes_base64url"),
+    rotationControlEntryId: text("rotation_control_entry_id"),
+    rotationControlEntryHash: text("rotation_control_entry_hash"),
+    rotationControlSequence: integer("rotation_control_sequence"),
+    rotationReceiptHash: text("rotation_receipt_hash"),
+    rotationReceiptBytesBase64url: text("rotation_receipt_bytes_base64url"),
+    expiresAt: text("expires_at").notNull(),
+    offeredAt: text("offered_at").notNull(),
+    challengedAt: text("challenged_at"),
+    candidateConfirmedAt: text("candidate_confirmed_at"),
+    authorizedAt: text("authorized_at"),
+    drainingAt: text("draining_at"),
+    drainedAt: text("drained_at"),
+    rotationCommittedAt: text("rotation_committed_at"),
+    activatedAt: text("activated_at"),
+    terminatedAt: text("terminated_at"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (transcript) => [
+    uniqueIndex(
+      "content_encrypted_vault_broker_replacement_transcripts_scope_unique",
+    ).on(
+      transcript.ownerEmail,
+      transcript.accountId,
+      transcript.orgId,
+      transcript.workspaceId,
+      transcript.vaultId,
+      transcript.transcriptId,
+    ),
+    uniqueIndex(
+      "content_encrypted_vault_broker_replacement_transcripts_active_unique",
+    ).on(transcript.activeKey),
+    index(
+      "content_encrypted_vault_broker_replacement_transcripts_scope_phase_idx",
+    ).on(
+      transcript.ownerEmail,
+      transcript.accountId,
+      transcript.orgId,
+      transcript.workspaceId,
+      transcript.vaultId,
+      transcript.phase,
+      transcript.expiresAt,
+    ),
+  ],
+);
+
 export const contentEncryptedVaultJobResults = table(
   "content_encrypted_vault_job_results",
   {
