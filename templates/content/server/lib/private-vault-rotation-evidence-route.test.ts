@@ -1,0 +1,128 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const setResponseHeader = vi.hoisted(() => vi.fn());
+const setResponseStatus = vi.hoisted(() => vi.fn());
+const readBody = vi.hoisted(() => vi.fn());
+const decodeProof = vi.hoisted(() => vi.fn());
+const authenticate = vi.hoisted(() => vi.fn());
+const appendCheckpoint = vi.hoisted(() => vi.fn());
+const appendOffer = vi.hoisted(() => vi.fn());
+
+vi.mock("h3", () => ({
+  getHeader: (event: TestEvent, name: string) => event.headers[name],
+  setResponseHeader: (...args: unknown[]) => setResponseHeader(...args),
+  setResponseStatus: (...args: unknown[]) => setResponseStatus(...args),
+}));
+vi.mock("./private-vault-bounded-body.js", () => ({
+  readPrivateVaultBoundedBody: (...args: unknown[]) => readBody(...args),
+}));
+vi.mock("./private-vault-endpoint-auth.js", () => ({
+  decodePrivateVaultEndpointProofHeader: (...args: unknown[]) =>
+    decodeProof(...args),
+  authenticatePrivateVaultAttendedEndpoint: (...args: unknown[]) =>
+    authenticate(...args),
+}));
+vi.mock("./private-vault-rotation-evidence-runtime.js", () => ({
+  privateVaultRotationEvidenceIngress: { appendCheckpoint, appendOffer },
+}));
+
+import { handlePrivateVaultRotationEvidence } from "./private-vault-rotation-evidence-route.js";
+
+interface TestEvent {
+  headers: Record<string, string>;
+  body: Uint8Array;
+}
+
+const ceremonyId = "11".repeat(16);
+const principal = {
+  ownerEmail: "owner@example.test",
+  orgId: "org-test",
+  vaultId: "22".repeat(16),
+  endpointId: "33".repeat(16),
+};
+
+function event(body: Uint8Array): TestEvent {
+  return {
+    body,
+    headers: {
+      "content-length": String(body.byteLength),
+      "content-type": "application/octet-stream",
+      "x-anc-endpoint-proof": "proof",
+    },
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  readBody.mockImplementation((input: TestEvent) =>
+    Promise.resolve(input.body),
+  );
+  decodeProof.mockReturnValue({ proof: true });
+  authenticate.mockResolvedValue(principal);
+  const status = {
+    ceremonyId,
+    phase: "collecting_offers",
+    expectedRecipientCount: 1,
+  };
+  appendCheckpoint.mockResolvedValue(status);
+  appendOffer.mockResolvedValue({
+    ...status,
+    phase: "awaiting_acknowledgements",
+  });
+});
+
+describe("Private Vault rotation evidence routes", () => {
+  it("authenticates a bounded checkpoint on its exact proof path", async () => {
+    const body = Uint8Array.of(1, 2, 3);
+    await expect(
+      handlePrivateVaultRotationEvidence(event(body) as never, "checkpoint"),
+    ).resolves.toEqual({
+      state: "stored",
+      ceremonyId,
+      phase: "collecting_offers",
+      expectedRecipientCount: 1,
+    });
+    expect(authenticate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: "/api/private-vault/rotation-evidence/checkpoint",
+        body,
+      }),
+    );
+    expect(appendCheckpoint).toHaveBeenCalledWith(principal, body);
+    expect(body.every((byte) => byte === 0)).toBe(true);
+  });
+
+  it("decodes a canonical hash-bound EEK wrap only for the offer route", async () => {
+    const body = Uint8Array.of(4, 5, 6);
+    const wrap = Uint8Array.of(7, 8, 9);
+    const request = event(body);
+    request.headers["x-anc-eek-wrap"] = Buffer.from(wrap).toString("base64url");
+    await expect(
+      handlePrivateVaultRotationEvidence(request as never, "offer"),
+    ).resolves.toMatchObject({ phase: "awaiting_acknowledgements" });
+    expect(authenticate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: "/api/private-vault/rotation-evidence/offer",
+      }),
+    );
+    expect(appendOffer).toHaveBeenCalledWith(
+      principal,
+      body,
+      expect.objectContaining({ byteLength: wrap.byteLength }),
+    );
+  });
+
+  it("returns the same opaque failure for malformed offer framing", async () => {
+    const request = event(Uint8Array.of(1));
+    await expect(
+      handlePrivateVaultRotationEvidence(request as never, "offer"),
+    ).resolves.toEqual({ error: "Not found" });
+    expect(appendOffer).not.toHaveBeenCalled();
+    expect(setResponseStatus).toHaveBeenCalledWith(expect.anything(), 404);
+    expect(setResponseHeader).toHaveBeenCalledWith(
+      expect.anything(),
+      "Cache-Control",
+      "no-store",
+    );
+  });
+});
