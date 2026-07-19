@@ -11,7 +11,10 @@ import {
   authenticatePrivateVaultAttendedEndpoint,
   decodePrivateVaultEndpointProofHeader,
 } from "./private-vault-endpoint-auth.js";
-import { privateVaultRotationEvidenceIngress } from "./private-vault-rotation-evidence-runtime.js";
+import {
+  authenticatePrivateVaultRotationEvidenceRecipient,
+  privateVaultRotationEvidenceIngress,
+} from "./private-vault-rotation-evidence-runtime.js";
 
 export const PRIVATE_VAULT_ROTATION_EVIDENCE_PATHS = Object.freeze({
   checkpoint: "/api/private-vault/rotation-evidence/checkpoint",
@@ -20,6 +23,34 @@ export const PRIVATE_VAULT_ROTATION_EVIDENCE_PATHS = Object.freeze({
 
 export type PrivateVaultRotationEvidenceRoute =
   keyof typeof PRIVATE_VAULT_ROTATION_EVIDENCE_PATHS;
+export type PrivateVaultRotationEvidenceExchangeRoute =
+  | "recipient"
+  | "acknowledgement"
+  | "destruction"
+  | "status";
+
+const IDENTIFIER = /^[0-9a-f]{32}$/;
+
+export function privateVaultRotationEvidenceExchangePath(
+  route: PrivateVaultRotationEvidenceExchangeRoute,
+  ceremonyId: string,
+  recipientEndpointId?: string,
+) {
+  if (!IDENTIFIER.test(ceremonyId)) throw new Error();
+  if (route === "status") {
+    if (recipientEndpointId !== undefined) throw new Error();
+    return `/api/private-vault/rotation-evidence/${ceremonyId}/status`;
+  }
+  if (!recipientEndpointId || !IDENTIFIER.test(recipientEndpointId))
+    throw new Error();
+  const suffix =
+    route === "recipient"
+      ? "recipient"
+      : route === "acknowledgement"
+        ? "acknowledgement"
+        : "destruction";
+  return `/api/private-vault/rotation-evidence/${ceremonyId}/recipients/${recipientEndpointId}/${suffix}`;
+}
 
 function fail(event: H3Event) {
   setResponseStatus(event, 404);
@@ -96,6 +127,120 @@ export async function handlePrivateVaultRotationEvidence(
     return {
       state: "stored",
       ceremonyId: status.ceremonyId,
+      phase: status.phase,
+      expectedRecipientCount: status.expectedRecipientCount,
+    };
+  } catch {
+    return fail(event);
+  } finally {
+    body.fill(0);
+  }
+}
+
+function bytes(value: Uint8Array | null) {
+  return value ? Buffer.from(value).toString("base64url") : null;
+}
+
+export async function handlePrivateVaultRotationEvidenceExchange(
+  event: H3Event,
+  route: PrivateVaultRotationEvidenceExchangeRoute,
+  ceremonyId: string,
+  recipientEndpointId?: string,
+) {
+  setResponseHeader(event, "Cache-Control", "no-store");
+  setResponseHeader(event, "Referrer-Policy", "no-referrer");
+  setResponseHeader(event, "X-Content-Type-Options", "nosniff");
+  let path: string;
+  try {
+    path = privateVaultRotationEvidenceExchangePath(
+      route,
+      ceremonyId,
+      recipientEndpointId,
+    );
+  } catch {
+    return fail(event);
+  }
+  const bodyRoute = route === "acknowledgement" || route === "destruction";
+  const maximum =
+    route === "acknowledgement"
+      ? ANC_ROTATION_EVIDENCE_SIZE_LIMITS.acknowledgementBytes
+      : route === "destruction"
+        ? ANC_ROTATION_EVIDENCE_SIZE_LIMITS.destructionBytes
+        : 0;
+  const rawLength = getHeader(event, "content-length")?.trim() ?? "";
+  const length = bodyRoute
+    ? boundedLength(rawLength, maximum)
+    : rawLength === "0"
+      ? 0
+      : Number.NaN;
+  if (
+    getHeader(event, "content-type")?.trim().toLowerCase() !==
+      "application/octet-stream" ||
+    !Number.isSafeInteger(length)
+  )
+    return fail(event);
+  const body = bodyRoute
+    ? await readPrivateVaultBoundedBody(event, length, maximum).catch(
+        () => null,
+      )
+    : new Uint8Array();
+  if (!body || body.byteLength !== length) return fail(event);
+  try {
+    const proof = decodePrivateVaultEndpointProofHeader(
+      getHeader(event, "x-anc-endpoint-proof")?.trim() ?? "",
+    );
+    const principal = await authenticatePrivateVaultRotationEvidenceRecipient({
+      proof,
+      path,
+      body,
+    });
+    if (route === "recipient") {
+      const evidence =
+        await privateVaultRotationEvidenceIngress.fetchRecipientEvidence(
+          principal,
+          ceremonyId,
+          recipientEndpointId!,
+        );
+      return {
+        ceremonyId,
+        recipientEndpointId,
+        offer: bytes(evidence.offer),
+        eekWrap: bytes(evidence.eekWrap),
+      };
+    }
+    if (route === "status") {
+      const status = await privateVaultRotationEvidenceIngress.readForInitiator(
+        principal,
+        ceremonyId,
+      );
+      return {
+        ceremonyId,
+        phase: status.phase,
+        expectedRecipientCount: status.expectedRecipientCount,
+        recipients: status.recipients.map((recipient) => ({
+          recipientEndpointId: recipient.recipientEndpointId,
+          acknowledgement: bytes(recipient.acknowledgement),
+          destructionAttestation: bytes(recipient.destructionAttestation),
+        })),
+      };
+    }
+    const status =
+      route === "acknowledgement"
+        ? await privateVaultRotationEvidenceIngress.appendAcknowledgement(
+            principal,
+            ceremonyId,
+            recipientEndpointId!,
+            body,
+          )
+        : await privateVaultRotationEvidenceIngress.appendDestruction(
+            principal,
+            ceremonyId,
+            recipientEndpointId!,
+            body,
+          );
+    return {
+      state: "stored",
+      ceremonyId,
       phase: status.phase,
       expectedRecipientCount: status.expectedRecipientCount,
     };

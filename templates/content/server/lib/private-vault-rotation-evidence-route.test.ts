@@ -7,6 +7,11 @@ const decodeProof = vi.hoisted(() => vi.fn());
 const authenticate = vi.hoisted(() => vi.fn());
 const appendCheckpoint = vi.hoisted(() => vi.fn());
 const appendOffer = vi.hoisted(() => vi.fn());
+const authenticateRecipient = vi.hoisted(() => vi.fn());
+const fetchRecipientEvidence = vi.hoisted(() => vi.fn());
+const appendAcknowledgement = vi.hoisted(() => vi.fn());
+const appendDestruction = vi.hoisted(() => vi.fn());
+const readForInitiator = vi.hoisted(() => vi.fn());
 
 vi.mock("h3", () => ({
   getHeader: (event: TestEvent, name: string) => event.headers[name],
@@ -23,10 +28,22 @@ vi.mock("./private-vault-endpoint-auth.js", () => ({
     authenticate(...args),
 }));
 vi.mock("./private-vault-rotation-evidence-runtime.js", () => ({
-  privateVaultRotationEvidenceIngress: { appendCheckpoint, appendOffer },
+  authenticatePrivateVaultRotationEvidenceRecipient: (...args: unknown[]) =>
+    authenticateRecipient(...args),
+  privateVaultRotationEvidenceIngress: {
+    appendCheckpoint,
+    appendOffer,
+    fetchRecipientEvidence,
+    appendAcknowledgement,
+    appendDestruction,
+    readForInitiator,
+  },
 }));
 
-import { handlePrivateVaultRotationEvidence } from "./private-vault-rotation-evidence-route.js";
+import {
+  handlePrivateVaultRotationEvidence,
+  handlePrivateVaultRotationEvidenceExchange,
+} from "./private-vault-rotation-evidence-route.js";
 
 interface TestEvent {
   headers: Record<string, string>;
@@ -68,6 +85,31 @@ beforeEach(() => {
   appendOffer.mockResolvedValue({
     ...status,
     phase: "awaiting_acknowledgements",
+  });
+  authenticateRecipient.mockResolvedValue(principal);
+  fetchRecipientEvidence.mockResolvedValue({
+    ceremonyId,
+    recipientEndpointId: principal.endpointId,
+    offer: Uint8Array.of(7),
+    eekWrap: Uint8Array.of(8),
+  });
+  appendAcknowledgement.mockResolvedValue({
+    ...status,
+    phase: "awaiting_destructions",
+  });
+  appendDestruction.mockResolvedValue({
+    ...status,
+    phase: "awaiting_hosted_receipt",
+  });
+  readForInitiator.mockResolvedValue({
+    ...status,
+    recipients: [
+      {
+        recipientEndpointId: principal.endpointId,
+        acknowledgement: Uint8Array.of(9),
+        destructionAttestation: Uint8Array.of(10),
+      },
+    ],
   });
 });
 
@@ -124,5 +166,87 @@ describe("Private Vault rotation evidence routes", () => {
       "Cache-Control",
       "no-store",
     );
+  });
+
+  it("binds recipient fetch and ACK to their exact ceremony route", async () => {
+    const fetch = event(new Uint8Array());
+    fetch.headers["content-length"] = "0";
+    await expect(
+      handlePrivateVaultRotationEvidenceExchange(
+        fetch as never,
+        "recipient",
+        ceremonyId,
+        principal.endpointId,
+      ),
+    ).resolves.toMatchObject({
+      ceremonyId,
+      recipientEndpointId: principal.endpointId,
+      offer: "Bw",
+      eekWrap: "CA",
+    });
+    expect(authenticateRecipient).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: `/api/private-vault/rotation-evidence/${ceremonyId}/recipients/${principal.endpointId}/recipient`,
+        body: expect.objectContaining({ byteLength: 0 }),
+      }),
+    );
+
+    const acknowledgement = event(Uint8Array.of(11, 12));
+    await expect(
+      handlePrivateVaultRotationEvidenceExchange(
+        acknowledgement as never,
+        "acknowledgement",
+        ceremonyId,
+        principal.endpointId,
+      ),
+    ).resolves.toMatchObject({ phase: "awaiting_destructions" });
+    expect(appendAcknowledgement).toHaveBeenCalledWith(
+      principal,
+      ceremonyId,
+      principal.endpointId,
+      expect.objectContaining({ byteLength: 2 }),
+    );
+  });
+
+  it("returns exact collected bytes only to the proof-authenticated initiator", async () => {
+    const request = event(new Uint8Array());
+    request.headers["content-length"] = "0";
+    await expect(
+      handlePrivateVaultRotationEvidenceExchange(
+        request as never,
+        "status",
+        ceremonyId,
+      ),
+    ).resolves.toMatchObject({
+      recipients: [
+        {
+          recipientEndpointId: principal.endpointId,
+          acknowledgement: "CQ",
+          destructionAttestation: "Cg",
+        },
+      ],
+    });
+    expect(readForInitiator).toHaveBeenCalledWith(principal, ceremonyId);
+  });
+
+  it("rejects extra framing and malformed recipient coordinates opaquely", async () => {
+    const extra = event(Uint8Array.of(1));
+    extra.headers["content-length"] = "1";
+    await expect(
+      handlePrivateVaultRotationEvidenceExchange(
+        extra as never,
+        "recipient",
+        ceremonyId,
+        principal.endpointId,
+      ),
+    ).resolves.toEqual({ error: "Not found" });
+    await expect(
+      handlePrivateVaultRotationEvidenceExchange(
+        event(Uint8Array.of(1)) as never,
+        "destruction",
+        "not-a-ceremony",
+        principal.endpointId,
+      ),
+    ).resolves.toEqual({ error: "Not found" });
   });
 });

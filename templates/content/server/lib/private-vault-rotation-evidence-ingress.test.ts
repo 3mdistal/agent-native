@@ -5,14 +5,19 @@ import {
   ancV1SignDetached,
   ancV1SigningKeypairFromSeed,
   encodeAncV1EekWrapEnvelope,
+  encodeAncV1RotationEpochDestructionAttestation,
   encodeAncV1RotationManifestCheckpoint,
+  encodeAncV1RotationRecipientAcknowledgement,
   encodeAncV1RotationRecipientOffer,
   encodeAncV1UnsignedEekWrapPreimage,
   hashAncV1RotationLiveRevisionSet,
   hashAncV1RotationManifestCheckpoint,
   hashAncV1RotationRecipientSet,
+  hashAncV1RotationRecipientOffer,
+  signAncV1RotationEpochDestructionAttestation,
   signAncV1RotationManifestCheckpoint,
   signAncV1RotationRecipientOffer,
+  signAncV1RotationRecipientAcknowledgement,
   type ControlLogState,
 } from "@agent-native/core/e2ee";
 import { describe, expect, it, vi } from "vitest";
@@ -259,5 +264,176 @@ describe("Private Vault verified rotation evidence ingress", () => {
       ),
     ).rejects.toBeDefined();
     expect(putRecipientOffer).not.toHaveBeenCalled();
+  });
+
+  it("serves only the active survivor and stores ACK before fully verified destruction", async () => {
+    const value = await fixture();
+    const scope = {
+      ownerEmail: "alice@example.test",
+      accountId: "account:alice",
+      orgId: "org:alice",
+      workspaceId: "workspace:alice",
+      vaultId: value.state.vaultId,
+    };
+    const recipientId = ancV1BytesToHex(issuerId);
+    const principal = {
+      ownerEmail: scope.ownerEmail,
+      orgId: scope.orgId,
+      vaultId: scope.vaultId,
+      endpointId: recipientId,
+    };
+    const checkpointHash = await hashAncV1RotationManifestCheckpoint(
+      value.checkpoint,
+      vault,
+    );
+    const offerHash = await hashAncV1RotationRecipientOffer(value.offer, vault);
+    const acknowledgement = encodeAncV1RotationRecipientAcknowledgement(
+      await signAncV1RotationRecipientAcknowledgement(
+        {
+          suite: ANC_ROTATION_EVIDENCE_SUITE_ID,
+          vaultId: vault,
+          type: "rotation-recipient-acknowledgement",
+          createdAt: now,
+          envelopeId: fill(29),
+          ceremonyId,
+          checkpointHash,
+          eekWrapHash: await ancV1Hash("eek-wrap", value.encodedWrap),
+          offerHash,
+          recipientEndpointId: issuerId,
+          targetEpoch: 2,
+        },
+        {
+          recipientSigningPrivateKey: value.issuer.privateKey,
+          pendingEpochKey: fill(30, 32),
+        },
+      ),
+    );
+    const destruction = encodeAncV1RotationEpochDestructionAttestation(
+      await signAncV1RotationEpochDestructionAttestation(
+        {
+          suite: ANC_ROTATION_EVIDENCE_SUITE_ID,
+          vaultId: vault,
+          type: "rotation-epoch-destruction-attestation",
+          createdAt: now,
+          envelopeId: fill(31),
+          ceremonyId,
+          checkpointHash,
+          controlEntryHash: fill(19, 32),
+          endpointId: issuerId,
+          destroyedEpoch: 1,
+          activatedEpoch: 2,
+          // Custody and manifest generations are independent monotonic clocks.
+          custodyGeneration: 7,
+        },
+        value.issuer.privateKey,
+      ),
+    );
+    let status: any = {
+      ceremonyId: ancV1BytesToHex(ceremonyId),
+      phase: "awaiting_acknowledgements",
+      expectedRecipientCount: 1,
+      checkpoint: value.checkpoint,
+      recipients: [
+        {
+          recipientEndpointId: recipientId,
+          offer: value.offer,
+          eekWrap: value.encodedWrap,
+          acknowledgement: null,
+          destructionAttestation: null,
+        },
+      ],
+      hostedReceipt: null,
+      completionAttestation: null,
+      terminalAt: null,
+      purgeEligibleAt: null,
+    };
+    const store = {
+      read: vi.fn(async () => status),
+      putRecipientAcknowledgement: vi.fn(async (_scope, input) => {
+        status = {
+          ...status,
+          phase: "awaiting_destructions",
+          recipients: [
+            { ...status.recipients[0], acknowledgement: input.acknowledgement },
+          ],
+        };
+        return status;
+      }),
+      putDestructionAttestation: vi.fn(async (_scope, input) => {
+        status = {
+          ...status,
+          phase: "awaiting_hosted_receipt",
+          recipients: [
+            {
+              ...status.recipients[0],
+              destructionAttestation: input.destructionAttestation,
+            },
+          ],
+        };
+        return status;
+      }),
+    };
+    const ingress = createPrivateVaultRotationEvidenceIngress({
+      loadState: async () => value.state,
+      resolveScope: async () => scope,
+      store: store as never,
+      now: () => now,
+    });
+    await expect(
+      ingress.fetchRecipientEvidence(
+        principal,
+        ancV1BytesToHex(ceremonyId),
+        recipientId,
+      ),
+    ).resolves.toMatchObject({ recipientEndpointId: recipientId });
+    await expect(
+      ingress.appendAcknowledgement(
+        principal,
+        ancV1BytesToHex(ceremonyId),
+        recipientId,
+        acknowledgement,
+      ),
+    ).resolves.toMatchObject({ phase: "awaiting_destructions" });
+    expect(store.putRecipientAcknowledgement).toHaveBeenCalledWith(
+      scope,
+      expect.objectContaining({ acknowledgement }),
+    );
+    const forgedDestruction = destruction.slice();
+    forgedDestruction[forgedDestruction.length - 1] ^= 1;
+    await expect(
+      ingress.appendDestruction(
+        principal,
+        ancV1BytesToHex(ceremonyId),
+        recipientId,
+        forgedDestruction,
+      ),
+    ).rejects.toBeDefined();
+    expect(store.putDestructionAttestation).not.toHaveBeenCalled();
+    await expect(
+      ingress.appendDestruction(
+        principal,
+        ancV1BytesToHex(ceremonyId),
+        recipientId,
+        destruction,
+      ),
+    ).resolves.toMatchObject({ phase: "awaiting_hosted_receipt" });
+
+    await expect(
+      ingress.readForInitiator(principal, ancV1BytesToHex(ceremonyId)),
+    ).resolves.toMatchObject({
+      recipients: [
+        expect.objectContaining({
+          acknowledgement,
+          destructionAttestation: destruction,
+        }),
+      ],
+    });
+    await expect(
+      ingress.fetchRecipientEvidence(
+        { ...principal, endpointId: ancV1BytesToHex(removedId) },
+        ancV1BytesToHex(ceremonyId),
+        ancV1BytesToHex(removedId),
+      ),
+    ).rejects.toBeDefined();
   });
 });
