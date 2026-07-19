@@ -1662,6 +1662,48 @@ const runContentMigrations = runMigrations(
       ALTER TABLE content_encrypted_vault_rotation_evidence_artifacts
         ADD COLUMN IF NOT EXISTS recovery_wrap_byte_length INTEGER`,
     },
+    {
+      version: 117,
+      name: "content-private-vault-mutation-gate",
+      sql: {
+        sqlite: `ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_serial REAL NOT NULL DEFAULT 0;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_phase TEXT NOT NULL DEFAULT 'open';
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_kind TEXT;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_ceremony_id TEXT;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_base_epoch REAL;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_target_epoch REAL;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_manifest_object_id TEXT;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_manifest_revision_id TEXT;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_manifest_generation REAL`,
+        postgres: `ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_serial DOUBLE PRECISION NOT NULL DEFAULT 0;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_phase TEXT NOT NULL DEFAULT 'open';
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_kind TEXT;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_ceremony_id TEXT;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_base_epoch DOUBLE PRECISION;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_target_epoch DOUBLE PRECISION;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_manifest_object_id TEXT;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_manifest_revision_id TEXT;
+      ALTER TABLE content_encrypted_vaults
+        ADD COLUMN IF NOT EXISTS mutation_manifest_generation DOUBLE PRECISION`,
+      },
+    },
   ],
   { table: "content_migrations" },
 );
