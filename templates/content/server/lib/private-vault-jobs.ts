@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
   E2EE_SIZE_LIMITS,
@@ -29,6 +29,7 @@ import {
   inArray,
   lt,
   lte,
+  not,
   or,
   sql,
 } from "drizzle-orm";
@@ -273,6 +274,44 @@ function activeEndpointPredicate(principal: PrivateVaultEndpointPrincipal) {
   );
 }
 
+function noActiveBrokerReplacementDrainPredicate(
+  scope: PrivateVaultJobScope,
+  endpointId: string,
+) {
+  return not(
+    exists(
+      getDb()
+        .select({ one: sql`1` })
+        .from(schema.contentEncryptedVaultBrokerReplacementDrains)
+        .where(
+          and(
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains.vaultId,
+              scope.vaultId,
+            ),
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains.ownerEmail,
+              scope.ownerEmail,
+            ),
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains.orgId,
+              scope.orgId,
+            ),
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains
+                .oldBrokerEndpointId,
+              endpointId,
+            ),
+            inArray(schema.contentEncryptedVaultBrokerReplacementDrains.phase, [
+              "draining",
+              "witnessed",
+            ]),
+          ),
+        ),
+    ),
+  );
+}
+
 function metadataFromRow(
   row: typeof schema.contentEncryptedVaultJobs.$inferSelect,
 ): PrivateVaultJobMetadata {
@@ -473,6 +512,10 @@ export const sqlPrivateVaultJobStore: PrivateVaultJobStore = {
           eq(schema.contentEncryptedVaults.orgId, scope.orgId),
           eq(schema.contentEncryptedVaults.vaultState, "active"),
           lte(schema.contentEncryptedVaultGrants.issuedAt, now),
+          noActiveBrokerReplacementDrainPredicate(
+            scope,
+            input.recipientEndpointId,
+          ),
         ),
       )
       .limit(1);
@@ -545,6 +588,38 @@ export const sqlPrivateVaultJobStore: PrivateVaultJobStore = {
         )
         .limit(1);
       if (!vault) throw new PrivateVaultJobNotFoundError();
+      const [activeDrain] = await tx
+        .select({
+          drainId: schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+        })
+        .from(schema.contentEncryptedVaultBrokerReplacementDrains)
+        .where(
+          and(
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains.vaultId,
+              scope.vaultId,
+            ),
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains.ownerEmail,
+              scope.ownerEmail,
+            ),
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains.orgId,
+              scope.orgId,
+            ),
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains
+                .oldBrokerEndpointId,
+              job.recipientEndpointId,
+            ),
+            inArray(schema.contentEncryptedVaultBrokerReplacementDrains.phase, [
+              "draining",
+              "witnessed",
+            ]),
+          ),
+        )
+        .limit(1);
+      if (activeDrain) throw new PrivateVaultJobConflictError();
       await tx
         .insert(schema.contentEncryptedVaultJobs)
         .values(row)
@@ -645,6 +720,38 @@ export const sqlPrivateVaultJobStore: PrivateVaultJobStore = {
         )
         .limit(1);
       if (!activeEndpoint) return null;
+      const [activeDrain] = await tx
+        .select({
+          drainId: schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+        })
+        .from(schema.contentEncryptedVaultBrokerReplacementDrains)
+        .where(
+          and(
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains.vaultId,
+              principal.vaultId,
+            ),
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains.ownerEmail,
+              principal.ownerEmail,
+            ),
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains.orgId,
+              principal.orgId,
+            ),
+            eq(
+              schema.contentEncryptedVaultBrokerReplacementDrains
+                .oldBrokerEndpointId,
+              principal.endpointId,
+            ),
+            inArray(schema.contentEncryptedVaultBrokerReplacementDrains.phase, [
+              "draining",
+              "witnessed",
+            ]),
+          ),
+        )
+        .limit(1);
+      if (activeDrain) return null;
       const expiredRows = await tx
         .update(schema.contentEncryptedVaultJobs)
         .set({ jobState: "cancelled", retryAt: null, leaseExpiresAt: null })
@@ -779,6 +886,10 @@ export const sqlPrivateVaultJobStore: PrivateVaultJobStore = {
             ),
             eq(schema.contentEncryptedVaultJobs.jobState, "queued"),
             gt(schema.contentEncryptedVaultJobs.expiresAt, now),
+            noActiveBrokerReplacementDrainPredicate(
+              principal,
+              principal.endpointId,
+            ),
           ),
         )
         .orderBy(
@@ -810,6 +921,10 @@ export const sqlPrivateVaultJobStore: PrivateVaultJobStore = {
               candidate.retryCount,
             ),
             gt(schema.contentEncryptedVaultJobs.expiresAt, now),
+            noActiveBrokerReplacementDrainPredicate(
+              principal,
+              principal.endpointId,
+            ),
           ),
         )
         .returning();
@@ -1053,6 +1168,879 @@ export const sqlPrivateVaultJobStore: PrivateVaultJobStore = {
     };
   },
 };
+
+const brokerDrainFreezeInputSchema = z
+  .object({
+    drainId: opaqueIdSchema,
+    oldBrokerEndpointId: opaqueIdSchema,
+    replacementBrokerEndpointId: opaqueIdSchema,
+    authorizerEndpointId: opaqueIdSchema,
+    authorizerApprovalId: opaqueIdSchema,
+    authorizerApprovalHash: opaqueIdSchema,
+    drainGeneration: opaqueIdSchema,
+    deadlineAt: protocolTimestampSchema,
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (
+      value.oldBrokerEndpointId === value.replacementBrokerEndpointId ||
+      value.oldBrokerEndpointId === value.authorizerEndpointId ||
+      value.replacementBrokerEndpointId === value.authorizerEndpointId
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["oldBrokerEndpointId"],
+        message: "The old broker, replacement, and authorizer must be distinct",
+      });
+    }
+  });
+
+const brokerDrainDeadlineDecisionInputSchema = z
+  .object({
+    drainId: opaqueIdSchema,
+    decisionId: opaqueIdSchema,
+    decision: z.enum(["abort", "cancel_nonterminal", "expire_nonterminal"]),
+  })
+  .strict();
+
+const brokerDrainCompletionInputSchema = z
+  .object({
+    drainId: opaqueIdSchema,
+    completionId: opaqueIdSchema,
+    witnessGeneration: z.number().int().positive(),
+    terminalJobsDigest: opaqueIdSchema,
+  })
+  .strict();
+
+export type PrivateVaultBrokerDrainPhase =
+  | "draining"
+  | "witnessed"
+  | "committed"
+  | "aborted";
+
+export interface PrivateVaultBrokerDrainMetadata {
+  drainId: string;
+  vaultId: string;
+  oldBrokerEndpointId: string;
+  replacementBrokerEndpointId: string;
+  authorizerEndpointId: string;
+  authorizerApprovalId: string;
+  authorizerApprovalHash: string;
+  drainGeneration: string;
+  phase: PrivateVaultBrokerDrainPhase;
+  deadlineAt: string;
+  frozenAt: string;
+  deadlineDecisionId: string | null;
+  deadlineDecision:
+    | "abort"
+    | "cancel_nonterminal"
+    | "expire_nonterminal"
+    | null;
+  deadlineDecidedAt: string | null;
+  witnessGeneration: number | null;
+  totalJobCount: number | null;
+  completedJobCount: number | null;
+  failedJobCount: number | null;
+  cancelledJobCount: number | null;
+  terminalJobsDigest: string | null;
+  witnessedAt: string | null;
+  completionId: string | null;
+  completedAt: string | null;
+}
+
+export class PrivateVaultBrokerDrainNotFoundError extends Error {
+  constructor() {
+    super("Private Vault broker replacement drain was not found");
+    this.name = "PrivateVaultBrokerDrainNotFoundError";
+  }
+}
+
+export class PrivateVaultBrokerDrainConflictError extends Error {
+  constructor() {
+    super(
+      "Private Vault broker replacement drain conflicts with current state",
+    );
+    this.name = "PrivateVaultBrokerDrainConflictError";
+  }
+}
+
+function brokerDrainMetadataFromRow(
+  row: typeof schema.contentEncryptedVaultBrokerReplacementDrains.$inferSelect,
+): PrivateVaultBrokerDrainMetadata {
+  return {
+    drainId: row.drainId,
+    vaultId: row.vaultId,
+    oldBrokerEndpointId: row.oldBrokerEndpointId,
+    replacementBrokerEndpointId: row.replacementBrokerEndpointId,
+    authorizerEndpointId: row.authorizerEndpointId,
+    authorizerApprovalId: row.authorizerApprovalId,
+    authorizerApprovalHash: row.authorizerApprovalHash,
+    drainGeneration: row.drainGeneration,
+    phase: row.phase as PrivateVaultBrokerDrainPhase,
+    deadlineAt: row.deadlineAt,
+    frozenAt: row.frozenAt,
+    deadlineDecisionId: row.deadlineDecisionId,
+    deadlineDecision: row.deadlineDecision as
+      | "abort"
+      | "cancel_nonterminal"
+      | "expire_nonterminal"
+      | null,
+    deadlineDecidedAt: row.deadlineDecidedAt,
+    witnessGeneration: row.witnessGeneration,
+    totalJobCount: row.totalJobCount,
+    completedJobCount: row.completedJobCount,
+    failedJobCount: row.failedJobCount,
+    cancelledJobCount: row.cancelledJobCount,
+    terminalJobsDigest: row.terminalJobsDigest,
+    witnessedAt: row.witnessedAt,
+    completionId: row.completionId,
+    completedAt: row.completedAt,
+  };
+}
+
+function sameBrokerDrainFreeze(
+  row: PrivateVaultBrokerDrainMetadata,
+  input: z.infer<typeof brokerDrainFreezeInputSchema>,
+) {
+  return (
+    row.drainId === input.drainId &&
+    row.oldBrokerEndpointId === input.oldBrokerEndpointId &&
+    row.replacementBrokerEndpointId === input.replacementBrokerEndpointId &&
+    row.authorizerEndpointId === input.authorizerEndpointId &&
+    row.authorizerApprovalId === input.authorizerApprovalId &&
+    row.authorizerApprovalHash === input.authorizerApprovalHash &&
+    row.drainGeneration === input.drainGeneration &&
+    row.deadlineAt === input.deadlineAt
+  );
+}
+
+function brokerDrainActiveKey(vaultId: string, oldBrokerEndpointId: string) {
+  return createHash("sha256")
+    .update(JSON.stringify([vaultId, oldBrokerEndpointId]))
+    .digest("hex");
+}
+
+function brokerDrainMembershipId(drainId: string, jobId: string) {
+  return createHash("sha256")
+    .update(JSON.stringify([drainId, jobId]))
+    .digest("hex");
+}
+
+function brokerDrainWitnessDigest(input: {
+  drain: PrivateVaultBrokerDrainMetadata;
+  jobs: Array<{
+    jobId: string;
+    jobState: string;
+    retryCount: number;
+    serverReceivedAt: string;
+  }>;
+}) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        version: 1,
+        drainId: input.drain.drainId,
+        vaultId: input.drain.vaultId,
+        oldBrokerEndpointId: input.drain.oldBrokerEndpointId,
+        replacementBrokerEndpointId: input.drain.replacementBrokerEndpointId,
+        authorizerApprovalHash: input.drain.authorizerApprovalHash,
+        drainGeneration: input.drain.drainGeneration,
+        jobs: input.jobs,
+      }),
+    )
+    .digest("hex");
+}
+
+/**
+ * Durable hosted half of broker replacement. The caller must verify the
+ * endpoint-signed authorizer approval before `freeze`; this service stores the
+ * public commitment and atomically fences the old broker's enqueue/claim lane.
+ * It never decrypts, rewraps, or readdresses ciphertext.
+ */
+export function createPrivateVaultBrokerDrainService(
+  options: { now?: () => string } = {},
+) {
+  const now = options.now ?? (() => new Date().toISOString());
+
+  const load = async (
+    scope: PrivateVaultJobScope,
+    drainId: string,
+  ): Promise<PrivateVaultBrokerDrainMetadata> => {
+    const normalized = normalizeScope(scope);
+    const [row] = await getDb()
+      .select()
+      .from(schema.contentEncryptedVaultBrokerReplacementDrains)
+      .where(
+        and(
+          eq(
+            schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+            opaqueIdSchema.parse(drainId),
+          ),
+          eq(
+            schema.contentEncryptedVaultBrokerReplacementDrains.vaultId,
+            normalized.vaultId,
+          ),
+          eq(
+            schema.contentEncryptedVaultBrokerReplacementDrains.ownerEmail,
+            normalized.ownerEmail,
+          ),
+          eq(
+            schema.contentEncryptedVaultBrokerReplacementDrains.orgId,
+            normalized.orgId,
+          ),
+        ),
+      )
+      .limit(1);
+    if (!row) throw new PrivateVaultBrokerDrainNotFoundError();
+    return brokerDrainMetadataFromRow(row);
+  };
+
+  return {
+    get: load,
+    async freeze(
+      scopeInput: PrivateVaultJobScope,
+      inputValue: z.input<typeof brokerDrainFreezeInputSchema>,
+    ) {
+      const scope = normalizeScope(scopeInput);
+      const input = brokerDrainFreezeInputSchema.parse(inputValue);
+      const at = now();
+      return getDb().transaction(async (tx) => {
+        const [existingRow] = await tx
+          .select()
+          .from(schema.contentEncryptedVaultBrokerReplacementDrains)
+          .where(
+            and(
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+                input.drainId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.vaultId,
+                scope.vaultId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.ownerEmail,
+                scope.ownerEmail,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.orgId,
+                scope.orgId,
+              ),
+            ),
+          )
+          .limit(1);
+        if (existingRow) {
+          const existing = brokerDrainMetadataFromRow(existingRow);
+          if (sameBrokerDrainFreeze(existing, input)) return existing;
+          throw new PrivateVaultBrokerDrainConflictError();
+        }
+        if (Date.parse(input.deadlineAt) <= Date.parse(at)) {
+          throw new PrivateVaultBrokerDrainConflictError();
+        }
+        const endpoints = await tx
+          .select({
+            endpointId: schema.contentEncryptedVaultEndpoints.endpointId,
+          })
+          .from(schema.contentEncryptedVaultEndpoints)
+          .where(
+            and(
+              eq(schema.contentEncryptedVaultEndpoints.vaultId, scope.vaultId),
+              eq(
+                schema.contentEncryptedVaultEndpoints.ownerEmail,
+                scope.ownerEmail,
+              ),
+              eq(schema.contentEncryptedVaultEndpoints.orgId, scope.orgId),
+              inArray(schema.contentEncryptedVaultEndpoints.endpointId, [
+                input.oldBrokerEndpointId,
+                input.authorizerEndpointId,
+              ]),
+              eq(schema.contentEncryptedVaultEndpoints.endpointState, "online"),
+            ),
+          );
+        if (
+          new Set(endpoints.map((endpoint) => endpoint.endpointId)).size !== 2
+        ) {
+          throw new PrivateVaultBrokerDrainNotFoundError();
+        }
+        await tx
+          .insert(schema.contentEncryptedVaultBrokerReplacementDrains)
+          .values({
+            drainId: input.drainId,
+            vaultId: scope.vaultId,
+            ownerEmail: scope.ownerEmail,
+            orgId: scope.orgId,
+            oldBrokerEndpointId: input.oldBrokerEndpointId,
+            replacementBrokerEndpointId: input.replacementBrokerEndpointId,
+            authorizerEndpointId: input.authorizerEndpointId,
+            authorizerApprovalId: input.authorizerApprovalId,
+            authorizerApprovalHash: input.authorizerApprovalHash,
+            drainGeneration: input.drainGeneration,
+            phase: "draining",
+            activeKey: brokerDrainActiveKey(
+              scope.vaultId,
+              input.oldBrokerEndpointId,
+            ),
+            deadlineAt: input.deadlineAt,
+            frozenAt: at,
+            createdAt: at,
+            updatedAt: at,
+          })
+          .onConflictDoNothing();
+        const [storedRow] = await tx
+          .select()
+          .from(schema.contentEncryptedVaultBrokerReplacementDrains)
+          .where(
+            and(
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+                input.drainId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.vaultId,
+                scope.vaultId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.ownerEmail,
+                scope.ownerEmail,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.orgId,
+                scope.orgId,
+              ),
+            ),
+          )
+          .limit(1);
+        const stored = storedRow ? brokerDrainMetadataFromRow(storedRow) : null;
+        if (!stored || !sameBrokerDrainFreeze(stored, input)) {
+          throw new PrivateVaultBrokerDrainConflictError();
+        }
+        const frozenJobs = await tx
+          .select({ jobId: schema.contentEncryptedVaultJobs.jobId })
+          .from(schema.contentEncryptedVaultJobs)
+          .where(
+            and(
+              eq(schema.contentEncryptedVaultJobs.vaultId, scope.vaultId),
+              eq(schema.contentEncryptedVaultJobs.ownerEmail, scope.ownerEmail),
+              eq(schema.contentEncryptedVaultJobs.orgId, scope.orgId),
+              eq(
+                schema.contentEncryptedVaultJobs.recipientEndpointId,
+                input.oldBrokerEndpointId,
+              ),
+              inArray(schema.contentEncryptedVaultJobs.jobState, [
+                "queued",
+                "leased",
+                "acknowledged",
+                "retry_wait",
+              ]),
+            ),
+          )
+          .orderBy(asc(schema.contentEncryptedVaultJobs.jobId));
+        for (let offset = 0; offset < frozenJobs.length; offset += 100) {
+          await tx
+            .insert(schema.contentEncryptedVaultBrokerReplacementDrainJobs)
+            .values(
+              frozenJobs.slice(offset, offset + 100).map(({ jobId }) => ({
+                id: brokerDrainMembershipId(input.drainId, jobId),
+                drainId: input.drainId,
+                vaultId: scope.vaultId,
+                ownerEmail: scope.ownerEmail,
+                orgId: scope.orgId,
+                jobId,
+                drainGeneration: input.drainGeneration,
+                frozenAt: at,
+              })),
+            );
+        }
+        return stored;
+      });
+    },
+    async resolveDeadline(
+      scopeInput: PrivateVaultJobScope,
+      inputValue: z.input<typeof brokerDrainDeadlineDecisionInputSchema>,
+    ) {
+      const scope = normalizeScope(scopeInput);
+      const input = brokerDrainDeadlineDecisionInputSchema.parse(inputValue);
+      const at = now();
+      return getDb().transaction(async (tx) => {
+        const [row] = await tx
+          .select()
+          .from(schema.contentEncryptedVaultBrokerReplacementDrains)
+          .where(
+            and(
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+                input.drainId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.vaultId,
+                scope.vaultId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.ownerEmail,
+                scope.ownerEmail,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.orgId,
+                scope.orgId,
+              ),
+            ),
+          )
+          .limit(1);
+        if (!row) throw new PrivateVaultBrokerDrainNotFoundError();
+        const drain = brokerDrainMetadataFromRow(row);
+        if (drain.deadlineDecisionId) {
+          if (
+            drain.deadlineDecisionId === input.decisionId &&
+            drain.deadlineDecision === input.decision
+          ) {
+            return drain;
+          }
+          throw new PrivateVaultBrokerDrainConflictError();
+        }
+        if (
+          drain.phase !== "draining" ||
+          Date.parse(at) < Date.parse(drain.deadlineAt)
+        ) {
+          throw new PrivateVaultBrokerDrainConflictError();
+        }
+        if (input.decision === "abort") {
+          const [updated] = await tx
+            .update(schema.contentEncryptedVaultBrokerReplacementDrains)
+            .set({
+              phase: "aborted",
+              activeKey: null,
+              deadlineDecisionId: input.decisionId,
+              deadlineDecision: input.decision,
+              deadlineDecidedAt: at,
+              completedAt: at,
+              updatedAt: at,
+            })
+            .where(
+              and(
+                eq(
+                  schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+                  drain.drainId,
+                ),
+                eq(
+                  schema.contentEncryptedVaultBrokerReplacementDrains.phase,
+                  "draining",
+                ),
+              ),
+            )
+            .returning();
+          if (!updated) throw new PrivateVaultBrokerDrainConflictError();
+          return brokerDrainMetadataFromRow(updated);
+        }
+        const nonterminal = await tx
+          .select({
+            jobId: schema.contentEncryptedVaultJobs.jobId,
+            expiresAt: schema.contentEncryptedVaultJobs.expiresAt,
+          })
+          .from(schema.contentEncryptedVaultJobs)
+          .innerJoin(
+            schema.contentEncryptedVaultBrokerReplacementDrainJobs,
+            and(
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs.jobId,
+                schema.contentEncryptedVaultJobs.jobId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs.vaultId,
+                schema.contentEncryptedVaultJobs.vaultId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs
+                  .ownerEmail,
+                schema.contentEncryptedVaultJobs.ownerEmail,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs.orgId,
+                schema.contentEncryptedVaultJobs.orgId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs.drainId,
+                drain.drainId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs
+                  .drainGeneration,
+                drain.drainGeneration,
+              ),
+            ),
+          )
+          .where(
+            and(
+              eq(schema.contentEncryptedVaultJobs.vaultId, scope.vaultId),
+              eq(schema.contentEncryptedVaultJobs.ownerEmail, scope.ownerEmail),
+              eq(schema.contentEncryptedVaultJobs.orgId, scope.orgId),
+              eq(
+                schema.contentEncryptedVaultJobs.recipientEndpointId,
+                drain.oldBrokerEndpointId,
+              ),
+              inArray(schema.contentEncryptedVaultJobs.jobState, [
+                "queued",
+                "leased",
+                "acknowledged",
+                "retry_wait",
+              ]),
+            ),
+          );
+        if (
+          input.decision === "expire_nonterminal" &&
+          nonterminal.some((job) => Date.parse(job.expiresAt) > Date.parse(at))
+        ) {
+          throw new PrivateVaultBrokerDrainConflictError();
+        }
+        if (nonterminal.length > 0) {
+          const cancelled = await tx
+            .update(schema.contentEncryptedVaultJobs)
+            .set({ jobState: "cancelled", retryAt: null, leaseExpiresAt: null })
+            .where(
+              and(
+                eq(schema.contentEncryptedVaultJobs.vaultId, scope.vaultId),
+                eq(
+                  schema.contentEncryptedVaultJobs.ownerEmail,
+                  scope.ownerEmail,
+                ),
+                eq(schema.contentEncryptedVaultJobs.orgId, scope.orgId),
+                eq(
+                  schema.contentEncryptedVaultJobs.recipientEndpointId,
+                  drain.oldBrokerEndpointId,
+                ),
+                exists(
+                  getDb()
+                    .select({ one: sql`1` })
+                    .from(
+                      schema.contentEncryptedVaultBrokerReplacementDrainJobs,
+                    )
+                    .where(
+                      and(
+                        eq(
+                          schema.contentEncryptedVaultBrokerReplacementDrainJobs
+                            .drainId,
+                          drain.drainId,
+                        ),
+                        eq(
+                          schema.contentEncryptedVaultBrokerReplacementDrainJobs
+                            .drainGeneration,
+                          drain.drainGeneration,
+                        ),
+                        eq(
+                          schema.contentEncryptedVaultBrokerReplacementDrainJobs
+                            .jobId,
+                          schema.contentEncryptedVaultJobs.jobId,
+                        ),
+                        eq(
+                          schema.contentEncryptedVaultBrokerReplacementDrainJobs
+                            .vaultId,
+                          scope.vaultId,
+                        ),
+                        eq(
+                          schema.contentEncryptedVaultBrokerReplacementDrainJobs
+                            .ownerEmail,
+                          scope.ownerEmail,
+                        ),
+                        eq(
+                          schema.contentEncryptedVaultBrokerReplacementDrainJobs
+                            .orgId,
+                          scope.orgId,
+                        ),
+                      ),
+                    ),
+                ),
+                inArray(schema.contentEncryptedVaultJobs.jobState, [
+                  "queued",
+                  "leased",
+                  "acknowledged",
+                  "retry_wait",
+                ]),
+              ),
+            )
+            .returning({ jobId: schema.contentEncryptedVaultJobs.jobId });
+          if (cancelled.length !== nonterminal.length) {
+            throw new PrivateVaultBrokerDrainConflictError();
+          }
+          await enqueuePrivateVaultRetentionItems(
+            tx,
+            cancelled.map(({ jobId }) =>
+              buildPrivateVaultJobRetentionItem(scope, jobId, at),
+            ),
+          );
+        }
+        const [updated] = await tx
+          .update(schema.contentEncryptedVaultBrokerReplacementDrains)
+          .set({
+            deadlineDecisionId: input.decisionId,
+            deadlineDecision: input.decision,
+            deadlineDecidedAt: at,
+            updatedAt: at,
+          })
+          .where(
+            and(
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+                drain.drainId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.phase,
+                "draining",
+              ),
+            ),
+          )
+          .returning();
+        if (!updated) throw new PrivateVaultBrokerDrainConflictError();
+        return brokerDrainMetadataFromRow(updated);
+      });
+    },
+    async witness(scopeInput: PrivateVaultJobScope, rawDrainId: string) {
+      const scope = normalizeScope(scopeInput);
+      const drainId = opaqueIdSchema.parse(rawDrainId);
+      const at = now();
+      return getDb().transaction(async (tx) => {
+        const [row] = await tx
+          .select()
+          .from(schema.contentEncryptedVaultBrokerReplacementDrains)
+          .where(
+            and(
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+                drainId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.vaultId,
+                scope.vaultId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.ownerEmail,
+                scope.ownerEmail,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.orgId,
+                scope.orgId,
+              ),
+            ),
+          )
+          .limit(1);
+        if (!row) throw new PrivateVaultBrokerDrainNotFoundError();
+        const drain = brokerDrainMetadataFromRow(row);
+        if (drain.phase === "witnessed" || drain.phase === "committed") {
+          if (
+            drain.witnessGeneration === 1 &&
+            drain.terminalJobsDigest &&
+            drain.totalJobCount !== null
+          ) {
+            return drain;
+          }
+          throw new PrivateVaultBrokerDrainConflictError();
+        }
+        if (drain.phase !== "draining") {
+          throw new PrivateVaultBrokerDrainConflictError();
+        }
+        const cohort = await tx
+          .select({
+            memberJobId:
+              schema.contentEncryptedVaultBrokerReplacementDrainJobs.jobId,
+            storedJobId: schema.contentEncryptedVaultJobs.jobId,
+            jobState: schema.contentEncryptedVaultJobs.jobState,
+            retryCount: schema.contentEncryptedVaultJobs.retryCount,
+            serverReceivedAt: schema.contentEncryptedVaultJobs.serverReceivedAt,
+          })
+          .from(schema.contentEncryptedVaultBrokerReplacementDrainJobs)
+          .leftJoin(
+            schema.contentEncryptedVaultJobs,
+            and(
+              eq(
+                schema.contentEncryptedVaultJobs.jobId,
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs.jobId,
+              ),
+              eq(
+                schema.contentEncryptedVaultJobs.vaultId,
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs.vaultId,
+              ),
+              eq(
+                schema.contentEncryptedVaultJobs.ownerEmail,
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs
+                  .ownerEmail,
+              ),
+              eq(
+                schema.contentEncryptedVaultJobs.orgId,
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs.orgId,
+              ),
+              eq(
+                schema.contentEncryptedVaultJobs.recipientEndpointId,
+                drain.oldBrokerEndpointId,
+              ),
+            ),
+          )
+          .where(
+            and(
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs.drainId,
+                drain.drainId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs
+                  .drainGeneration,
+                drain.drainGeneration,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs.vaultId,
+                scope.vaultId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs
+                  .ownerEmail,
+                scope.ownerEmail,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrainJobs.orgId,
+                scope.orgId,
+              ),
+            ),
+          )
+          .orderBy(
+            asc(schema.contentEncryptedVaultBrokerReplacementDrainJobs.jobId),
+          );
+        if (
+          cohort.some(
+            (job) =>
+              !job.storedJobId ||
+              !job.jobState ||
+              job.retryCount === null ||
+              !job.serverReceivedAt ||
+              !["completed", "failed", "cancelled"].includes(job.jobState),
+          )
+        ) {
+          throw new PrivateVaultBrokerDrainConflictError();
+        }
+        const jobs = cohort.map((job) => ({
+          jobId: job.memberJobId,
+          jobState: job.jobState!,
+          retryCount: job.retryCount!,
+          serverReceivedAt: job.serverReceivedAt!,
+        }));
+        const completedJobCount = jobs.filter(
+          (job) => job.jobState === "completed",
+        ).length;
+        const failedJobCount = jobs.filter(
+          (job) => job.jobState === "failed",
+        ).length;
+        const cancelledJobCount = jobs.filter(
+          (job) => job.jobState === "cancelled",
+        ).length;
+        const terminalJobsDigest = brokerDrainWitnessDigest({ drain, jobs });
+        const [updated] = await tx
+          .update(schema.contentEncryptedVaultBrokerReplacementDrains)
+          .set({
+            phase: "witnessed",
+            witnessGeneration: 1,
+            totalJobCount: jobs.length,
+            completedJobCount,
+            failedJobCount,
+            cancelledJobCount,
+            terminalJobsDigest,
+            witnessedAt: at,
+            updatedAt: at,
+          })
+          .where(
+            and(
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+                drain.drainId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.phase,
+                "draining",
+              ),
+            ),
+          )
+          .returning();
+        if (!updated) throw new PrivateVaultBrokerDrainConflictError();
+        return brokerDrainMetadataFromRow(updated);
+      });
+    },
+    async finalize(
+      scopeInput: PrivateVaultJobScope,
+      inputValue: z.input<typeof brokerDrainCompletionInputSchema>,
+    ) {
+      const scope = normalizeScope(scopeInput);
+      const input = brokerDrainCompletionInputSchema.parse(inputValue);
+      const at = now();
+      return getDb().transaction(async (tx) => {
+        const [row] = await tx
+          .select()
+          .from(schema.contentEncryptedVaultBrokerReplacementDrains)
+          .where(
+            and(
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+                input.drainId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.vaultId,
+                scope.vaultId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.ownerEmail,
+                scope.ownerEmail,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.orgId,
+                scope.orgId,
+              ),
+            ),
+          )
+          .limit(1);
+        if (!row) throw new PrivateVaultBrokerDrainNotFoundError();
+        const drain = brokerDrainMetadataFromRow(row);
+        if (drain.phase === "committed") {
+          if (
+            drain.completionId === input.completionId &&
+            drain.witnessGeneration === input.witnessGeneration &&
+            drain.terminalJobsDigest === input.terminalJobsDigest
+          ) {
+            return drain;
+          }
+          throw new PrivateVaultBrokerDrainConflictError();
+        }
+        if (
+          drain.phase !== "witnessed" ||
+          drain.witnessGeneration !== input.witnessGeneration ||
+          drain.terminalJobsDigest !== input.terminalJobsDigest
+        ) {
+          throw new PrivateVaultBrokerDrainConflictError();
+        }
+        const [updated] = await tx
+          .update(schema.contentEncryptedVaultBrokerReplacementDrains)
+          .set({
+            phase: "committed",
+            activeKey: null,
+            completionId: input.completionId,
+            completedAt: at,
+            updatedAt: at,
+          })
+          .where(
+            and(
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.drainId,
+                drain.drainId,
+              ),
+              eq(
+                schema.contentEncryptedVaultBrokerReplacementDrains.phase,
+                "witnessed",
+              ),
+            ),
+          )
+          .returning();
+        if (!updated) throw new PrivateVaultBrokerDrainConflictError();
+        return brokerDrainMetadataFromRow(updated);
+      });
+    },
+  };
+}
+
+export const privateVaultBrokerDrainService =
+  createPrivateVaultBrokerDrainService();
 
 const coreBlobStore: PrivateVaultJobBlobStore = {
   put: putProtectedCiphertext,

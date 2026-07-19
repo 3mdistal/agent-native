@@ -1155,6 +1155,97 @@ export const contentEncryptedVaultJobs = table(
   ],
 );
 
+/**
+ * Content-free freeze and drain witness for an attended broker replacement.
+ *
+ * `active_key` is populated while a replacement owns the old broker's job
+ * lane and cleared only by an explicit commit or abort. SQLite permits more
+ * than one NULL in a unique index, giving us a portable partial-unique fence
+ * without relying on provider-specific partial-index syntax.
+ */
+export const contentEncryptedVaultBrokerReplacementDrains = table(
+  "content_encrypted_vault_broker_replacement_drains",
+  {
+    drainId: text("drain_id").primaryKey(),
+    vaultId: text("vault_id").notNull(),
+    ownerEmail: text("owner_email").notNull(),
+    orgId: text("org_id").notNull().default(""),
+    version: integer("version").notNull().default(1),
+    oldBrokerEndpointId: text("old_broker_endpoint_id").notNull(),
+    replacementBrokerEndpointId: text(
+      "replacement_broker_endpoint_id",
+    ).notNull(),
+    authorizerEndpointId: text("authorizer_endpoint_id").notNull(),
+    authorizerApprovalId: text("authorizer_approval_id").notNull(),
+    authorizerApprovalHash: text("authorizer_approval_hash").notNull(),
+    drainGeneration: text("drain_generation").notNull(),
+    phase: text("phase").notNull().default("draining"),
+    activeKey: text("active_key"),
+    deadlineAt: text("deadline_at").notNull(),
+    frozenAt: text("frozen_at").notNull(),
+    deadlineDecisionId: text("deadline_decision_id"),
+    deadlineDecision: text("deadline_decision"),
+    deadlineDecidedAt: text("deadline_decided_at"),
+    witnessGeneration: integer("witness_generation"),
+    totalJobCount: integer("total_job_count"),
+    completedJobCount: integer("completed_job_count"),
+    failedJobCount: integer("failed_job_count"),
+    cancelledJobCount: integer("cancelled_job_count"),
+    terminalJobsDigest: text("terminal_jobs_digest"),
+    witnessedAt: text("witnessed_at"),
+    completionId: text("completion_id"),
+    completedAt: text("completed_at"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (drain) => [
+    uniqueIndex(
+      "content_encrypted_vault_broker_replacement_drains_active_unique",
+    ).on(drain.activeKey),
+    uniqueIndex(
+      "content_encrypted_vault_broker_replacement_drains_approval_unique",
+    ).on(drain.vaultId, drain.authorizerApprovalId),
+    uniqueIndex(
+      "content_encrypted_vault_broker_replacement_drains_scope_unique",
+    ).on(drain.drainId, drain.vaultId, drain.ownerEmail, drain.orgId),
+    index(
+      "content_encrypted_vault_broker_replacement_drains_scope_phase_idx",
+    ).on(
+      drain.ownerEmail,
+      drain.orgId,
+      drain.vaultId,
+      drain.oldBrokerEndpointId,
+      drain.phase,
+    ),
+  ],
+);
+
+/** Exact content-free cohort captured atomically when a broker lane freezes. */
+export const contentEncryptedVaultBrokerReplacementDrainJobs = table(
+  "content_encrypted_vault_broker_replacement_drain_jobs",
+  {
+    id: text("id").primaryKey(),
+    drainId: text("drain_id").notNull(),
+    vaultId: text("vault_id").notNull(),
+    ownerEmail: text("owner_email").notNull(),
+    orgId: text("org_id").notNull().default(""),
+    jobId: text("job_id").notNull(),
+    drainGeneration: text("drain_generation").notNull(),
+    frozenAt: text("frozen_at").notNull(),
+  },
+  (job) => [
+    uniqueIndex(
+      "content_encrypted_vault_broker_replacement_drain_jobs_unique",
+    ).on(job.drainId, job.jobId),
+    index("content_encrypted_vault_broker_replacement_drain_jobs_scope_idx").on(
+      job.ownerEmail,
+      job.orgId,
+      job.vaultId,
+      job.drainId,
+    ),
+  ],
+);
+
 export const contentEncryptedVaultJobResults = table(
   "content_encrypted_vault_job_results",
   {

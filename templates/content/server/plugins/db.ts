@@ -1470,6 +1470,69 @@ const runContentMigrations = runMigrations(
         ON content_encrypted_vault_migration_evidence
         (owner_email, org_id, vault_id, migration_id, export_bundle_hash, evidence_kind)`,
     },
+    {
+      version: 112,
+      name: "content-private-vault-broker-replacement-drain",
+      sql: `CREATE TABLE IF NOT EXISTS content_encrypted_vault_broker_replacement_drains (
+        drain_id TEXT PRIMARY KEY,
+        vault_id TEXT NOT NULL,
+        owner_email TEXT NOT NULL,
+        org_id TEXT NOT NULL DEFAULT '',
+        version INTEGER NOT NULL DEFAULT 1,
+        old_broker_endpoint_id TEXT NOT NULL,
+        replacement_broker_endpoint_id TEXT NOT NULL,
+        authorizer_endpoint_id TEXT NOT NULL,
+        authorizer_approval_id TEXT NOT NULL,
+        authorizer_approval_hash TEXT NOT NULL,
+        drain_generation TEXT NOT NULL,
+        phase TEXT NOT NULL DEFAULT 'draining',
+        active_key TEXT,
+        deadline_at TEXT NOT NULL,
+        frozen_at TEXT NOT NULL,
+        deadline_decision_id TEXT,
+        deadline_decision TEXT,
+        deadline_decided_at TEXT,
+        witness_generation INTEGER,
+        total_job_count INTEGER,
+        completed_job_count INTEGER,
+        failed_job_count INTEGER,
+        cancelled_job_count INTEGER,
+        terminal_jobs_digest TEXT,
+        witnessed_at TEXT,
+        completion_id TEXT,
+        completed_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (vault_id, owner_email, org_id)
+          REFERENCES content_encrypted_vaults(vault_id, owner_email, org_id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS content_encrypted_vault_broker_replacement_drains_active_unique
+        ON content_encrypted_vault_broker_replacement_drains (active_key);
+      CREATE UNIQUE INDEX IF NOT EXISTS content_encrypted_vault_broker_replacement_drains_approval_unique
+        ON content_encrypted_vault_broker_replacement_drains (vault_id, authorizer_approval_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS content_encrypted_vault_broker_replacement_drains_scope_unique
+        ON content_encrypted_vault_broker_replacement_drains (drain_id, vault_id, owner_email, org_id);
+      CREATE INDEX IF NOT EXISTS content_encrypted_vault_broker_replacement_drains_scope_phase_idx
+        ON content_encrypted_vault_broker_replacement_drains
+        (owner_email, org_id, vault_id, old_broker_endpoint_id, phase);
+      CREATE TABLE IF NOT EXISTS content_encrypted_vault_broker_replacement_drain_jobs (
+        id TEXT PRIMARY KEY,
+        drain_id TEXT NOT NULL,
+        vault_id TEXT NOT NULL,
+        owner_email TEXT NOT NULL,
+        org_id TEXT NOT NULL DEFAULT '',
+        job_id TEXT NOT NULL,
+        drain_generation TEXT NOT NULL,
+        frozen_at TEXT NOT NULL,
+        FOREIGN KEY (drain_id, vault_id, owner_email, org_id)
+          REFERENCES content_encrypted_vault_broker_replacement_drains(drain_id, vault_id, owner_email, org_id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS content_encrypted_vault_broker_replacement_drain_jobs_unique
+        ON content_encrypted_vault_broker_replacement_drain_jobs (drain_id, job_id);
+      CREATE INDEX IF NOT EXISTS content_encrypted_vault_broker_replacement_drain_jobs_scope_idx
+        ON content_encrypted_vault_broker_replacement_drain_jobs
+        (owner_email, org_id, vault_id, drain_id)`,
+    },
   ],
   { table: "content_migrations" },
 );
