@@ -44,6 +44,103 @@ static AncPrivateVaultCanonicalValue *Field(
   return value.type == type ? value : nil;
 }
 
+static NSData *Encode(
+    NSDictionary<NSNumber *, AncPrivateVaultCanonicalValue *> *fields) {
+  AncPrivateVaultCanonicalStatus status;
+  NSData *encoded = AncPrivateVaultCanonicalEncode(
+      [AncPrivateVaultCanonicalValue map:fields], &status);
+  return status == AncPrivateVaultCanonicalStatusOK ? encoded : nil;
+}
+
+AncPrivateVaultEekWrap *AncPrivateVaultEekWrapBuild(
+    NSData *vaultId, NSData *recipientEndpointId, NSData *issuerEndpointId,
+    NSData *envelopeId, NSData *nonce, uint64_t epoch, uint64_t createdAt,
+    NSData *recipientKeyAgreementPublicKey, const uint8_t epochKey[32],
+    const uint8_t issuerSigningSeed[32],
+    const uint8_t issuerKeyAgreementSeed[32],
+    AncPrivateVaultEekWrapStatus *status) {
+  SetStatus(status, AncPrivateVaultEekWrapStatusInvalid);
+  if (!Exact(vaultId, 16) || !Exact(recipientEndpointId, 16) ||
+      !Exact(issuerEndpointId, 16) || !Exact(envelopeId, 16) ||
+      !Exact(nonce, 24) || epoch == 0 || epoch > kMaxSafeInteger ||
+      createdAt == 0 || createdAt > kMaxSafeInteger ||
+      !Exact(recipientKeyAgreementPublicKey, 32) || epochKey == NULL ||
+      issuerSigningSeed == NULL || issuerKeyAgreementSeed == NULL)
+    return nil;
+
+  uint8_t signingPublic[32] = {0}, signingPrivate[64] = {0};
+  uint8_t agreementPublic[32] = {0}, agreementPrivate[32] = {0};
+  uint8_t plaintext[sizeof kEekDomain + 32] = {0};
+  uint8_t ciphertext[64] = {0}, signature[64] = {0};
+  size_t ciphertextLength = 0;
+  memcpy(plaintext, kEekDomain, sizeof kEekDomain);
+  memcpy(plaintext + sizeof kEekDomain, epochKey, 32);
+  BOOL keysReady =
+      anc_pv_ed25519_seed_keypair(signingPublic, signingPrivate,
+                                  issuerSigningSeed) == ANC_PV_CRYPTO_OK &&
+      anc_pv_box_seed_keypair(agreementPublic, agreementPrivate,
+                              issuerKeyAgreementSeed) == ANC_PV_CRYPTO_OK;
+  BOOL wrapped =
+      keysReady &&
+      anc_pv_box_wrap(ciphertext, sizeof ciphertext, &ciphertextLength,
+                      plaintext, sizeof plaintext, nonce.bytes,
+                      recipientKeyAgreementPublicKey.bytes,
+                      agreementPrivate) == ANC_PV_CRYPTO_OK &&
+      ciphertextLength == sizeof ciphertext;
+  anc_pv_zeroize(plaintext, sizeof plaintext);
+  anc_pv_zeroize(agreementPrivate, sizeof agreementPrivate);
+  anc_pv_zeroize(agreementPublic, sizeof agreementPublic);
+
+  NSDictionary<NSNumber *, AncPrivateVaultCanonicalValue *> *unsignedFields =
+      wrapped
+          ? @{
+              @1 : [AncPrivateVaultCanonicalValue text:@"anc/v1"],
+              @2 : [AncPrivateVaultCanonicalValue bytes:vaultId],
+              @3 : [AncPrivateVaultCanonicalValue text:@"eek-wrap"],
+              @4 : [AncPrivateVaultCanonicalValue integer:(int64_t)createdAt],
+              @5 : [AncPrivateVaultCanonicalValue bytes:envelopeId],
+              @30 : [AncPrivateVaultCanonicalValue integer:(int64_t)epoch],
+              @31 : [AncPrivateVaultCanonicalValue
+                  bytes:recipientEndpointId],
+              @32 : [AncPrivateVaultCanonicalValue bytes:issuerEndpointId],
+              @33 : [AncPrivateVaultCanonicalValue bytes:nonce],
+              @34 : [AncPrivateVaultCanonicalValue
+                  bytes:[NSData dataWithBytes:ciphertext
+                                       length:sizeof ciphertext]],
+            }
+          : nil;
+  NSData *unsignedEnvelope =
+      unsignedFields == nil ? nil : Encode(unsignedFields);
+  NSMutableData *message = unsignedEnvelope == nil
+      ? nil
+      : [NSMutableData dataWithBytes:kEekDomain length:sizeof kEekDomain];
+  [message appendData:unsignedEnvelope];
+  BOOL signedEnvelope =
+      message != nil &&
+      anc_pv_ed25519_sign(signature, message.bytes, message.length,
+                          signingPrivate) == ANC_PV_CRYPTO_OK;
+  NSMutableDictionary<NSNumber *, AncPrivateVaultCanonicalValue *> *fields =
+      signedEnvelope ? [unsignedFields mutableCopy] : nil;
+  fields[@35] = [AncPrivateVaultCanonicalValue
+      bytes:[NSData dataWithBytes:signature length:sizeof signature]];
+  NSData *encoded = fields == nil ? nil : Encode(fields);
+  anc_pv_zeroize(message.mutableBytes, message.length);
+  anc_pv_zeroize(ciphertext, sizeof ciphertext);
+  anc_pv_zeroize(signature, sizeof signature);
+  anc_pv_zeroize(signingPrivate, sizeof signingPrivate);
+  if (encoded == nil) {
+    anc_pv_zeroize(signingPublic, sizeof signingPublic);
+    SetStatus(status, AncPrivateVaultEekWrapStatusCryptoFailed);
+    return nil;
+  }
+  NSData *issuerSigningPublicKey =
+      [NSData dataWithBytes:signingPublic length:sizeof signingPublic];
+  anc_pv_zeroize(signingPublic, sizeof signingPublic);
+  return AncPrivateVaultEekWrapVerify(
+      encoded, vaultId, recipientEndpointId, issuerEndpointId, epoch,
+      issuerSigningPublicKey, status);
+}
+
 AncPrivateVaultEekWrap *AncPrivateVaultEekWrapVerify(
     NSData *encoded, NSData *expectedVaultId,
     NSData *expectedRecipientEndpointId, NSData *expectedIssuerEndpointId,

@@ -46,6 +46,20 @@ int main(void) {
     NSData *sender = [NSData dataWithBytes:senderPublic length:32];
     NSData *recipient = [NSData dataWithBytes:recipientPublic length:32];
     AncPrivateVaultEekWrapStatus status;
+    uint8_t epochKey[32];
+    memset(epochKey, 0x44, sizeof epochKey);
+    AncPrivateVaultEekWrap *built = AncPrivateVaultEekWrapBuild(
+        Repeated(0x01, 16), Repeated(0x03, 16), Repeated(0x02, 16),
+        Repeated(0x12, 16), Repeated(0x19, 24), 7, 1721111111, recipient,
+        epochKey, signingSeed, senderSeed, &status);
+    assert(status == AncPrivateVaultEekWrapStatusOK && built != nil &&
+           [built.encodedEnvelope isEqualToData:encoded]);
+    assert(AncPrivateVaultEekWrapBuild(
+               Repeated(0x01, 16), Repeated(0x03, 16),
+               Repeated(0x02, 16), Repeated(0x12, 16), Repeated(0x19, 24),
+               7, 1721111111, Repeated(0x00, 31), epochKey, signingSeed,
+               senderSeed, &status) == nil &&
+           status == AncPrivateVaultEekWrapStatusInvalid);
     AncPrivateVaultEekWrap *verified = AncPrivateVaultEekWrapVerify(
         encoded, Repeated(0x01, 16), Repeated(0x03, 16), Repeated(0x02, 16),
         7, signing, &status);
@@ -131,6 +145,7 @@ int main(void) {
     anc_pv_zeroize(signingSeed, sizeof signingSeed);
     anc_pv_zeroize(senderSeed, sizeof senderSeed);
     anc_pv_zeroize(recipientSeed, sizeof recipientSeed);
+    anc_pv_zeroize(epochKey, sizeof epochKey);
     anc_pv_zeroize(wrongSeed, sizeof wrongSeed);
     anc_pv_zeroize(signingPrivate, sizeof signingPrivate);
     anc_pv_zeroize(senderPrivate, sizeof senderPrivate);

@@ -104,6 +104,9 @@ int main(void) {
             agreementSeed, &status);
     assert(result != nil && status == AncPrivateVaultEndpointRemovalBuilderStatusOK);
     assert(result.signedEntry.length > 0 && result.recoveryWrap.length > 0 &&
+           result.eekWraps.count == 2 &&
+           [result.eekWraps[0].recipientEndpointId isEqualToData:currentId] &&
+           [result.eekWraps[1].recipientEndpointId isEqualToData:brokerId] &&
            result.transcriptDigest.length == 32 && result.nextState.epoch == 4 &&
            result.nextState.sequence == 8 &&
            ![[result.nextState.activeMembers valueForKey:@"endpointId"]
@@ -117,6 +120,10 @@ int main(void) {
     assert(lostReceiptRetry != nil &&
            [lostReceiptRetry.signedEntry isEqualToData:result.signedEntry] &&
            [lostReceiptRetry.recoveryWrap isEqualToData:result.recoveryWrap] &&
+           [lostReceiptRetry.eekWraps[0].encodedEnvelope
+               isEqualToData:result.eekWraps[0].encodedEnvelope] &&
+           [lostReceiptRetry.eekWraps[1].encodedEnvelope
+               isEqualToData:result.eekWraps[1].encodedEnvelope] &&
            [lostReceiptRetry.transcriptDigest
                isEqualToData:result.transcriptDigest]);
     assert(AncPrivateVaultBuildEndpointRemoval(

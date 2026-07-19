@@ -1710,6 +1710,7 @@ case "${PRIVATE_VAULT_BUILD_ROTATION_PREPARATION_TESTS:-}" in
       "$SOURCE_ROOT/control/PrivateVaultAncCanonical.m" \
       "$SOURCE_ROOT/control/PrivateVaultControlLog.m" \
       "$SOURCE_ROOT/control/PrivateVaultRecoveryWrap.m" \
+      "$SOURCE_ROOT/control/PrivateVaultEekWrap.m" \
       "$SOURCE_ROOT/control/PrivateVaultEndpointRemovalBuilder.m" \
       "$SOURCE_ROOT/control/PrivateVaultEndpointRemovalBuilderTests.m" \
       "$sodium_root/lib/libsodium.a" \
@@ -1755,6 +1756,7 @@ case "${PRIVATE_VAULT_BUILD_ROTATION_PREPARATION_TESTS:-}" in
       "$SOURCE_ROOT/control/PrivateVaultControlLogInternal.m" \
       "$SOURCE_ROOT/control/PrivateVaultBrokerReplacementBuilder.m" \
       "$SOURCE_ROOT/control/PrivateVaultEndpointRemovalBuilder.m" \
+      "$SOURCE_ROOT/control/PrivateVaultEekWrap.m" \
       "$SOURCE_ROOT/control/PrivateVaultEndpointRequest.m" \
       "$SOURCE_ROOT/control/PrivateVaultRecoveryWrap.m" \
       "$SOURCE_ROOT/storage/PrivateVaultKeychain.m" \

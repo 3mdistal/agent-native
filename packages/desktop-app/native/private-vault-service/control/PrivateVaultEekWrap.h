@@ -26,6 +26,20 @@ typedef NS_ENUM(NSInteger, AncPrivateVaultEekWrapStatus) {
 + (instancetype)new NS_UNAVAILABLE;
 @end
 
+/* Builds one recipient-bound EEK wrap with the same frozen anc/v1 envelope
+ * verified below. Secret inputs are borrowed for this call only. The caller
+ * remains responsible for deriving a unique envelope id and nonce and for
+ * proving the issuer and recipient belong to authenticated control state. */
+FOUNDATION_EXPORT AncPrivateVaultEekWrap *_Nullable
+AncPrivateVaultEekWrapBuild(
+    NSData *vaultId, NSData *recipientEndpointId, NSData *issuerEndpointId,
+    NSData *envelopeId, NSData *nonce, uint64_t epoch, uint64_t createdAt,
+    NSData *recipientKeyAgreementPublicKey,
+    const uint8_t *_Nonnull epochKey,
+    const uint8_t *_Nonnull issuerSigningSeed,
+    const uint8_t *_Nonnull issuerKeyAgreementSeed,
+    AncPrivateVaultEekWrapStatus *_Nullable status);
+
 FOUNDATION_EXPORT AncPrivateVaultEekWrap *_Nullable
 AncPrivateVaultEekWrapVerify(
     NSData *encodedEnvelope, NSData *expectedVaultId,

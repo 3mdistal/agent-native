@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 
 #import "PrivateVaultControlLog.h"
+#import "PrivateVaultEekWrap.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -16,6 +17,7 @@ typedef NS_ENUM(NSInteger, AncPrivateVaultEndpointRemovalBuilderStatus) {
 @interface AncPrivateVaultPreparedEndpointRemoval : NSObject
 @property(nonatomic, readonly) NSData *signedEntry;
 @property(nonatomic, readonly) NSData *recoveryWrap;
+@property(nonatomic, readonly) NSArray<AncPrivateVaultEekWrap *> *eekWraps;
 @property(nonatomic, readonly) NSData *transcriptDigest;
 @property(nonatomic, readonly) AncPrivateVaultControlLogState *nextState;
 - (instancetype)init NS_UNAVAILABLE;

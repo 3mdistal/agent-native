@@ -12,6 +12,7 @@ static const uint64_t kMaximumSafeInteger = UINT64_C(9007199254740991);
 @interface AncPrivateVaultPreparedEndpointRemoval ()
 - (instancetype)initPrivateWithEntry:(NSData *)entry
                                 wrap:(NSData *)wrap
+                            eekWraps:(NSArray<AncPrivateVaultEekWrap *> *)eekWraps
                           transcript:(NSData *)transcript
                            nextState:(AncPrivateVaultControlLogState *)state;
 @end
@@ -19,17 +20,20 @@ static const uint64_t kMaximumSafeInteger = UINT64_C(9007199254740991);
 @implementation AncPrivateVaultPreparedEndpointRemoval
 @synthesize signedEntry = _signedEntry;
 @synthesize recoveryWrap = _recoveryWrap;
+@synthesize eekWraps = _eekWraps;
 @synthesize transcriptDigest = _transcriptDigest;
 @synthesize nextState = _nextState;
 + (BOOL)accessInstanceVariablesDirectly { return NO; }
 - (instancetype)initPrivateWithEntry:(NSData *)entry
                                 wrap:(NSData *)wrap
+                            eekWraps:(NSArray<AncPrivateVaultEekWrap *> *)eekWraps
                           transcript:(NSData *)transcript
                            nextState:(AncPrivateVaultControlLogState *)state {
   self = [super init];
   if (self != nil) {
     _signedEntry = [entry copy];
     _recoveryWrap = [wrap copy];
+    _eekWraps = [eekWraps copy];
     _transcriptDigest = [transcript copy];
     _nextState = state;
   }
@@ -110,6 +114,28 @@ static NSData *Hash(const uint8_t *domain, size_t domainLength, NSData *data) {
   NSData *result = okay ? [NSData dataWithBytes:digest length:32] : nil;
   anc_pv_zeroize(digest, sizeof digest);
   return result;
+}
+static BOOL DeriveRecipientBytes(uint8_t *output, size_t outputLength,
+                                 const char *label,
+                                 const uint8_t pendingKey[32],
+                                 NSData *ceremonyId, NSData *recipientId) {
+  if (output == NULL || outputLength == 0 || outputLength > 32 ||
+      label == NULL || pendingKey == NULL || ceremonyId.length != 16 ||
+      recipientId.length != 16)
+    return NO;
+  NSMutableData *input =
+      [NSMutableData dataWithBytes:label length:strlen(label) + 1];
+  [input appendBytes:pendingKey length:32];
+  [input appendData:ceremonyId];
+  [input appendData:recipientId];
+  uint8_t digest[32] = {0};
+  BOOL okay = anc_pv_blake2b_256(digest, input.bytes, input.length) ==
+      ANC_PV_CRYPTO_OK;
+  if (okay)
+    memcpy(output, digest, outputLength);
+  anc_pv_zeroize(digest, sizeof digest);
+  anc_pv_zeroize(input.mutableBytes, input.length);
+  return okay;
 }
 static NSData *Signature(const uint8_t *domain, size_t domainLength,
                          NSData *payload, const uint8_t seed[32],
@@ -194,6 +220,56 @@ AncPrivateVaultPreparedEndpointRemoval *AncPrivateVaultBuildEndpointRemoval(
     anc_pv_zeroize(agreementPrivate, sizeof agreementPrivate);
     SetStatus(status, AncPrivateVaultEndpointRemovalBuilderStatusTargetRejected);
     return nil;
+  }
+
+  NSArray<AncPrivateVaultControlLogMember *> *survivors =
+      [[current.activeMembers
+          filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(
+              AncPrivateVaultControlLogMember *member,
+              __unused NSDictionary *bindings) {
+            return member != targetMember;
+          }]] sortedArrayUsingComparator:^NSComparisonResult(
+              AncPrivateVaultControlLogMember *left,
+              AncPrivateVaultControlLogMember *right) {
+        return [left.endpointId compare:right.endpointId];
+      }];
+  if (survivors.count == 0 || survivors.count > 64) {
+    SetStatus(status, AncPrivateVaultEndpointRemovalBuilderStatusTargetRejected);
+    return nil;
+  }
+  NSMutableArray<AncPrivateVaultEekWrap *> *eekWraps =
+      [NSMutableArray arrayWithCapacity:survivors.count];
+  for (AncPrivateVaultControlLogMember *recipientMember in survivors) {
+    NSData *recipientId = HexData(recipientMember.endpointId, 16);
+    uint8_t envelopeBytes[16] = {0}, nonceBytes[24] = {0};
+    BOOL derived = recipientId != nil &&
+        recipientMember.signingPublicKey.length == 32 &&
+        recipientMember.keyAgreementPublicKey.length == 32 &&
+        DeriveRecipientBytes(envelopeBytes, sizeof envelopeBytes,
+                             "endpoint-removal/eek-envelope", pendingKey,
+                             ceremony, recipientId) &&
+        DeriveRecipientBytes(nonceBytes, sizeof nonceBytes,
+                             "endpoint-removal/eek-nonce", pendingKey,
+                             ceremony, recipientId);
+    AncPrivateVaultEekWrapStatus wrapStatus;
+    AncPrivateVaultEekWrap *eekWrap =
+        derived
+            ? AncPrivateVaultEekWrapBuild(
+                  vault, recipientId, HexData(issuer.endpointId, 16),
+                  [NSData dataWithBytes:envelopeBytes length:16],
+                  [NSData dataWithBytes:nonceBytes length:24],
+                  current.epoch + 1, createdAt,
+                  recipientMember.keyAgreementPublicKey, pendingKey,
+                  signingSeed, agreementSeed, &wrapStatus)
+            : nil;
+    anc_pv_zeroize(envelopeBytes, sizeof envelopeBytes);
+    anc_pv_zeroize(nonceBytes, sizeof nonceBytes);
+    if (eekWrap == nil || wrapStatus != AncPrivateVaultEekWrapStatusOK) {
+      SetStatus(status,
+                AncPrivateVaultEndpointRemovalBuilderStatusCryptoFailed);
+      return nil;
+    }
+    [eekWraps addObject:eekWrap];
   }
 
   uint8_t plaintext[48] = {0}, ciphertext[64] = {0};
@@ -283,7 +359,7 @@ AncPrivateVaultPreparedEndpointRemoval *AncPrivateVaultBuildEndpointRemoval(
   }
   SetStatus(status, AncPrivateVaultEndpointRemovalBuilderStatusOK);
   return [[AncPrivateVaultPreparedEndpointRemoval alloc]
-      initPrivateWithEntry:entry wrap:wrap
+      initPrivateWithEntry:entry wrap:wrap eekWraps:eekWraps
                 transcript:replay.state.membershipHash
                  nextState:replay.state];
 }
