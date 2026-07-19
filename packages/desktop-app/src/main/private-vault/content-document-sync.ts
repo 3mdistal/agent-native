@@ -83,29 +83,14 @@ export class PrivateVaultContentSync {
 
     const candidates = new Map<string, PrivateVaultLocalManifestHead>();
     for (const object of manifestObjects) {
-      if (object.latestRevision.revision !== 1)
-        throw new PrivateVaultContentSyncError();
-      const opened = await this.#gateway.open({
+      const head = await this.#openManifest(
         vaultId,
-        objectId: object.objectId,
-        revisionId: object.latestRevision.revisionId,
-      });
-      try {
-        if (opened.contentType !== PRIVATE_VAULT_MANIFEST_CONTENT_TYPE)
-          throw new PrivateVaultContentSyncError();
-        const manifest = decodePrivateVaultContentManifest(opened.plaintext);
-        if (manifest.vaultId !== vaultId)
-          throw new PrivateVaultContentSyncError();
-        const head = {
-          version: 1 as const,
-          objectId: object.objectId,
-          revisionId: object.latestRevision.revisionId,
-          manifest,
-        };
-        candidates.set(coordinate(head), head);
-      } finally {
-        opened.plaintext.fill(0);
-      }
+        object.objectId,
+        object.latestRevision.revisionId,
+      );
+      if (head.manifest.generation !== object.latestRevision.revision)
+        throw new PrivateVaultContentSyncError();
+      candidates.set(coordinate(head), head);
     }
 
     const highestGeneration = Math.max(
@@ -116,7 +101,11 @@ export class PrivateVaultContentSync {
     );
     if (highest.length !== 1) throw new PrivateVaultContentSyncError();
     const selected = highest[0];
-    const selectedChain = this.#verifiedChain(selected, candidates);
+    const selectedChain = await this.#verifiedChain(
+      vaultId,
+      selected,
+      candidates,
+    );
 
     const local = await this.#index.readManifest(vaultId);
     if (local) {
@@ -169,15 +158,40 @@ export class PrivateVaultContentSync {
     return selected;
   }
 
-  #verifiedChain(
+  async #openManifest(
+    vaultId: string,
+    objectId: string,
+    revisionId: string,
+  ): Promise<PrivateVaultLocalManifestHead> {
+    const opened = await this.#gateway.open({ vaultId, objectId, revisionId });
+    try {
+      if (opened.contentType !== PRIVATE_VAULT_MANIFEST_CONTENT_TYPE)
+        throw new PrivateVaultContentSyncError();
+      const manifest = decodePrivateVaultContentManifest(opened.plaintext);
+      if (manifest.vaultId !== vaultId)
+        throw new PrivateVaultContentSyncError();
+      return Object.freeze({
+        version: 1 as const,
+        objectId,
+        revisionId,
+        manifest,
+      });
+    } finally {
+      opened.plaintext.fill(0);
+    }
+  }
+
+  async #verifiedChain(
+    vaultId: string,
     selected: PrivateVaultLocalManifestHead,
-    candidates: ReadonlyMap<string, PrivateVaultLocalManifestHead>,
-  ): Map<string, PrivateVaultLocalManifestHead> {
+    candidates: Map<string, PrivateVaultLocalManifestHead>,
+  ): Promise<Map<string, PrivateVaultLocalManifestHead>> {
     const chain = new Map<string, PrivateVaultLocalManifestHead>();
     let current = selected;
     while (true) {
       const key = coordinate(current);
-      if (chain.has(key)) throw new PrivateVaultContentSyncError();
+      if (chain.has(key) || chain.size >= MAXIMUM_MANIFEST_CANDIDATES)
+        throw new PrivateVaultContentSyncError();
       chain.set(key, current);
       const previous = current.manifest.previousManifest;
       if (current.manifest.generation === 1) {
@@ -185,11 +199,18 @@ export class PrivateVaultContentSync {
         return chain;
       }
       if (!previous) throw new PrivateVaultContentSyncError();
-      const parent = candidates.get(coordinate(previous));
-      if (
-        !parent ||
-        parent.manifest.generation !== current.manifest.generation - 1
-      )
+      if (previous.objectId !== selected.objectId)
+        throw new PrivateVaultContentSyncError();
+      let parent = candidates.get(coordinate(previous));
+      if (!parent) {
+        parent = await this.#openManifest(
+          vaultId,
+          previous.objectId,
+          previous.revisionId,
+        );
+        candidates.set(coordinate(parent), parent);
+      }
+      if (parent.manifest.generation !== current.manifest.generation - 1)
         throw new PrivateVaultContentSyncError();
       current = parent;
     }

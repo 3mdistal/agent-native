@@ -19,7 +19,6 @@ const documentId = "22".repeat(16);
 const documentRevisionId = "33".repeat(32);
 const firstManifestId = "44".repeat(16);
 const firstManifestRevisionId = "55".repeat(32);
-const secondManifestId = "66".repeat(16);
 const secondManifestRevisionId = "77".repeat(32);
 
 const document: PrivateVaultContentDocument = {
@@ -76,12 +75,7 @@ function harness(local: PrivateVaultLocalManifestHead | null = null) {
     {
       objectId: firstManifestId,
       objectType: "vault-manifest" as const,
-      latestRevision: { revision: 1, revisionId: firstManifestRevisionId },
-    },
-    {
-      objectId: secondManifestId,
-      objectType: "vault-manifest" as const,
-      latestRevision: { revision: 1, revisionId: secondManifestRevisionId },
+      latestRevision: { revision: 2, revisionId: secondManifestRevisionId },
     },
     {
       objectId: documentId,
@@ -106,7 +100,7 @@ function harness(local: PrivateVaultLocalManifestHead | null = null) {
       },
     ],
     [
-      `${secondManifestId}:${secondManifestRevisionId}`,
+      `${firstManifestId}:${secondManifestRevisionId}`,
       {
         contentType: PRIVATE_VAULT_MANIFEST_CONTENT_TYPE,
         plaintext: encodePrivateVaultContentManifest(second),
@@ -145,7 +139,7 @@ describe("PrivateVaultContentSync", () => {
       vaultId,
     );
     expect(result).toMatchObject({
-      objectId: secondManifestId,
+      objectId: firstManifestId,
       revisionId: secondManifestRevisionId,
       manifest: { generation: 2 },
     });
