@@ -649,6 +649,63 @@ describe("Private Vault authenticated rotation append", () => {
       healthState: "healthy",
       publicIdentityJson: hostedIdentity(fourth),
     });
+    await getDb()
+      .update(schema.contentEncryptedVaultEndpoints)
+      .set({ endpointState: "online" })
+      .where(eq(schema.contentEncryptedVaultEndpoints.endpointId, THIRD_ID));
+    const corruptRevocationRetryProof = await createEndpointRequestProof({
+      vaultId: VAULT_ID,
+      endpointId: OWNER_ID,
+      method: "POST",
+      path: "/api/private-vault/control-log/append",
+      body,
+      issuedAt: rotation.createdAt,
+      nonce: "d1".repeat(16),
+      signingPrivateKey: ownerSigning.privateKey,
+    });
+    await expect(
+      appendRotation({
+        body,
+        proof: corruptRevocationRetryProof,
+        now: new Date(requestTime.getTime() + 6_000),
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    await getDb()
+      .update(schema.contentEncryptedVaultEndpoints)
+      .set({
+        endpointState: "revoked",
+        healthState: "unknown",
+        publicIdentityJson: JSON.stringify({
+          algorithmId: "anc/v1-control-log-revoked",
+          publicIdentity: "redacted",
+        }),
+      })
+      .where(eq(schema.contentEncryptedVaultEndpoints.endpointId, THIRD_ID));
+    await getDb()
+      .update(schema.contentEncryptedVaultEndpoints)
+      .set({ healthState: "degraded" })
+      .where(eq(schema.contentEncryptedVaultEndpoints.endpointId, FOURTH_ID));
+    const corruptReplacementRetryProof = await createEndpointRequestProof({
+      vaultId: VAULT_ID,
+      endpointId: OWNER_ID,
+      method: "POST",
+      path: "/api/private-vault/control-log/append",
+      body,
+      issuedAt: rotation.createdAt,
+      nonce: "d2".repeat(16),
+      signingPrivateKey: ownerSigning.privateKey,
+    });
+    await expect(
+      appendRotation({
+        body,
+        proof: corruptReplacementRetryProof,
+        now: new Date(requestTime.getTime() + 7_000),
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    await getDb()
+      .update(schema.contentEncryptedVaultEndpoints)
+      .set({ healthState: "healthy" })
+      .where(eq(schema.contentEncryptedVaultEndpoints.endpointId, FOURTH_ID));
 
     const committedN =
       await controlLog.privateVaultControlLogService.loadVerifiedState(scope);

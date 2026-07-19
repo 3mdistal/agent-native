@@ -1045,6 +1045,86 @@ export async function appendPrivateVaultControlLogRotation(input: {
     ) {
       throw new PrivateVaultControlLogAppendError("conflict");
     }
+    const removedMembers = signerAuthority.activeMembers.filter((member) =>
+      rotation.removedEndpointIds.includes(member.endpointId),
+    );
+    if (removedMembers.length !== rotation.removedEndpointIds.length) {
+      throw new PrivateVaultControlLogAppendError("conflict");
+    }
+    if (rotation.removedEndpointIds.length > 0) {
+      const revokedRows = await getDb()
+        .select({
+          endpointId: schema.contentEncryptedVaultEndpoints.endpointId,
+          endpointState: schema.contentEncryptedVaultEndpoints.endpointState,
+          publicIdentityJson:
+            schema.contentEncryptedVaultEndpoints.publicIdentityJson,
+          healthState: schema.contentEncryptedVaultEndpoints.healthState,
+        })
+        .from(schema.contentEncryptedVaultEndpoints)
+        .where(
+          and(
+            eq(
+              schema.contentEncryptedVaultEndpoints.ownerEmail,
+              scope.ownerEmail,
+            ),
+            eq(schema.contentEncryptedVaultEndpoints.orgId, scope.orgId),
+            eq(schema.contentEncryptedVaultEndpoints.vaultId, scope.vaultId),
+            inArray(
+              schema.contentEncryptedVaultEndpoints.endpointId,
+              rotation.removedEndpointIds,
+            ),
+          ),
+        );
+      if (
+        revokedRows.length !== removedMembers.length ||
+        revokedRows.some(
+          (row) =>
+            row.endpointState !== "revoked" ||
+            row.healthState !== "unknown" ||
+            row.publicIdentityJson !== REVOKED_ENDPOINT_PUBLIC_IDENTITY_JSON,
+        )
+      ) {
+        throw new PrivateVaultControlLogAppendError("conflict");
+      }
+    }
+    if (rotation.ceremonyKind === "broker_replacement") {
+      const priorEndpointIds = new Set(
+        signerAuthority.activeMembers.map((member) => member.endpointId),
+      );
+      const replacementMembers = rotation.activeMembers.filter(
+        (member) => !priorEndpointIds.has(member.endpointId),
+      );
+      const replacement = replacementMembers[0];
+      if (
+        replacementMembers.length !== 1 ||
+        !replacement ||
+        replacement.role !== "broker"
+      ) {
+        throw new PrivateVaultControlLogAppendError("conflict");
+      }
+      const [replacementRow] = await getDb()
+        .select()
+        .from(schema.contentEncryptedVaultEndpoints)
+        .where(
+          eq(
+            schema.contentEncryptedVaultEndpoints.endpointId,
+            replacement.endpointId,
+          ),
+        )
+        .limit(1);
+      if (
+        !replacementRow ||
+        replacementRow.ownerEmail !== scope.ownerEmail ||
+        replacementRow.orgId !== scope.orgId ||
+        replacementRow.vaultId !== scope.vaultId ||
+        replacementRow.endpointState !== "online" ||
+        replacementRow.healthState !== "healthy" ||
+        replacementRow.publicIdentityJson !==
+          endpointPublicIdentityJson(replacement)
+      ) {
+        throw new PrivateVaultControlLogAppendError("conflict");
+      }
+    }
     return verifiedRotationReceipt({
       scope,
       signedEntry: request.signedEntry,
