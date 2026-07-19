@@ -1606,6 +1606,42 @@ const runContentMigrations = runMigrations(
         ON content_encrypted_vault_broker_replacement_transcripts
         (owner_email, account_id, org_id, workspace_id, vault_id, phase, expires_at)`,
     },
+    {
+      version: 115,
+      name: "content-private-vault-rotation-evidence-artifacts",
+      sql: `CREATE TABLE IF NOT EXISTS content_encrypted_vault_rotation_evidence_artifacts (
+        id TEXT PRIMARY KEY,
+        owner_email TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        org_id TEXT NOT NULL DEFAULT '',
+        workspace_id TEXT NOT NULL,
+        vault_id TEXT NOT NULL,
+        ceremony_id TEXT NOT NULL,
+        format_version INTEGER NOT NULL DEFAULT 1,
+        artifact_kind TEXT NOT NULL,
+        artifact_key TEXT NOT NULL,
+        recipient_endpoint_id TEXT,
+        evidence_bytes_base64url TEXT,
+        eek_wrap_bytes_base64url TEXT,
+        expected_recipient_count INTEGER,
+        phase TEXT,
+        terminal_at TEXT,
+        purge_eligible_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (vault_id, owner_email, org_id)
+          REFERENCES content_encrypted_vaults(vault_id, owner_email, org_id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS content_encrypted_vault_rotation_evidence_artifacts_scope_unique
+        ON content_encrypted_vault_rotation_evidence_artifacts
+        (owner_email, account_id, org_id, workspace_id, vault_id, ceremony_id, artifact_kind, artifact_key);
+      CREATE INDEX IF NOT EXISTS content_encrypted_vault_rotation_evidence_artifacts_ceremony_idx
+        ON content_encrypted_vault_rotation_evidence_artifacts
+        (owner_email, account_id, org_id, workspace_id, vault_id, ceremony_id);
+      CREATE INDEX IF NOT EXISTS content_encrypted_vault_rotation_evidence_artifacts_retention_idx
+        ON content_encrypted_vault_rotation_evidence_artifacts
+        (phase, purge_eligible_at)`,
+    },
   ],
   { table: "content_migrations" },
 );

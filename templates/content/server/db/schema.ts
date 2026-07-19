@@ -1341,6 +1341,64 @@ export const contentEncryptedVaultBrokerReplacementTranscripts = table(
   ],
 );
 
+/**
+ * Small, public, opaque artifacts exchanged during one attended epoch
+ * rotation. One scoped ceremony row and its artifact rows share this table so
+ * recipient uniqueness and retention can be enforced without storing keys,
+ * plaintext, or large payloads in SQL.
+ */
+export const contentEncryptedVaultRotationEvidenceArtifacts = table(
+  "content_encrypted_vault_rotation_evidence_artifacts",
+  {
+    id: text("id").primaryKey(),
+    ownerEmail: text("owner_email").notNull(),
+    accountId: text("account_id").notNull(),
+    orgId: text("org_id").notNull().default(""),
+    workspaceId: text("workspace_id").notNull(),
+    vaultId: text("vault_id").notNull(),
+    ceremonyId: text("ceremony_id").notNull(),
+    formatVersion: integer("format_version").notNull().default(1),
+    artifactKind: text("artifact_kind").notNull(),
+    artifactKey: text("artifact_key").notNull(),
+    recipientEndpointId: text("recipient_endpoint_id"),
+    evidenceBytesBase64url: text("evidence_bytes_base64url"),
+    eekWrapBytesBase64url: text("eek_wrap_bytes_base64url"),
+    expectedRecipientCount: integer("expected_recipient_count"),
+    phase: text("phase"),
+    terminalAt: text("terminal_at"),
+    purgeEligibleAt: text("purge_eligible_at"),
+    createdAt: text("created_at").notNull().default(now()),
+    updatedAt: text("updated_at").notNull().default(now()),
+  },
+  (artifact) => [
+    uniqueIndex(
+      "content_encrypted_vault_rotation_evidence_artifacts_scope_unique",
+    ).on(
+      artifact.ownerEmail,
+      artifact.accountId,
+      artifact.orgId,
+      artifact.workspaceId,
+      artifact.vaultId,
+      artifact.ceremonyId,
+      artifact.artifactKind,
+      artifact.artifactKey,
+    ),
+    index(
+      "content_encrypted_vault_rotation_evidence_artifacts_ceremony_idx",
+    ).on(
+      artifact.ownerEmail,
+      artifact.accountId,
+      artifact.orgId,
+      artifact.workspaceId,
+      artifact.vaultId,
+      artifact.ceremonyId,
+    ),
+    index(
+      "content_encrypted_vault_rotation_evidence_artifacts_retention_idx",
+    ).on(artifact.phase, artifact.purgeEligibleAt),
+  ],
+);
+
 export const contentEncryptedVaultJobResults = table(
   "content_encrypted_vault_job_results",
   {
