@@ -1,3 +1,8 @@
+import {
+  ancV1BytesToHex,
+  ancV1Hash,
+  encodeEndpointRequestUnsignedProof,
+} from "@agent-native/core/e2ee";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -30,6 +35,213 @@ function response(
 }
 
 describe("Private Vault Content object transport", () => {
+  it("authorizes a manifest CAS over the exact hosted body and prior head", async () => {
+    const url = "https://content.example/api/private-vault/objects";
+    const endpointId = "40".repeat(16);
+    const ciphertext = Uint8Array.of(1, 2, 3, 4);
+    const priorManifestHead = {
+      objectId: coordinate.objectId,
+      revisionId: "50".repeat(32),
+      generation: 2,
+    };
+    const metadata = {
+      ...coordinate,
+      objectType: "vault-manifest",
+      algorithmId: "anc/v1",
+      revision: 3,
+      epoch: 7,
+      parentRevisionIds: [priorManifestHead.revisionId],
+      ciphertextByteLength: 4,
+    };
+    const signEndpointRequest = vi.fn(async () => ({
+      version: 1 as const,
+      suite: "anc/v1" as const,
+      operation: "signEndpointRequest" as const,
+      state: "signed" as const,
+      signature: Uint8Array.from({ length: 64 }, () => 0x77),
+    }));
+    const fetch = vi.fn(async (_url: string, init: RequestInit) => {
+      const headers = init.headers as Record<string, string>;
+      expect(headers["X-ANC-Prior-Manifest-Generation"]).toBe("2");
+      expect(headers["X-ANC-Prior-Manifest-Object-Id"]).toBe(
+        priorManifestHead.objectId,
+      );
+      expect(headers["X-ANC-Prior-Manifest-Revision-Id"]).toBe(
+        priorManifestHead.revisionId,
+      );
+      const proof = JSON.parse(
+        Buffer.from(headers["X-Anc-Endpoint-Proof"]!, "base64url").toString(
+          "utf8",
+        ),
+      );
+      expect(proof).toMatchObject({
+        vaultId: coordinate.vaultId,
+        endpointId,
+        method: "POST",
+        path: "/api/private-vault/objects",
+        issuedAt: "2026-07-19T12:00:00.000Z",
+        nonce: "60".repeat(16),
+      });
+      return response(url, JSON.stringify(metadata), {
+        "Content-Type": "application/json",
+      });
+    });
+    const transport = new PrivateVaultContentObjectTransport({
+      session: { fetch },
+      origin: "https://content.example",
+      native: {
+        listVaultMembers: vi.fn(async () => ({
+          version: 1 as const,
+          suite: "anc/v1" as const,
+          operation: "list_members" as const,
+          state: "listed" as const,
+          vaultId: coordinate.vaultId,
+          members: [
+            {
+              endpointId,
+              role: "endpoint" as const,
+              unattended: false,
+              current: true,
+            },
+          ],
+        })),
+        signEndpointRequest,
+      },
+      now: () => new Date("2026-07-19T12:00:00.000Z"),
+      nonce: () => "60".repeat(16),
+    });
+    await expect(
+      transport.put({
+        coordinate,
+        objectType: "vault-manifest",
+        revision: 3,
+        epoch: 7,
+        parentRevisionIds: [priorManifestHead.revisionId],
+        ciphertext,
+        priorManifestHead,
+      }),
+    ).resolves.toEqual(metadata);
+
+    const authorizationBody = Uint8Array.from(
+      Buffer.from(
+        JSON.stringify([
+          "anc/v1/private-vault-manifest-write",
+          coordinate.vaultId,
+          coordinate.objectId,
+          coordinate.revisionId,
+          3,
+          "vault-manifest",
+          "anc/v1",
+          7,
+          [priorManifestHead.revisionId],
+          4,
+          priorManifestHead.objectId,
+          priorManifestHead.revisionId,
+          2,
+          "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a",
+        ]),
+      ),
+    );
+    expect(signEndpointRequest).toHaveBeenCalledWith({
+      version: 1,
+      suite: "anc/v1",
+      operation: "signEndpointRequest",
+      unsignedProof: encodeEndpointRequestUnsignedProof({
+        version: 1,
+        suite: "anc/v1",
+        type: "endpoint_request",
+        vaultId: coordinate.vaultId,
+        endpointId,
+        method: "POST",
+        path: "/api/private-vault/objects",
+        bodyHash: ancV1BytesToHex(
+          await ancV1Hash("endpoint-request-body", authorizationBody),
+        ),
+        issuedAt: "2026-07-19T12:00:00.000Z",
+        nonce: "60".repeat(16),
+      }),
+    });
+  });
+
+  it("fails manifest writes closed without an exact prior head and native signer", async () => {
+    const base = {
+      coordinate,
+      objectType: "vault-manifest" as const,
+      revision: 1,
+      epoch: 1,
+      ciphertext: Uint8Array.of(1),
+    };
+    const unsigned = new PrivateVaultContentObjectTransport({
+      session: { fetch: vi.fn() },
+      origin: "https://content.example",
+    });
+    await expect(
+      unsigned.put({ ...base, priorManifestHead: null }),
+    ).rejects.toBeInstanceOf(PrivateVaultContentObjectTransportError);
+    await expect(unsigned.put(base)).rejects.toBeInstanceOf(
+      PrivateVaultContentObjectTransportError,
+    );
+  });
+
+  it("surfaces a hosted stale-prior conflict without retrying another head", async () => {
+    const fetch = vi.fn(async () => {
+      const value = new Response("conflict", { status: 409 });
+      Object.defineProperties(value, {
+        url: {
+          value: "https://content.example/api/private-vault/objects",
+        },
+        redirected: { value: false },
+      });
+      return value;
+    });
+    const transport = new PrivateVaultContentObjectTransport({
+      session: { fetch },
+      origin: "https://content.example",
+      native: {
+        listVaultMembers: vi.fn(async () => ({
+          version: 1 as const,
+          suite: "anc/v1" as const,
+          operation: "list_members" as const,
+          state: "listed" as const,
+          vaultId: coordinate.vaultId,
+          members: [
+            {
+              endpointId: "40".repeat(16),
+              role: "endpoint" as const,
+              unattended: false,
+              current: true,
+            },
+          ],
+        })),
+        signEndpointRequest: vi.fn(async () => ({
+          version: 1 as const,
+          suite: "anc/v1" as const,
+          operation: "signEndpointRequest" as const,
+          state: "signed" as const,
+          signature: Uint8Array.from({ length: 64 }, () => 0x77),
+        })),
+      },
+      now: () => new Date("2026-07-19T12:00:00.000Z"),
+      nonce: () => "60".repeat(16),
+    });
+    await expect(
+      transport.put({
+        coordinate,
+        objectType: "vault-manifest",
+        revision: 3,
+        epoch: 7,
+        parentRevisionIds: ["50".repeat(32)],
+        ciphertext: Uint8Array.of(1),
+        priorManifestHead: {
+          objectId: coordinate.objectId,
+          revisionId: "50".repeat(32),
+          generation: 2,
+        },
+      }),
+    ).rejects.toBeInstanceOf(PrivateVaultContentObjectTransportError);
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
   it("uploads only one bounded opaque revision through the authenticated session", async () => {
     const url = "https://content.example/api/private-vault/objects";
     const metadata = {

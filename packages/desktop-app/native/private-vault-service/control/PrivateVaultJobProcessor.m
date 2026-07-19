@@ -52,7 +52,16 @@ static BOOL LowerHexText(NSString *value, NSUInteger length) {
   return YES;
 }
 
-static BOOL BrokerPath(NSString *value) {
+typedef NS_ENUM(NSInteger, AncPrivateVaultEndpointRequestRole) {
+  AncPrivateVaultEndpointRequestRoleInvalid = 0,
+  AncPrivateVaultEndpointRequestRoleBroker = 1,
+  AncPrivateVaultEndpointRequestRoleAttendedEndpoint = 2,
+};
+
+static AncPrivateVaultEndpointRequestRole EndpointRequestRoleForPath(
+    NSString *value) {
+  if ([value isEqualToString:@"/api/private-vault/objects"])
+    return AncPrivateVaultEndpointRequestRoleAttendedEndpoint;
   static NSSet<NSString *> *paths;
   static dispatch_once_t once;
   dispatch_once(&once, ^{
@@ -65,7 +74,9 @@ static BOOL BrokerPath(NSString *value) {
       @"/api/private-vault/jobs/broker/disclosure",
     ]];
   });
-  return [paths containsObject:value];
+  return [paths containsObject:value]
+             ? AncPrivateVaultEndpointRequestRoleBroker
+             : AncPrivateVaultEndpointRequestRoleInvalid;
 }
 
 static BOOL EndpointProofTimestamp(NSString *value) {
@@ -805,6 +816,8 @@ static BOOL IsContentActionName(NSString *value) {
     NSString *endpointId =
         JobField(map, 5, AncPrivateVaultCanonicalTypeText).textValue;
     NSString *path = JobField(map, 7, AncPrivateVaultCanonicalTypeText).textValue;
+    AncPrivateVaultEndpointRequestRole requiredRole =
+        EndpointRequestRoleForPath(path);
     NSString *nonce = JobField(map, 10, AncPrivateVaultCanonicalTypeText).textValue;
     if (canonicalStatus != AncPrivateVaultCanonicalStatusOK ||
         map.count != keys.count ||
@@ -817,7 +830,7 @@ static BOOL IsContentActionName(NSString *value) {
         !LowerHexText(vaultId, 32) || !LowerHexText(endpointId, 32) ||
         ![JobField(map, 6, AncPrivateVaultCanonicalTypeText).textValue
             isEqualToString:@"POST"] ||
-        !BrokerPath(path) ||
+        requiredRole == AncPrivateVaultEndpointRequestRoleInvalid ||
         JobField(map, 8, AncPrivateVaultCanonicalTypeBytes).bytesValue.length != 32 ||
         !EndpointProofTimestamp(
             JobField(map, 9, AncPrivateVaultCanonicalTypeText).textValue) ||
@@ -838,17 +851,22 @@ static BOOL IsContentActionName(NSString *value) {
       status = AncPrivateVaultJobProcessorStatusStaleAuthority;
       return;
     }
-    AncPrivateVaultAuthorityMember *broker = nil;
+    AncPrivateVaultAuthorityMember *signer = nil;
     NSUInteger count = 0;
     for (AncPrivateVaultAuthorityMember *member in
          checkpoint.snapshot.activeMembers) {
-      if ([member.role isEqualToString:@"broker"] && member.unattended) {
-        broker = member;
+      BOOL authorizedRole =
+          (requiredRole == AncPrivateVaultEndpointRequestRoleBroker &&
+           [member.role isEqualToString:@"broker"] && member.unattended) ||
+          (requiredRole ==
+               AncPrivateVaultEndpointRequestRoleAttendedEndpoint &&
+           [member.role isEqualToString:@"endpoint"] && !member.unattended);
+      if (authorizedRole && [member.endpointId isEqualToString:endpointId]) {
+        signer = member;
         count += 1;
       }
     }
-    if (count != 1 || ![broker.endpointId isEqualToString:endpointId] ||
-        broker.signingPublicKey.length != 32) {
+    if (count != 1 || signer.signingPublicKey.length != 32) {
       status = AncPrivateVaultJobProcessorStatusUnauthorized;
       return;
     }
@@ -857,7 +875,10 @@ static BOOL IsContentActionName(NSString *value) {
                     const AncPrivateVaultCustodySecretInputs *secrets) {
           if (snapshot == NULL || secrets == NULL ||
               secrets->signing_seed == NULL ||
-              snapshot->role != ANC_PV_CUSTODY_ROLE_BROKER)
+              (([signer.role isEqualToString:@"broker"] &&
+                snapshot->role != ANC_PV_CUSTODY_ROLE_BROKER) ||
+               ([signer.role isEqualToString:@"endpoint"] &&
+                snapshot->role != ANC_PV_CUSTODY_ROLE_ENDPOINT)))
             return NO;
           NSString *localEndpoint = [[NSString alloc]
               initWithBytes:snapshot->endpoint_id
@@ -871,7 +892,7 @@ static BOOL IsContentActionName(NSString *value) {
               anc_pv_ed25519_seed_keypair(publicKey, privateKey,
                                           secrets->signing_seed) ==
                   ANC_PV_CRYPTO_OK &&
-              anc_pv_memcmp(publicKey, broker.signingPublicKey.bytes, 32) ==
+              anc_pv_memcmp(publicKey, signer.signingPublicKey.bytes, 32) ==
                   ANC_PV_CRYPTO_OK &&
               anc_pv_memcmp(publicKey, snapshot->signing_public_key, 32) ==
                   ANC_PV_CRYPTO_OK;

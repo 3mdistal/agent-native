@@ -112,6 +112,11 @@ export interface PrivateVaultMigrationObjectGateway {
       | typeof PRIVATE_VAULT_MANIFEST_CONTENT_TYPE;
     readonly plaintext: Uint8Array;
     readonly parentRevisionIds: readonly string[];
+    readonly priorManifestHead?: {
+      readonly objectId: string;
+      readonly revisionId: string;
+      readonly generation: number;
+    } | null;
   }): Promise<{
     readonly revisionId: string;
     readonly ciphertextHash: string;
@@ -304,6 +309,7 @@ export class PrivateVaultContentMigrationRuntime {
       fail();
     const manifestObjectId = snapshot.ledger.cutoverManifestObjectId;
     const current = await this.#index.readManifest(vaultId);
+    if (current && current.objectId !== manifestObjectId) fail();
     const existing = current
       ? await this.#structuredEntries(vaultId, current.manifest)
       : [];
@@ -347,10 +353,17 @@ export class PrivateVaultContentMigrationRuntime {
       sealed = await this.#objects.sealAndUpload({
         vaultId,
         objectId: manifestObjectId,
-        revision: 1,
+        revision: manifest.generation,
         contentType: PRIVATE_VAULT_MANIFEST_CONTENT_TYPE,
         plaintext,
-        parentRevisionIds: [],
+        parentRevisionIds: current ? [current.revisionId] : [],
+        priorManifestHead: current
+          ? {
+              objectId: current.objectId,
+              revisionId: current.revisionId,
+              generation: current.manifest.generation,
+            }
+          : null,
       });
     } finally {
       plaintext.fill(0);

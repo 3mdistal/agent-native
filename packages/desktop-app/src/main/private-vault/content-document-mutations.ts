@@ -29,6 +29,11 @@ export interface PrivateVaultContentObjectGateway {
       | typeof PRIVATE_VAULT_MANIFEST_CONTENT_TYPE;
     readonly plaintext: Uint8Array;
     readonly parentRevisionIds: readonly string[];
+    readonly priorManifestHead?: {
+      readonly objectId: string;
+      readonly revisionId: string;
+      readonly generation: number;
+    } | null;
   }): Promise<{ readonly revisionId: string }>;
 }
 
@@ -327,16 +332,29 @@ export class PrivateVaultContentMutations {
     vaultId: string,
     manifest: PrivateVaultContentManifest,
   ): Promise<PrivateVaultLocalManifestHead> {
-    const objectId = this.#objectId();
+    const current = await this.#index.readManifest(vaultId);
+    const priorManifestHead = current
+      ? {
+          objectId: current.objectId,
+          revisionId: current.revisionId,
+          generation: current.manifest.generation,
+        }
+      : null;
+    if (manifest.generation !== (priorManifestHead?.generation ?? 0) + 1)
+      throw new PrivateVaultContentMutationError();
+    const objectId = priorManifestHead?.objectId ?? this.#objectId();
     const plaintext = encodePrivateVaultContentManifest(manifest);
     try {
       const { revisionId } = await this.#gateway.sealAndUpload({
         vaultId,
         objectId,
-        revision: 1,
+        revision: manifest.generation,
         contentType: PRIVATE_VAULT_MANIFEST_CONTENT_TYPE,
         plaintext,
-        parentRevisionIds: [],
+        parentRevisionIds: priorManifestHead
+          ? [priorManifestHead.revisionId]
+          : [],
+        priorManifestHead,
       });
       return Object.freeze({
         version: 1,

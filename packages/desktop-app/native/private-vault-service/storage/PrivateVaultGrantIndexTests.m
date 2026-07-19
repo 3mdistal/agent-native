@@ -63,6 +63,8 @@ static NSData *Pattern(uint8_t byte, NSUInteger length) {
 
 @interface TestRepository : NSObject <AncPrivateVaultSessionCustodyRepository>
 @property(nonatomic) TestHandle *handle;
+@property(nonatomic) AncPrivateVaultCustodyRole role;
+@property(nonatomic) NSString *endpointId;
 @end
 @implementation TestRepository
 - (NSInteger)readVaultId:(NSString *)vaultId
@@ -72,14 +74,13 @@ static NSData *Pattern(uint8_t byte, NSUInteger length) {
   snapshot->record_version = ANC_PV_CUSTODY_VERSION;
   snapshot->authority_anchor_present = 1;
   snapshot->lifecycle = ANC_PV_CUSTODY_LIFECYCLE_ACTIVE;
-  snapshot->role = ANC_PV_CUSTODY_ROLE_BROKER;
+  snapshot->role = self.role;
   snapshot->custody_generation = 2;
   snapshot->active_epoch = 1;
   NSData *vault = [vaultId dataUsingEncoding:NSUTF8StringEncoding];
   memcpy(snapshot->vault_id, vault.bytes, vault.length);
   snapshot->vault_id_length = vault.length;
-  NSData *endpoint = [@"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
-      dataUsingEncoding:NSUTF8StringEncoding];
+  NSData *endpoint = [self.endpointId dataUsingEncoding:NSUTF8StringEncoding];
   memcpy(snapshot->endpoint_id, endpoint.bytes, endpoint.length);
   snapshot->endpoint_id_length = endpoint.length;
   uint8_t seed[32] = {0};
@@ -130,6 +131,7 @@ static NSData *Pattern(uint8_t byte, NSUInteger length) {
 
 @interface TestAuthorityStore : NSObject
 @property(nonatomic) TestAuthorityCheckpoint *checkpoint;
+@property(nonatomic) NSString *expectedVaultId;
 @end
 @implementation TestAuthorityStore
 - (AncPrivateVaultAuthorityStoreStatus)
@@ -137,6 +139,9 @@ static NSData *Pattern(uint8_t byte, NSUInteger length) {
           error:(NSError **)error {
   (void)vaultId;
   (void)error;
+  if (self.expectedVaultId != nil &&
+      ![self.expectedVaultId isEqualToString:vaultId])
+    return AncPrivateVaultAuthorityStoreStatusNotFound;
   *checkpoint = self.checkpoint;
   return AncPrivateVaultAuthorityStoreStatusOK;
 }
@@ -200,6 +205,8 @@ int main(void) {
                                                             error:nil]);
     TestRepository *repository = [TestRepository new];
     repository.handle = [TestHandle new];
+    repository.role = ANC_PV_CUSTODY_ROLE_BROKER;
+    repository.endpointId = @"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
     AncPrivateVaultSession *session =
         [[AncPrivateVaultSession alloc] initWithRepository:repository];
     assert([session unlockVaultId:kVaultId] == AncPrivateVaultSessionStatusOK);
@@ -456,16 +463,23 @@ int main(void) {
     anc_pv_zeroize(brokerSigningPublic, sizeof brokerSigningPublic);
     anc_pv_zeroize(brokerSigningPrivate, sizeof brokerSigningPrivate);
     broker.keyAgreementPublicKey = brokerBox;
+    TestAuthorityMember *attended = [TestAuthorityMember new];
+    attended.endpointId = @"0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c";
+    attended.role = @"endpoint";
+    attended.unattended = NO;
+    attended.signingPublicKey = broker.signingPublicKey;
+    attended.keyAgreementPublicKey = brokerBox;
     TestAuthoritySnapshot *authoritySnapshot = [TestAuthoritySnapshot new];
     authoritySnapshot.verifiedAtMs = 1721111200ULL * 1000;
     authoritySnapshot.signedAtMs = 1721111200ULL * 1000;
     authoritySnapshot.freshnessMode = @"endpoint_witnessed";
-    authoritySnapshot.activeMembers = @[requester, broker];
+    authoritySnapshot.activeMembers = @[requester, broker, attended];
     TestAuthorityCheckpoint *authorityCheckpoint =
         [TestAuthorityCheckpoint new];
     authorityCheckpoint.snapshot = authoritySnapshot;
     TestAuthorityStore *authorityStore = [TestAuthorityStore new];
     authorityStore.checkpoint = authorityCheckpoint;
+    authorityStore.expectedVaultId = kVaultId;
     AncPrivateVaultResultSpool *resultSpool =
         [[AncPrivateVaultResultSpool alloc]
             initWithStateRootURL:[NSURL fileURLWithPath:temporary]];
@@ -536,6 +550,92 @@ int main(void) {
                                  proofMessage.length,
                                  broker.signingPublicKey.bytes) ==
            ANC_PV_CRYPTO_OK);
+    NSData *(^ManifestProof)(NSString *, NSString *, NSString *) =
+        ^NSData *(NSString *vaultId, NSString *endpointId, NSString *path) {
+          AncPrivateVaultCanonicalStatus status;
+          NSData *proof = AncPrivateVaultCanonicalEncode(
+              [AncPrivateVaultCanonicalValue map:@{
+                @1 : [AncPrivateVaultCanonicalValue text:@"anc/v1"],
+                @2 : [AncPrivateVaultCanonicalValue integer:1],
+                @3 : [AncPrivateVaultCanonicalValue text:@"endpoint_request"],
+                @4 : [AncPrivateVaultCanonicalValue text:vaultId],
+                @5 : [AncPrivateVaultCanonicalValue text:endpointId],
+                @6 : [AncPrivateVaultCanonicalValue text:@"POST"],
+                @7 : [AncPrivateVaultCanonicalValue text:path],
+                @8 : [AncPrivateVaultCanonicalValue bytes:Pattern(0x56, 32)],
+                @9 : [AncPrivateVaultCanonicalValue
+                    text:@"2024-07-16T00:00:00.000Z"],
+                @10 : [AncPrivateVaultCanonicalValue
+                    text:@"67676767676767676767676767676767"],
+              }],
+              &status);
+          assert(status == AncPrivateVaultCanonicalStatusOK);
+          return proof;
+        };
+    TestRepository *endpointRepository = [TestRepository new];
+    endpointRepository.handle = [TestHandle new];
+    endpointRepository.role = ANC_PV_CUSTODY_ROLE_ENDPOINT;
+    endpointRepository.endpointId = attended.endpointId;
+    AncPrivateVaultSession *endpointSession =
+        [[AncPrivateVaultSession alloc] initWithRepository:endpointRepository];
+    assert([endpointSession unlockVaultId:kVaultId] ==
+           AncPrivateVaultSessionStatusOK);
+    AncPrivateVaultJobProcessor *endpointProcessor =
+        [[AncPrivateVaultJobProcessor alloc]
+            initWithSession:endpointSession
+              authorityStore:(AncPrivateVaultAuthorityStore *)authorityStore
+                  grantIndex:index
+                 resultSpool:resultSpool];
+    NSData *manifestProof = ManifestProof(
+        kVaultId, attended.endpointId, @"/api/private-vault/objects");
+    NSData *manifestSignature = nil;
+    assert([endpointProcessor signEndpointRequestProof:manifestProof
+                                             nowSeconds:1721111200
+                                                 result:&manifestSignature] ==
+               AncPrivateVaultJobProcessorStatusOK &&
+           manifestSignature.length == 64);
+    NSMutableData *manifestMessage = [NSMutableData
+        dataWithCapacity:sizeof proofDomain + manifestProof.length];
+    [manifestMessage appendBytes:proofDomain length:sizeof proofDomain];
+    [manifestMessage appendData:manifestProof];
+    assert(anc_pv_ed25519_verify(manifestSignature.bytes,
+                                 manifestMessage.bytes,
+                                 manifestMessage.length,
+                                 attended.signingPublicKey.bytes) ==
+           ANC_PV_CRYPTO_OK);
+    NSData *rejectedSignature = nil;
+    assert([processor signEndpointRequestProof:
+                          ManifestProof(kVaultId, broker.endpointId,
+                                        @"/api/private-vault/objects")
+                                     nowSeconds:1721111200
+                                         result:&rejectedSignature] ==
+               AncPrivateVaultJobProcessorStatusUnauthorized &&
+           rejectedSignature == nil);
+    assert([endpointProcessor signEndpointRequestProof:
+                                  ManifestProof(kVaultId, attended.endpointId,
+                                                @"/api/private-vault/object")
+                                             nowSeconds:1721111200
+                                                 result:&rejectedSignature] ==
+               AncPrivateVaultJobProcessorStatusInvalid &&
+           rejectedSignature == nil);
+    assert([endpointProcessor signEndpointRequestProof:
+                                  ManifestProof(
+                                      @"02020202020202020202020202020202",
+                                      attended.endpointId,
+                                      @"/api/private-vault/objects")
+                                             nowSeconds:1721111200
+                                                 result:&rejectedSignature] ==
+               AncPrivateVaultJobProcessorStatusStorageFailed &&
+           rejectedSignature == nil);
+    NSData *attendedSigningKey = attended.signingPublicKey;
+    attended.signingPublicKey = Pattern(0xaa, 32);
+    assert([endpointProcessor signEndpointRequestProof:manifestProof
+                                             nowSeconds:1721111200
+                                                 result:&rejectedSignature] ==
+               AncPrivateVaultJobProcessorStatusLocked &&
+           rejectedSignature == nil);
+    attended.signingPublicKey = attendedSigningKey;
+    assert([endpointSession lock] == AncPrivateVaultSessionStatusOK);
     NSData *authorizedJobHash = [authorizedJob.jobHash copy];
     assert([processor openJobEnvelope:semanticJob vaultId:kVaultId
                                 jobId:Pattern(0x06, 16)

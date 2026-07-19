@@ -7,6 +7,7 @@ import {
 import {
   PrivateVaultContentObjectTransport,
   type PrivateVaultContentObjectMetadata,
+  type PrivateVaultContentManifestHead,
   type PrivateVaultContentHostedObjectType,
 } from "./content-object-transport.js";
 import {
@@ -59,6 +60,7 @@ export class PrivateVaultContentObjectRuntime {
     readonly contentType?: ContentType;
     readonly plaintext: Uint8Array;
     readonly parentRevisionIds?: readonly string[];
+    readonly priorManifestHead?: PrivateVaultContentManifestHead | null;
   }): Promise<{
     readonly revisionId: string;
     readonly ciphertextHash: string;
@@ -90,6 +92,9 @@ export class PrivateVaultContentObjectRuntime {
         epoch: sealed.epoch,
         parentRevisionIds: input.parentRevisionIds,
         ciphertext: sealed.encodedRevision,
+        ...(contentType === PRIVATE_VAULT_MANIFEST_CONTENT_TYPE
+          ? { priorManifestHead: input.priorManifestHead }
+          : {}),
       });
       return Object.freeze({
         revisionId,

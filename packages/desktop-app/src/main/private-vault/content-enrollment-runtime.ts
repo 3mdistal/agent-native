@@ -52,7 +52,10 @@ export class PrivateVaultContentEnrollmentRuntime {
     const hosted = new PrivateVaultContentEnrollmentTransport(input);
     const manifest = new PrivateVaultContentEnrollmentManifestRevisionSource({
       index: createEncryptedContentIndexStore(),
-      transport: new PrivateVaultContentObjectTransport(input),
+      transport: new PrivateVaultContentObjectTransport({
+        ...input,
+        native: this.#native,
+      }),
       native: this.#native,
     });
     const roles = Object.freeze({
@@ -83,7 +86,10 @@ export class PrivateVaultContentEnrollmentRuntime {
     }
     const existing = byOrigin.get(input.origin);
     if (existing) return existing;
-    const objectTransport = new PrivateVaultContentObjectTransport(input);
+    const objectTransport = new PrivateVaultContentObjectTransport({
+      ...input,
+      native: this.#native,
+    });
     const manifest = new PrivateVaultContentEnrollmentManifestRevisionSource({
       index: createEncryptedContentIndexStore(),
       transport: objectTransport,

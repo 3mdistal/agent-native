@@ -457,8 +457,11 @@ export function createPrivateVaultContentRuntime(input: {
   archiveReader: PrivateVaultMigrationArchiveReader;
 }): PrivateVaultContentRuntime {
   const index = createEncryptedContentIndexStore();
-  const transport = new PrivateVaultContentObjectTransport(input);
   const native = createPrivateVaultNativeServiceClient();
+  const transport = new PrivateVaultContentObjectTransport({
+    ...input,
+    native,
+  });
   const disclosureTransport = new PrivateVaultContentDisclosureTransport(input);
   const disclosures: DisclosureSurface = {
     async list(vaultId) {

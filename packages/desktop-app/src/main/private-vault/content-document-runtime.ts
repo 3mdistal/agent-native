@@ -11,15 +11,13 @@ import {
 import { PrivateVaultContentRegistry } from "./content-document-registry.js";
 import { PrivateVaultContentSync } from "./content-document-sync.js";
 import type { PrivateVaultContentSession } from "./content-genesis-transport.js";
-import {
-  createPrivateVaultContentObjectRuntime,
-  type PrivateVaultContentObjectRuntime,
-} from "./content-object-runtime.js";
+import { PrivateVaultContentObjectRuntime } from "./content-object-runtime.js";
 import { PrivateVaultContentObjectTransport } from "./content-object-transport.js";
 import {
   createEncryptedContentIndexStore,
   type EncryptedContentIndexStore,
 } from "./encrypted-content-index-store.js";
+import { createPrivateVaultNativeServiceClient } from "./native-service-client.js";
 
 type ObjectRuntimeSurface = Pick<
   PrivateVaultContentObjectRuntime,
@@ -160,9 +158,10 @@ export function createPrivateVaultContentDocumentRuntime(input: {
   session: PrivateVaultContentSession;
   origin: string;
 }) {
+  const native = createPrivateVaultNativeServiceClient();
   return new PrivateVaultContentDocumentRuntime({
     index: createEncryptedContentIndexStore(),
-    transport: new PrivateVaultContentObjectTransport(input),
-    objects: createPrivateVaultContentObjectRuntime(),
+    transport: new PrivateVaultContentObjectTransport({ ...input, native }),
+    objects: new PrivateVaultContentObjectRuntime(native),
   });
 }

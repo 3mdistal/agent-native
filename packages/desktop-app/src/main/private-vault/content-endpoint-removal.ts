@@ -274,6 +274,11 @@ export class PrivateVaultContentEndpointRemovalPreparer {
               epoch: targetEpoch,
               parentRevisionIds: parents,
               ciphertext: sealed.ciphertext,
+              priorManifestHead: {
+                objectId: baseHead.objectId,
+                revisionId: baseHead.revisionId,
+                generation: baseHead.manifest.generation,
+              },
             });
             this.#assertStored(stored, sealed, parents);
             if (!(await this.#unchanged(baseHead))) throw new Error();

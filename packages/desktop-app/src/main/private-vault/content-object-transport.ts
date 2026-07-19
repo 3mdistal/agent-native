@@ -1,4 +1,15 @@
+import { createHash, randomBytes } from "node:crypto";
+
+import {
+  ancV1BytesToHex,
+  ancV1Hash,
+  encodeEndpointRequestUnsignedProof,
+  endpointRequestProofSchema,
+  endpointRequestUnsignedProofSchema,
+} from "@agent-native/core/e2ee";
+
 import type { PrivateVaultContentSession } from "./content-genesis-transport.js";
+import type { PrivateVaultNativeServiceClient } from "./native-service-client.js";
 
 export type PrivateVaultContentHostedObjectType = "document" | "vault-manifest";
 const ALGORITHM_ID = "anc/v1";
@@ -10,6 +21,12 @@ export interface PrivateVaultContentObjectCoordinate {
   readonly vaultId: string;
   readonly objectId: string;
   readonly revisionId: string;
+}
+
+export interface PrivateVaultContentManifestHead {
+  readonly objectId: string;
+  readonly revisionId: string;
+  readonly generation: number;
 }
 
 export interface PrivateVaultContentObjectMetadata extends PrivateVaultContentObjectCoordinate {
@@ -182,13 +199,28 @@ async function boundedBytes(
 export class PrivateVaultContentObjectTransport {
   readonly #session: PrivateVaultContentSession;
   readonly #origin: string;
+  readonly #native?: Pick<
+    PrivateVaultNativeServiceClient,
+    "listVaultMembers" | "signEndpointRequest"
+  >;
+  readonly #now: () => Date;
+  readonly #nonce: () => string;
 
   constructor(input: {
     readonly session: PrivateVaultContentSession;
     readonly origin: string;
+    readonly native?: Pick<
+      PrivateVaultNativeServiceClient,
+      "listVaultMembers" | "signEndpointRequest"
+    >;
+    readonly now?: () => Date;
+    readonly nonce?: () => string;
   }) {
     this.#session = input.session;
     this.#origin = exactOrigin(input.origin);
+    this.#native = input.native;
+    this.#now = input.now ?? (() => new Date());
+    this.#nonce = input.nonce ?? (() => randomBytes(16).toString("hex"));
   }
 
   async put(input: {
@@ -198,6 +230,7 @@ export class PrivateVaultContentObjectTransport {
     readonly epoch: number;
     readonly parentRevisionIds?: readonly string[];
     readonly ciphertext: Uint8Array;
+    readonly priorManifestHead?: PrivateVaultContentManifestHead | null;
   }): Promise<PrivateVaultContentObjectMetadata> {
     const coordinate = exactCoordinate(input.coordinate);
     const parents = input.parentRevisionIds ?? [];
@@ -224,6 +257,84 @@ export class PrivateVaultContentObjectTransport {
     const body = Buffer.from(ciphertext);
     try {
       const url = `${this.#origin}/api/private-vault/objects`;
+      let manifestHeaders: Record<string, string> = {};
+      if (input.objectType === "vault-manifest") {
+        if (!("priorManifestHead" in input) || !this.#native) throw new Error();
+        const prior = input.priorManifestHead;
+        if (prior === undefined) throw new Error();
+        if (
+          prior !== null &&
+          (!lowerHex(prior.objectId, 16) ||
+            !lowerHex(prior.revisionId, 32) ||
+            !positiveSafeInteger(prior.generation))
+        )
+          throw new Error();
+        const membership = await this.#native.listVaultMembers(
+          coordinate.vaultId,
+        );
+        const current = membership.members.filter((member) => member.current);
+        if (
+          current.length !== 1 ||
+          current[0]!.role !== "endpoint" ||
+          current[0]!.unattended
+        )
+          throw new Error();
+        const authorizationBody = Uint8Array.from(
+          Buffer.from(
+            JSON.stringify([
+              "anc/v1/private-vault-manifest-write",
+              coordinate.vaultId,
+              coordinate.objectId,
+              coordinate.revisionId,
+              input.revision,
+              input.objectType,
+              ALGORITHM_ID,
+              input.epoch,
+              parents,
+              body.byteLength,
+              prior?.objectId ?? null,
+              prior?.revisionId ?? null,
+              prior?.generation ?? 0,
+              createHash("sha256").update(body).digest("hex"),
+            ]),
+            "utf8",
+          ),
+        );
+        const unsigned = endpointRequestUnsignedProofSchema.parse({
+          version: 1,
+          suite: "anc/v1",
+          type: "endpoint_request",
+          vaultId: coordinate.vaultId,
+          endpointId: current[0]!.endpointId,
+          method: "POST",
+          path: "/api/private-vault/objects",
+          bodyHash: ancV1BytesToHex(
+            await ancV1Hash("endpoint-request-body", authorizationBody),
+          ),
+          issuedAt: this.#now().toISOString(),
+          nonce: this.#nonce(),
+        });
+        const signed = await this.#native.signEndpointRequest({
+          version: 1,
+          suite: "anc/v1",
+          operation: "signEndpointRequest",
+          unsignedProof: encodeEndpointRequestUnsignedProof(unsigned),
+        });
+        const proof = endpointRequestProofSchema.parse({
+          ...unsigned,
+          signature: ancV1BytesToHex(signed.signature),
+        });
+        const proofHeader = Buffer.from(JSON.stringify(proof)).toString(
+          "base64url",
+        );
+        if (proofHeader.length > 16_384) throw new Error();
+        manifestHeaders = {
+          "X-ANC-Prior-Manifest-Generation": String(prior?.generation ?? 0),
+          "X-ANC-Prior-Manifest-Object-Id": prior?.objectId ?? "",
+          "X-ANC-Prior-Manifest-Revision-Id": prior?.revisionId ?? "",
+          "X-Anc-Endpoint-Proof": proofHeader,
+        };
+      }
       const response = await this.#session.fetch(url, {
         method: "POST",
         redirect: "error",
@@ -244,6 +355,7 @@ export class PrivateVaultContentObjectTransport {
           "X-ANC-Epoch": String(input.epoch),
           "X-ANC-Parent-Revision-Ids": encodeParents(parents),
           "X-ANC-Ciphertext-Byte-Length": String(body.byteLength),
+          ...manifestHeaders,
         },
         body,
       });

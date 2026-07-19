@@ -179,8 +179,15 @@ describe("PrivateVaultContentMutations", () => {
     ).resolves.toEqual({ success: true, deleted: 2 });
     expect(source.head()?.manifest.documents).toEqual([]);
     expect(source.uploads.at(-1)).toMatchObject({
-      objectId: thirdManifestId,
+      objectId: firstManifestId,
+      revision: 3,
       contentType: PRIVATE_VAULT_MANIFEST_CONTENT_TYPE,
+      parentRevisionIds: ["8".repeat(64)],
+      priorManifestHead: {
+        objectId: firstManifestId,
+        revisionId: "8".repeat(64),
+        generation: 2,
+      },
     });
     expect(source.index.deleteDocument).toHaveBeenCalledTimes(2);
   });
