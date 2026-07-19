@@ -42,6 +42,44 @@ xpc_object_t MakeReply(const char *oldBrokerEndpointID,
   return reply;
 }
 
+xpc_object_t MakeCeremonyReply(PVOperation operation) {
+  uint8_t body[] = {0xa1, 0x01, 0x01};
+  uint8_t digest[32] = {0x31};
+  uint8_t id[16] = {0x41};
+  xpc_object_t reply = xpc_dictionary_create(nullptr, nullptr, 0);
+  xpc_dictionary_set_int64(reply, "version", PV_PROTOCOL_VERSION);
+  xpc_dictionary_set_bool(reply, "ok", true);
+  xpc_dictionary_set_string(reply, "requestId", "ceremony-request");
+  xpc_dictionary_set_string(reply, "vaultId",
+                            "00112233445566778899aabbccddeeff");
+  xpc_dictionary_set_string(reply, "oldBrokerEndpointId",
+                            "11112222333344445555666677778888");
+  xpc_dictionary_set_string(reply, "candidateBrokerEndpointId",
+                            "9999aaaabbbbccccddddeeeeffff0000");
+  if (operation == PVOperation::ChallengeBrokerReplacement) {
+    xpc_dictionary_set_string(reply, "state", "challenged");
+    xpc_dictionary_set_data(reply, "challenge", body, sizeof body);
+    xpc_dictionary_set_string(reply, "sasCode", "056-775-976");
+    xpc_dictionary_set_data(reply, "sasTranscriptHash", digest, sizeof digest);
+  } else if (operation == PVOperation::ConfirmBrokerReplacement) {
+    xpc_dictionary_set_string(reply, "state", "confirmed");
+    xpc_dictionary_set_data(reply, "sasDecisionHash", digest, sizeof digest);
+  } else {
+    uint8_t drain[16] = {0x42};
+    xpc_dictionary_set_string(reply, "state", "approved");
+    xpc_dictionary_set_string(reply, "issuerEndpointId",
+                              "22223333444455556666777788889999");
+    xpc_dictionary_set_data(reply, "approval", body, sizeof body);
+    xpc_dictionary_set_data(reply, "freezeId", id, sizeof id);
+    xpc_dictionary_set_data(reply, "envelopeId", id, sizeof id);
+    xpc_dictionary_set_data(reply, "drainId", drain, sizeof drain);
+    xpc_dictionary_set_uint64(reply, "drainGeneration", 1);
+    xpc_dictionary_set_uint64(reply, "createdAt", 1721111111);
+    xpc_dictionary_set_uint64(reply, "deadlineAt", 1721114711);
+  }
+  return reply;
+}
+
 }
 
 int main() {
@@ -56,6 +94,35 @@ int main() {
                                                 candidateBroker));
   assert(!PVBrokerReplacementReplyMatchesRequest(
       parsed, "00000000000000000000000000000000", candidateBroker));
+
+  for (PVOperation operation : {PVOperation::ChallengeBrokerReplacement,
+                                PVOperation::ConfirmBrokerReplacement,
+                                PVOperation::ApproveBrokerReplacement}) {
+    xpc_object_t ceremony = MakeCeremonyReply(operation);
+    PVParsedReply ceremonyParsed = PVParseReply(
+        ceremony, operation, "ceremony-request",
+        "00112233445566778899aabbccddeeff");
+    assert(ceremonyParsed.failure == PVFailure::None);
+    xpc_object_t extraCeremony = xpc_copy(ceremony);
+    xpc_dictionary_set_string(extraCeremony, "baseHead", "not-accepted");
+    assert(PVParseReply(extraCeremony, operation, "ceremony-request",
+                        "00112233445566778899aabbccddeeff")
+               .failure == PVFailure::MalformedReply);
+    xpc_release(extraCeremony);
+    xpc_release(ceremony);
+  }
+
+  xpc_object_t substitutedApproval =
+      MakeCeremonyReply(PVOperation::ApproveBrokerReplacement);
+  uint8_t sameDrain[16] = {0x41};
+  xpc_dictionary_set_data(substitutedApproval, "drainId", sameDrain,
+                          sizeof sameDrain);
+  assert(PVParseReply(substitutedApproval,
+                      PVOperation::ApproveBrokerReplacement,
+                      "ceremony-request",
+                      "00112233445566778899aabbccddeeff")
+             .failure == PVFailure::MalformedReply);
+  xpc_release(substitutedApproval);
 
   xpc_object_t missing = xpc_copy(valid);
   xpc_dictionary_set_value(missing, "checkpointDigest", nullptr);

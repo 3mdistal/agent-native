@@ -225,6 +225,9 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
     bool signRequest = strcmp(operation, "sign_request") == 0;
     bool prepareEnrollment = strcmp(operation, "prepare_enroll") == 0;
     bool challengeEnrollment = strcmp(operation, "challenge_enroll") == 0;
+    bool challengeBroker = strcmp(operation, "challenge_broker") == 0;
+    bool confirmBroker = strcmp(operation, "confirm_broker") == 0;
+    bool approveBroker = strcmp(operation, "approve_broker") == 0;
     bool inspectEnrollment = strcmp(operation, "inspect_enroll") == 0;
     bool decideEnrollment = strcmp(operation, "decide_enroll") == 0;
     bool authorizeEnrollment = strcmp(operation, "authorize_enroll") == 0;
@@ -248,6 +251,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
         !revokeGrant && !removeEndpoint && !replaceBroker && !refreshAuthority && !sealJob && !openResult && !sealResult &&
         !completeResult && !pendingResult &&
         !signRequest && !prepareEnrollment && !challengeEnrollment &&
+        !challengeBroker && !confirmBroker && !approveBroker &&
         !inspectEnrollment && !decideEnrollment && !authorizeEnrollment &&
         !activateEnrollment && !verifyManifest && !enrollmentBootstrap && !sealObject &&
         !openObject && !sealJobObject &&
@@ -605,7 +609,7 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
             !PVIsVaultID(xpc_dictionary_get_string(message, "vaultId"))) {
             return PVRequestInvalid;
         }
-    } else if (challengeEnrollment) {
+    } else if (challengeEnrollment || challengeBroker) {
         if (fieldCount != 6 || vaultIDValue == NULL ||
             xpc_get_type(vaultIDValue) != XPC_TYPE_STRING ||
             !PVIsVaultID(xpc_dictionary_get_string(message, "vaultId")) ||
@@ -619,6 +623,24 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
                 PV_ENROLLMENT_CANDIDATE_PROOF_BYTES,
                 &request->enrollmentCandidateKeyProof,
                 &request->enrollmentCandidateKeyProofLength)) {
+            return PVRequestInvalid;
+        }
+    } else if (confirmBroker || approveBroker) {
+        if (fieldCount != 7 || vaultIDValue == NULL ||
+            xpc_get_type(vaultIDValue) != XPC_TYPE_STRING ||
+            !PVIsVaultID(xpc_dictionary_get_string(message, "vaultId")) ||
+            !PVReadBoundedData(message, "offer",
+                               PV_ENROLLMENT_OFFER_MAXIMUM_BYTES,
+                               &request->enrollmentOffer,
+                               &request->enrollmentOfferLength) ||
+            !PVReadBoundedData(message, "challenge",
+                               PV_ENROLLMENT_CHALLENGE_MAXIMUM_BYTES,
+                               &request->enrollmentChallenge,
+                               &request->enrollmentChallengeLength) ||
+            !PVReadBoundedData(message, "sasDecision",
+                               PV_ENROLLMENT_SAS_DECISION_MAXIMUM_BYTES,
+                               &request->enrollmentSasDecision,
+                               &request->enrollmentSasDecisionLength)) {
             return PVRequestInvalid;
         }
     } else if (inspectEnrollment) {
@@ -903,7 +925,8 @@ PVRequestResult PVParseRequest(xpc_object_t message, PVRequest *request) {
         unlock || resumeRotation || recoverStatus || openJob || createGrant ||
                 sealJob || openResult || sealResult ||
                 completeResult || pendingResult || prepareEnrollment ||
-                challengeEnrollment || inspectEnrollment ||
+                challengeEnrollment || challengeBroker || confirmBroker ||
+                approveBroker || inspectEnrollment ||
                 authorizeEnrollment || verifyManifest || activateEnrollment ||
                 enrollmentBootstrap || listGrants || listMembers || brokerKey ||
                 revokeGrant || removeEndpoint || replaceBroker || refreshAuthority || sealObject ||

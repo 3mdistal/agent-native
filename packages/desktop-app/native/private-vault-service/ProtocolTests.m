@@ -203,6 +203,52 @@ int main(void) {
   xpc_release(extraReplacement);
   xpc_release(replaceBroker);
 
+  const uint8_t replacementOffer[] = {0xa1, 0x01, 0x01};
+  const uint8_t replacementChallenge[] = {0xa1, 0x02, 0x02};
+  const uint8_t replacementDecision[] = {0xa1, 0x03, 0x03};
+  uint8_t replacementProof[PV_ENROLLMENT_CANDIDATE_PROOF_BYTES] = {0x61};
+  xpc_object_t challengeBroker = PVMakeRequest(
+      PV_PROTOCOL_VERSION, "challenge_broker", "request-challenge-broker");
+  xpc_dictionary_set_string(challengeBroker, "vaultId",
+                            "00112233445566778899aabbccddeeff");
+  xpc_dictionary_set_data(challengeBroker, "offer", replacementOffer,
+                          sizeof replacementOffer);
+  xpc_dictionary_set_data(challengeBroker, "candidateKeyProof",
+                          replacementProof, sizeof replacementProof);
+  assert(PVParseRequest(challengeBroker, &parsed) == PVRequestValid &&
+         parsed.enrollmentOfferLength == sizeof replacementOffer &&
+         parsed.enrollmentCandidateKeyProofLength == sizeof replacementProof);
+  xpc_object_t shortProof = xpc_copy(challengeBroker);
+  xpc_dictionary_set_data(shortProof, "candidateKeyProof", replacementProof,
+                          sizeof replacementProof - 1);
+  assert(PVParseRequest(shortProof, &parsed) == PVRequestInvalid);
+  xpc_release(shortProof);
+  xpc_release(challengeBroker);
+
+  const char *replacementOperations[] = {"confirm_broker", "approve_broker"};
+  for (size_t operationIndex = 0; operationIndex < 2; operationIndex += 1) {
+    const char *operation = replacementOperations[operationIndex];
+    xpc_object_t ceremony =
+        PVMakeRequest(PV_PROTOCOL_VERSION, operation, "request-broker-step");
+    xpc_dictionary_set_string(ceremony, "vaultId",
+                              "00112233445566778899aabbccddeeff");
+    xpc_dictionary_set_data(ceremony, "offer", replacementOffer,
+                            sizeof replacementOffer);
+    xpc_dictionary_set_data(ceremony, "challenge", replacementChallenge,
+                            sizeof replacementChallenge);
+    xpc_dictionary_set_data(ceremony, "sasDecision", replacementDecision,
+                            sizeof replacementDecision);
+    assert(PVParseRequest(ceremony, &parsed) == PVRequestValid &&
+           parsed.enrollmentChallengeLength == sizeof replacementChallenge &&
+           parsed.enrollmentSasDecisionLength == sizeof replacementDecision);
+    xpc_object_t extra = xpc_copy(ceremony);
+    xpc_dictionary_set_string(extra, "issuerEndpointId",
+                              "11112222333344445555666677778888");
+    assert(PVParseRequest(extra, &parsed) == PVRequestInvalid);
+    xpc_release(extra);
+    xpc_release(ceremony);
+  }
+
   xpc_object_t listGrants =
       PVMakeRequest(PV_PROTOCOL_VERSION, "list_grants", "request-list-grants");
   xpc_dictionary_set_string(listGrants, "vaultId",

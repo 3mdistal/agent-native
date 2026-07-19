@@ -23,6 +23,7 @@ xcrun clang++ -O1 -fblocks -std=c++20 -Wall -Wextra -Werror \
   -framework Foundation \
   -framework AppKit \
   "$ROOT/BrokerReplacementReplyTests.mm" \
+  "$ROOT/TrustedEnrollmentUI.mm" \
   -o "$TEST_BINARY"
 
 "$TEST_BINARY"

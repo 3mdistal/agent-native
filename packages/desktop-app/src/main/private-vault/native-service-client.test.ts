@@ -374,6 +374,139 @@ describe("Private Vault native service client", () => {
     }
   });
 
+  it("keeps broker replacement coordinates and approval generation native-owned", async () => {
+    const vaultId = "00112233445566778899aabbccddeeff";
+    const oldBrokerEndpointId = "11".repeat(16);
+    const candidateBrokerEndpointId = "22".repeat(16);
+    const issuerEndpointId = "33".repeat(16);
+    const offer = new Uint8Array([0xa1, 0x01, 0x01]);
+    const proof = new Uint8Array(64).fill(2);
+    const challenge = new Uint8Array([0xa1, 0x02, 0x02]);
+    const sasDecision = new Uint8Array([0xa1, 0x03, 0x03]);
+    const approval = new Uint8Array([0xa1, 0x04, 0x04]);
+    const request = vi.fn(async (operation: string) => {
+      if (operation === "challenge_broker")
+        return {
+          version: 3,
+          operation,
+          state: "challenged",
+          vaultId,
+          oldBrokerEndpointId,
+          candidateBrokerEndpointId,
+          challenge: Buffer.from(challenge),
+        };
+      if (operation === "confirm_broker")
+        return {
+          version: 3,
+          operation,
+          state: "confirmed",
+          vaultId,
+          oldBrokerEndpointId,
+          candidateBrokerEndpointId,
+          sasDecisionHash: Buffer.alloc(32, 7),
+        };
+      return {
+        version: 3,
+        operation,
+        state: "approved",
+        vaultId,
+        issuerEndpointId,
+        oldBrokerEndpointId,
+        candidateBrokerEndpointId,
+        approval: Buffer.from(approval),
+        freezeId: Buffer.alloc(16, 4),
+        envelopeId: Buffer.alloc(16, 5),
+        drainId: Buffer.alloc(16, 6),
+        drainGeneration: 1,
+        createdAt: 1_721_111_111,
+        deadlineAt: 1_721_114_711,
+      };
+    });
+    const client = createPrivateVaultNativeServiceClientForTest(async () => ({
+      request,
+    }));
+    await expect(
+      client.challengeBrokerReplacement({
+        vaultId,
+        offer,
+        candidateKeyProof: proof,
+      }),
+    ).resolves.toMatchObject({
+      operation: "challenge_broker",
+      oldBrokerEndpointId,
+      candidateBrokerEndpointId,
+      challenge,
+    });
+    const decisionInput = { vaultId, offer, challenge, sasDecision };
+    await expect(
+      client.confirmBrokerReplacement(decisionInput),
+    ).resolves.toMatchObject({
+      operation: "confirm_broker",
+      state: "confirmed",
+      oldBrokerEndpointId,
+      candidateBrokerEndpointId,
+    });
+    await expect(
+      client.approveBrokerReplacement(decisionInput),
+    ).resolves.toMatchObject({
+      operation: "approve_broker",
+      state: "approved",
+      issuerEndpointId,
+      oldBrokerEndpointId,
+      candidateBrokerEndpointId,
+      approval,
+      drainGeneration: 1,
+      createdAt: 1_721_111_111,
+      deadlineAt: 1_721_114_711,
+    });
+    expect(request.mock.calls.map(([operation]) => operation)).toEqual([
+      "challenge_broker",
+      "confirm_broker",
+      "approve_broker",
+    ]);
+    for (const call of request.mock.calls)
+      for (const value of call.slice(2))
+        expect(
+          Buffer.isBuffer(value) ? value.every((byte) => byte === 0) : true,
+        ).toBe(true);
+    expect(wrapperSource).not.toContain(
+      "issuerEndpointId: string;\n  readonly base",
+    );
+    expect(wrapperSource).not.toContain("deadlineAtSeconds");
+
+    for (const malformed of [
+      { candidateBrokerEndpointId: oldBrokerEndpointId },
+      { drainId: Buffer.alloc(16, 5) },
+      { deadlineAt: 1_721_114_710 },
+      { extra: true },
+    ]) {
+      const malformedClient = createPrivateVaultNativeServiceClientForTest(
+        async () => ({
+          request: vi.fn(async () => ({
+            version: 3,
+            operation: "approve_broker",
+            state: "approved",
+            vaultId,
+            issuerEndpointId,
+            oldBrokerEndpointId,
+            candidateBrokerEndpointId,
+            approval: Buffer.from(approval),
+            freezeId: Buffer.alloc(16, 4),
+            envelopeId: Buffer.alloc(16, 5),
+            drainId: Buffer.alloc(16, 6),
+            drainGeneration: 1,
+            createdAt: 1_721_111_111,
+            deadlineAt: 1_721_114_711,
+            ...malformed,
+          })),
+        }),
+      );
+      await expect(
+        malformedClient.approveBrokerReplacement(decisionInput),
+      ).rejects.toBeInstanceOf(PrivateVaultNativeServiceClientError);
+    }
+  });
+
   it("seals and opens Content revisions only through the native endpoint boundary", async () => {
     const vaultId = "00112233445566778899aabbccddeeff";
     const objectId = "11223344556677889900aabbccddeeff";

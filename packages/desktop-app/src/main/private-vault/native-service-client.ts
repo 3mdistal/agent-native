@@ -79,6 +79,9 @@ type NativeOperation =
   | "sign_request"
   | "prepare_enroll"
   | "challenge_enroll"
+  | "challenge_broker"
+  | "confirm_broker"
+  | "approve_broker"
   | "confirm_enroll"
   | "authorize_enroll"
   | "verify_manifest"
@@ -119,6 +122,15 @@ export interface PrivateVaultNativeServiceClient
     vaultId: string,
     targetEndpointId: string,
   ): Promise<NativePendingEndpointRemovalResult>;
+  challengeBrokerReplacement(
+    input: NativeBrokerReplacementChallengeInput,
+  ): Promise<NativeBrokerReplacementChallengeResult>;
+  confirmBrokerReplacement(
+    input: NativeBrokerReplacementDecisionInput,
+  ): Promise<NativeBrokerReplacementConfirmationResult>;
+  approveBrokerReplacement(
+    input: NativeBrokerReplacementDecisionInput,
+  ): Promise<NativeBrokerReplacementApprovalResult>;
   refreshAuthority(vaultId: string): Promise<NativeRefreshedAuthorityResult>;
   listContentGrants(vaultId: string): Promise<NativeListedContentGrantsResult>;
   listVaultMembers(vaultId: string): Promise<NativeListedVaultMembersResult>;
@@ -258,6 +270,59 @@ export interface NativePendingEndpointRemovalResult {
   readonly vaultId: string;
   readonly targetEndpointId: string;
   readonly createdAt: number;
+}
+
+export interface NativeBrokerReplacementDecisionInput {
+  readonly vaultId: string;
+  readonly offer: Uint8Array;
+  readonly challenge: Uint8Array;
+  readonly sasDecision: Uint8Array;
+}
+
+export interface NativeBrokerReplacementChallengeInput {
+  readonly vaultId: string;
+  readonly offer: Uint8Array;
+  readonly candidateKeyProof: Uint8Array;
+}
+
+export interface NativeBrokerReplacementChallengeResult {
+  readonly version: typeof SERVICE_VERSION;
+  readonly suite: typeof SERVICE_SUITE;
+  readonly operation: "challenge_broker";
+  readonly state: "challenged";
+  readonly vaultId: string;
+  readonly oldBrokerEndpointId: string;
+  readonly candidateBrokerEndpointId: string;
+  readonly challenge: Uint8Array;
+}
+
+export interface NativeBrokerReplacementConfirmationResult {
+  readonly version: typeof SERVICE_VERSION;
+  readonly suite: typeof SERVICE_SUITE;
+  readonly operation: "confirm_broker";
+  readonly state: "confirmed";
+  readonly vaultId: string;
+  readonly oldBrokerEndpointId: string;
+  readonly candidateBrokerEndpointId: string;
+  readonly sasDecisionHash: Uint8Array;
+}
+
+export interface NativeBrokerReplacementApprovalResult {
+  readonly version: typeof SERVICE_VERSION;
+  readonly suite: typeof SERVICE_SUITE;
+  readonly operation: "approve_broker";
+  readonly state: "approved";
+  readonly vaultId: string;
+  readonly issuerEndpointId: string;
+  readonly oldBrokerEndpointId: string;
+  readonly candidateBrokerEndpointId: string;
+  readonly approval: Uint8Array;
+  readonly freezeId: Uint8Array;
+  readonly envelopeId: Uint8Array;
+  readonly drainId: Uint8Array;
+  readonly drainGeneration: 1;
+  readonly createdAt: number;
+  readonly deadlineAt: number;
 }
 
 export interface NativeRefreshedAuthorityResult {
@@ -1619,6 +1684,156 @@ function parsePendingEndpointRemoval(
   });
 }
 
+function brokerReplacementBase(
+  value: Record<string, unknown>,
+  vaultId: string,
+) {
+  if (
+    value.vaultId !== vaultId ||
+    !isLowerHex(value.oldBrokerEndpointId, 32) ||
+    !isLowerHex(value.candidateBrokerEndpointId, 32) ||
+    value.oldBrokerEndpointId === value.candidateBrokerEndpointId
+  )
+    throw new PrivateVaultNativeServiceClientError();
+  return {
+    oldBrokerEndpointId: value.oldBrokerEndpointId,
+    candidateBrokerEndpointId: value.candidateBrokerEndpointId,
+  };
+}
+
+function parseBrokerReplacementChallenge(
+  value: unknown,
+  vaultId: string,
+): NativeBrokerReplacementChallengeResult {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "version",
+      "operation",
+      "state",
+      "vaultId",
+      "oldBrokerEndpointId",
+      "candidateBrokerEndpointId",
+      "challenge",
+    ]) ||
+    value.version !== XPC_PROTOCOL_VERSION ||
+    value.operation !== "challenge_broker" ||
+    value.state !== "challenged"
+  )
+    throw new PrivateVaultNativeServiceClientError();
+  const identity = brokerReplacementBase(value, vaultId);
+  return Object.freeze({
+    version: SERVICE_VERSION,
+    suite: SERVICE_SUITE,
+    operation: "challenge_broker" as const,
+    state: "challenged" as const,
+    vaultId,
+    ...identity,
+    challenge: copyBoundedBytes(value.challenge, 64 * 1024),
+  });
+}
+
+function parseBrokerReplacementConfirmation(
+  value: unknown,
+  vaultId: string,
+): NativeBrokerReplacementConfirmationResult {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "version",
+      "operation",
+      "state",
+      "vaultId",
+      "oldBrokerEndpointId",
+      "candidateBrokerEndpointId",
+      "sasDecisionHash",
+    ]) ||
+    value.version !== XPC_PROTOCOL_VERSION ||
+    value.operation !== "confirm_broker" ||
+    value.state !== "confirmed"
+  )
+    throw new PrivateVaultNativeServiceClientError();
+  const identity = brokerReplacementBase(value, vaultId);
+  const sasDecisionHash = copyBoundedBytes(value.sasDecisionHash, 32);
+  if (sasDecisionHash.byteLength !== 32)
+    throw new PrivateVaultNativeServiceClientError();
+  return Object.freeze({
+    version: SERVICE_VERSION,
+    suite: SERVICE_SUITE,
+    operation: "confirm_broker" as const,
+    state: "confirmed" as const,
+    vaultId,
+    ...identity,
+    sasDecisionHash,
+  });
+}
+
+function parseBrokerReplacementApproval(
+  value: unknown,
+  vaultId: string,
+): NativeBrokerReplacementApprovalResult {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "version",
+      "operation",
+      "state",
+      "vaultId",
+      "issuerEndpointId",
+      "oldBrokerEndpointId",
+      "candidateBrokerEndpointId",
+      "approval",
+      "freezeId",
+      "envelopeId",
+      "drainId",
+      "drainGeneration",
+      "createdAt",
+      "deadlineAt",
+    ]) ||
+    value.version !== XPC_PROTOCOL_VERSION ||
+    value.operation !== "approve_broker" ||
+    value.state !== "approved" ||
+    !isLowerHex(value.issuerEndpointId, 32) ||
+    value.drainGeneration !== 1 ||
+    !isSafeInteger(value.createdAt, true) ||
+    !isSafeInteger(value.deadlineAt, true) ||
+    value.deadlineAt !== value.createdAt + 3_600
+  )
+    throw new PrivateVaultNativeServiceClientError();
+  const identity = brokerReplacementBase(value, vaultId);
+  if (
+    value.issuerEndpointId === identity.oldBrokerEndpointId ||
+    value.issuerEndpointId === identity.candidateBrokerEndpointId
+  )
+    throw new PrivateVaultNativeServiceClientError();
+  const freezeId = copyBoundedBytes(value.freezeId, 16);
+  const envelopeId = copyBoundedBytes(value.envelopeId, 16);
+  const drainId = copyBoundedBytes(value.drainId, 16);
+  if (
+    freezeId.byteLength !== 16 ||
+    envelopeId.byteLength !== 16 ||
+    drainId.byteLength !== 16 ||
+    Buffer.from(envelopeId).equals(Buffer.from(drainId))
+  )
+    throw new PrivateVaultNativeServiceClientError();
+  return Object.freeze({
+    version: SERVICE_VERSION,
+    suite: SERVICE_SUITE,
+    operation: "approve_broker" as const,
+    state: "approved" as const,
+    vaultId,
+    issuerEndpointId: value.issuerEndpointId,
+    ...identity,
+    approval: copyBoundedBytes(value.approval, 1_024),
+    freezeId,
+    envelopeId,
+    drainId,
+    drainGeneration: 1 as const,
+    createdAt: value.createdAt,
+    deadlineAt: value.deadlineAt,
+  });
+}
+
 function parseListedContentGrants(
   value: unknown,
   vaultId: string,
@@ -2415,6 +2630,92 @@ class NativeServiceClient implements PrivateVaultNativeServiceClient {
         throw new PrivateVaultNativeServiceClientError();
       }
     });
+  }
+
+  challengeBrokerReplacement(
+    input: NativeBrokerReplacementChallengeInput,
+  ): Promise<NativeBrokerReplacementChallengeResult> {
+    if (!isLowerHex(input.vaultId, 32))
+      return Promise.reject(new PrivateVaultNativeServiceClientError());
+    let offer: Buffer;
+    let proof: Buffer;
+    try {
+      offer = Buffer.from(copyBoundedBytes(input.offer, 1_024));
+      proof = Buffer.from(copyBoundedBytes(input.candidateKeyProof, 64));
+      if (proof.byteLength !== 64) throw new Error();
+    } catch {
+      return Promise.reject(new PrivateVaultNativeServiceClientError());
+    }
+    return this.#enqueue(async () => {
+      try {
+        return parseBrokerReplacementChallenge(
+          await (
+            await this.#addon
+          ).request("challenge_broker", input.vaultId, offer, proof),
+          input.vaultId,
+        );
+      } catch {
+        throw new PrivateVaultNativeServiceClientError();
+      } finally {
+        offer.fill(0);
+        proof.fill(0);
+      }
+    });
+  }
+
+  #brokerReplacementDecision<T>(
+    operation: "confirm_broker" | "approve_broker",
+    input: NativeBrokerReplacementDecisionInput,
+    parse: (value: unknown, vaultId: string) => T,
+  ): Promise<T> {
+    if (!isLowerHex(input.vaultId, 32))
+      return Promise.reject(new PrivateVaultNativeServiceClientError());
+    let offer: Buffer;
+    let challenge: Buffer;
+    let decision: Buffer;
+    try {
+      offer = Buffer.from(copyBoundedBytes(input.offer, 1_024));
+      challenge = Buffer.from(copyBoundedBytes(input.challenge, 64 * 1024));
+      decision = Buffer.from(copyBoundedBytes(input.sasDecision, 2 * 1024));
+    } catch {
+      return Promise.reject(new PrivateVaultNativeServiceClientError());
+    }
+    return this.#enqueue(async () => {
+      try {
+        return parse(
+          await (
+            await this.#addon
+          ).request(operation, input.vaultId, offer, challenge, decision),
+          input.vaultId,
+        );
+      } catch {
+        throw new PrivateVaultNativeServiceClientError();
+      } finally {
+        offer.fill(0);
+        challenge.fill(0);
+        decision.fill(0);
+      }
+    });
+  }
+
+  confirmBrokerReplacement(
+    input: NativeBrokerReplacementDecisionInput,
+  ): Promise<NativeBrokerReplacementConfirmationResult> {
+    return this.#brokerReplacementDecision(
+      "confirm_broker",
+      input,
+      parseBrokerReplacementConfirmation,
+    );
+  }
+
+  approveBrokerReplacement(
+    input: NativeBrokerReplacementDecisionInput,
+  ): Promise<NativeBrokerReplacementApprovalResult> {
+    return this.#brokerReplacementDecision(
+      "approve_broker",
+      input,
+      parseBrokerReplacementApproval,
+    );
   }
 
   listContentGrants(vaultId: string): Promise<NativeListedContentGrantsResult> {

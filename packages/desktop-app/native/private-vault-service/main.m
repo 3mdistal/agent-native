@@ -30,6 +30,7 @@
 #import "PrivateVaultRotationCoordinator.h"
 #import "PrivateVaultEndpointRemovalBuilder.h"
 #import "PrivateVaultBrokerReplacementBuilder.h"
+#import "PrivateVaultBrokerReplacementApproval.h"
 #import "PrivateVaultRotationPreparationSpool.h"
 #import "PrivateVaultResultSpool.h"
 #import "PrivateVaultRotationPreparationStore.h"
@@ -1602,6 +1603,18 @@ static AncPrivateVaultControlLogMember *PVRequesterBroker(
                    match.unattended && match.keyAgreementPublicKey.length == 32
                ? match
                : nil;
+}
+
+static NSData *PVReplacementOldBrokerEndpointId(
+    AncPrivateVaultControlLogState *state) {
+    AncPrivateVaultControlLogMember *match = nil;
+    for (AncPrivateVaultControlLogMember *member in state.activeMembers) {
+        if (![member.role isEqualToString:@"broker"] || !member.unattended)
+            continue;
+        if (match != nil) return nil;
+        match = member;
+    }
+    return match == nil ? nil : PVLookupIDData(match.endpointId.UTF8String);
 }
 
 static void PVCreateContentGrant(xpc_connection_t peer, xpc_object_t message,
@@ -3321,6 +3334,223 @@ static void PVChallengeEnrollment(xpc_connection_t peer, xpc_object_t message,
     }
 }
 
+static void PVChallengeBrokerReplacement(xpc_connection_t peer,
+                                         xpc_object_t message,
+                                         const PVRequest *request) {
+    @autoreleasepool {
+        NSString *vaultId = [NSString stringWithUTF8String:request->vaultID];
+        NSData *offer = request->enrollmentOffer == NULL
+                            ? nil
+                            : [NSData dataWithBytes:request->enrollmentOffer
+                                            length:request->enrollmentOfferLength];
+        NSData *proof = request->enrollmentCandidateKeyProof == NULL
+                            ? nil
+                            : [NSData dataWithBytes:request->enrollmentCandidateKeyProof
+                                            length:request->enrollmentCandidateKeyProofLength];
+        AncPrivateVaultControlLogState *state = nil;
+        NSData *issuerId = nil;
+        AncPrivateVaultControlLogMember *issuer = nil;
+        AncPrivateVaultGuardedMemory *signing = nil, *agreement = nil;
+        BOOL context = offer != nil && proof.length == 64 &&
+            PVRequesterEndpointContext(vaultId, &state, &issuerId, &issuer,
+                                       &signing, &agreement);
+        (void)issuerId;
+        (void)issuer;
+        NSData *oldBroker = context ? PVReplacementOldBrokerEndpointId(state)
+                                    : nil;
+        uint64_t signedAt = context ? PVControlStateSignedAtSeconds(state) : 0;
+        uint64_t now = (uint64_t)floor(NSDate.date.timeIntervalSince1970);
+        NSData *envelope = PVEnrollmentRandom(16);
+        NSData *nonce = PVEnrollmentRandom(32);
+        uint64_t expires = now <= UINT64_MAX - 600 ? now + 600 : 0;
+        if (signedAt <= UINT64_MAX - 900 && expires > signedAt + 900)
+            expires = signedAt + 900;
+        AncPrivateVaultEnrollmentAuthorizerStatus status;
+        AncPrivateVaultPreparedEnrollmentChallenge *prepared =
+            oldBroker.length == 16 && signedAt > 0 && now > 0 &&
+                    expires > now && envelope.length == 16 && nonce.length == 32
+                ? AncPrivateVaultBuildBrokerReplacementChallenge(
+                      offer, proof, state, oldBroker, signing, agreement,
+                      envelope, nonce, signedAt, now, expires, &status)
+                : nil;
+        BOOL signingClosed = signing != nil &&
+            [signing close] == AncPrivateVaultGuardedMemoryStatusOK;
+        BOOL agreementClosed = agreement != nil &&
+            [agreement close] == AncPrivateVaultGuardedMemoryStatusOK;
+        AncPrivateVaultEnrollmentChallengeResult *verified =
+            prepared.verifiedChallenge;
+        NSString *oldId = PVVaultIDHex(oldBroker);
+        NSString *candidateId = PVVaultIDHex(verified.candidateEndpointId);
+        if (prepared == nil || !signingClosed || !agreementClosed ||
+            oldId.length != 32 || candidateId.length != 32 ||
+            verified.sasCode.length != 11 ||
+            verified.sasTranscriptHash.length != 32) {
+            PVSendError(peer, message, "broker_challenge_failed");
+            return;
+        }
+        xpc_object_t reply = PVCreateReply(message, request);
+        if (reply == NULL) return;
+        xpc_dictionary_set_string(reply, "state", "challenged");
+        xpc_dictionary_set_string(reply, "vaultId", request->vaultID);
+        xpc_dictionary_set_string(reply, "oldBrokerEndpointId", oldId.UTF8String);
+        xpc_dictionary_set_string(reply, "candidateBrokerEndpointId",
+                                  candidateId.UTF8String);
+        xpc_dictionary_set_data(reply, "challenge", prepared.encodedChallenge.bytes,
+                                prepared.encodedChallenge.length);
+        xpc_dictionary_set_string(reply, "sasCode", verified.sasCode.UTF8String);
+        xpc_dictionary_set_data(reply, "sasTranscriptHash",
+                                verified.sasTranscriptHash.bytes, 32);
+        xpc_connection_send_message(peer, reply);
+    }
+}
+
+static AncPrivateVaultEnrollmentSasReceipt *PVVerifyBrokerReplacementDecision(
+    const PVRequest *request, AncPrivateVaultControlLogState **outputState,
+    NSData **outputOldBroker, uint64_t *outputSignedAt) {
+    NSString *vaultId = [NSString stringWithUTF8String:request->vaultID];
+    AncPrivateVaultControlLogState *state = nil;
+    NSData *issuerId = nil;
+    AncPrivateVaultControlLogMember *issuer = nil;
+    AncPrivateVaultGuardedMemory *signing = nil, *agreement = nil;
+    if (!PVRequesterEndpointContext(vaultId, &state, &issuerId, &issuer,
+                                    &signing, &agreement))
+        return nil;
+    BOOL signingClosed =
+        [signing close] == AncPrivateVaultGuardedMemoryStatusOK;
+    BOOL agreementClosed =
+        [agreement close] == AncPrivateVaultGuardedMemoryStatusOK;
+    NSData *oldBroker = PVReplacementOldBrokerEndpointId(state);
+    uint64_t signedAt = PVControlStateSignedAtSeconds(state);
+    uint64_t now = (uint64_t)floor(NSDate.date.timeIntervalSince1970);
+    NSData *offer = [NSData dataWithBytes:request->enrollmentOffer
+                                  length:request->enrollmentOfferLength];
+    NSData *challenge = [NSData dataWithBytes:request->enrollmentChallenge
+                                      length:request->enrollmentChallengeLength];
+    NSData *decision = [NSData dataWithBytes:request->enrollmentSasDecision
+                                     length:request->enrollmentSasDecisionLength];
+    AncPrivateVaultBrokerReplacementApprovalStatus status;
+    AncPrivateVaultEnrollmentSasReceipt *receipt =
+        signingClosed && agreementClosed && oldBroker.length == 16 &&
+                signedAt > 0 && now > 0
+            ? AncPrivateVaultBrokerReplacementSasDecisionVerify(
+                  offer, challenge, decision, state, oldBroker, signedAt, now,
+                  &status)
+            : nil;
+    if (receipt == nil) return nil;
+    *outputState = state;
+    *outputOldBroker = oldBroker;
+    *outputSignedAt = signedAt;
+    return receipt;
+}
+
+static void PVConfirmBrokerReplacement(xpc_connection_t peer,
+                                       xpc_object_t message,
+                                       const PVRequest *request) {
+    @autoreleasepool {
+        AncPrivateVaultControlLogState *state = nil;
+        NSData *oldBroker = nil;
+        uint64_t signedAt = 0;
+        AncPrivateVaultEnrollmentSasReceipt *receipt =
+            PVVerifyBrokerReplacementDecision(request, &state, &oldBroker,
+                                              &signedAt);
+        (void)state;
+        (void)signedAt;
+        NSString *oldId = PVVaultIDHex(oldBroker);
+        NSString *candidateId = PVVaultIDHex(receipt.candidateEndpointId);
+        if (receipt == nil || oldId.length != 32 || candidateId.length != 32 ||
+            receipt.receiptHash.length != 32) {
+            PVSendError(peer, message, "broker_confirmation_failed");
+            return;
+        }
+        xpc_object_t reply = PVCreateReply(message, request);
+        if (reply == NULL) return;
+        xpc_dictionary_set_string(reply, "state", "confirmed");
+        xpc_dictionary_set_string(reply, "vaultId", request->vaultID);
+        xpc_dictionary_set_string(reply, "oldBrokerEndpointId", oldId.UTF8String);
+        xpc_dictionary_set_string(reply, "candidateBrokerEndpointId",
+                                  candidateId.UTF8String);
+        xpc_dictionary_set_data(reply, "sasDecisionHash", receipt.receiptHash.bytes,
+                                32);
+        xpc_connection_send_message(peer, reply);
+    }
+}
+
+static void PVApproveBrokerReplacement(xpc_connection_t peer,
+                                       xpc_object_t message,
+                                       const PVRequest *request) {
+    @autoreleasepool {
+        NSString *vaultId = [NSString stringWithUTF8String:request->vaultID];
+        AncPrivateVaultControlLogState *state = nil;
+        NSData *issuerId = nil;
+        AncPrivateVaultControlLogMember *issuer = nil;
+        AncPrivateVaultGuardedMemory *signing = nil, *agreement = nil;
+        BOOL context = PVRequesterEndpointContext(
+            vaultId, &state, &issuerId, &issuer, &signing, &agreement);
+        (void)issuer;
+        NSData *oldBroker = context ? PVReplacementOldBrokerEndpointId(state)
+                                    : nil;
+        uint64_t signedAt = context ? PVControlStateSignedAtSeconds(state) : 0;
+        uint64_t now = (uint64_t)floor(NSDate.date.timeIntervalSince1970);
+        NSData *offer = [NSData dataWithBytes:request->enrollmentOffer
+                                      length:request->enrollmentOfferLength];
+        NSData *challenge = [NSData dataWithBytes:request->enrollmentChallenge
+                                          length:request->enrollmentChallengeLength];
+        NSData *decision = [NSData dataWithBytes:request->enrollmentSasDecision
+                                         length:request->enrollmentSasDecisionLength];
+        __block AncPrivateVaultBrokerReplacementApproval *approval = nil;
+        AncPrivateVaultGuardedMemoryStatus borrowed =
+            oldBroker.length == 16 && signedAt > 0 && now > 0
+                ? [signing borrow:^BOOL(uint8_t *seed, size_t length) {
+                    AncPrivateVaultBrokerReplacementApprovalStatus status;
+                    approval = length == 32
+                        ? AncPrivateVaultBuildBrokerReplacementApproval(
+                              state, offer, challenge, decision, oldBroker,
+                              signedAt, now, 0, seed, &status)
+                        : nil;
+                    return approval != nil;
+                }]
+                : AncPrivateVaultGuardedMemoryStatusInvalid;
+        BOOL signingClosed = signing != nil &&
+            [signing close] == AncPrivateVaultGuardedMemoryStatusOK;
+        BOOL agreementClosed = agreement != nil &&
+            [agreement close] == AncPrivateVaultGuardedMemoryStatusOK;
+        NSString *issuerHex = PVVaultIDHex(approval.issuerEndpointId);
+        NSString *oldHex = PVVaultIDHex(approval.oldBrokerEndpointId);
+        NSString *candidateHex = PVVaultIDHex(approval.candidateBrokerEndpointId);
+        if (borrowed != AncPrivateVaultGuardedMemoryStatusOK ||
+            !signingClosed || !agreementClosed || approval == nil ||
+            approval.encodedApproval.length == 0 ||
+            approval.encodedApproval.length >
+                PV_BROKER_REPLACEMENT_APPROVAL_MAXIMUM_BYTES ||
+            approval.freezeId.length != 16 || approval.envelopeId.length != 16 ||
+            approval.drainId.length != 16 || approval.drainGeneration != 1 ||
+            ![approval.issuerEndpointId isEqualToData:issuerId] ||
+            issuerHex.length != 32 || oldHex.length != 32 ||
+            candidateHex.length != 32) {
+            PVSendError(peer, message, "broker_approval_failed");
+            return;
+        }
+        xpc_object_t reply = PVCreateReply(message, request);
+        if (reply == NULL) return;
+        xpc_dictionary_set_string(reply, "state", "approved");
+        xpc_dictionary_set_string(reply, "vaultId", request->vaultID);
+        xpc_dictionary_set_string(reply, "issuerEndpointId", issuerHex.UTF8String);
+        xpc_dictionary_set_string(reply, "oldBrokerEndpointId", oldHex.UTF8String);
+        xpc_dictionary_set_string(reply, "candidateBrokerEndpointId",
+                                  candidateHex.UTF8String);
+        xpc_dictionary_set_data(reply, "approval", approval.encodedApproval.bytes,
+                                approval.encodedApproval.length);
+        xpc_dictionary_set_data(reply, "freezeId", approval.freezeId.bytes, 16);
+        xpc_dictionary_set_data(reply, "envelopeId", approval.envelopeId.bytes, 16);
+        xpc_dictionary_set_data(reply, "drainId", approval.drainId.bytes, 16);
+        xpc_dictionary_set_uint64(reply, "drainGeneration",
+                                  approval.drainGeneration);
+        xpc_dictionary_set_uint64(reply, "createdAt", approval.createdAtSeconds);
+        xpc_dictionary_set_uint64(reply, "deadlineAt", approval.deadlineAtSeconds);
+        xpc_connection_send_message(peer, reply);
+    }
+}
+
 static void PVAuthorizeEnrollment(xpc_connection_t peer, xpc_object_t message,
                                   const PVRequest *request) {
     @autoreleasepool {
@@ -3938,6 +4168,18 @@ static void PVHandleMessage(xpc_connection_t peer, xpc_object_t message) {
             }
             if (strcmp(request.operation, "challenge_enroll") == 0) {
                 PVChallengeEnrollment(peer, message, &request);
+                return;
+            }
+            if (strcmp(request.operation, "challenge_broker") == 0) {
+                PVChallengeBrokerReplacement(peer, message, &request);
+                return;
+            }
+            if (strcmp(request.operation, "confirm_broker") == 0) {
+                PVConfirmBrokerReplacement(peer, message, &request);
+                return;
+            }
+            if (strcmp(request.operation, "approve_broker") == 0) {
+                PVApproveBrokerReplacement(peer, message, &request);
                 return;
             }
             if (strcmp(request.operation, "inspect_enroll") == 0) {
