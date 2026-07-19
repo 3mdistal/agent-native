@@ -46,6 +46,14 @@ typedef NS_ENUM(NSInteger, AncPrivateVaultRotationEvidenceStatus) {
 - (instancetype)init NS_UNAVAILABLE;
 @end
 
+@interface AncPrivateVaultRotationAcknowledgementEvidence : NSObject
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
+@interface AncPrivateVaultRotationDestructionEvidence : NSObject
+- (instancetype)init NS_UNAVAILABLE;
+@end
+
 FOUNDATION_EXPORT NSData *_Nullable AncPrivateVaultRotationEvidenceBuildCheckpoint(
     NSData *vaultId, uint64_t createdAt, NSData *envelopeId,
     NSData *ceremonyId, uint64_t baseSequence, NSData *baseHeadHash,
@@ -124,6 +132,23 @@ AncPrivateVaultVerifyRotationCustodyEvidence(
     NSArray<NSData *> *encodedAcknowledgements,
     NSArray<NSData *> *encodedDestructions,
     const uint8_t *_Nonnull pendingEpochKey, uint64_t now,
+    AncPrivateVaultRotationEvidenceStatus *_Nullable status);
+
+/* Staged component checks for crash-safe coordinators. Acknowledgements require
+ * the pending EEK and are verified before promotion. Destructions are verified
+ * independently after the exact control edge has been replayed and the old EEK
+ * has been destroyed. Neither result authorizes hosted append on its own. */
+FOUNDATION_EXPORT AncPrivateVaultRotationAcknowledgementEvidence *_Nullable
+AncPrivateVaultVerifyRotationAcknowledgementEvidence(
+    AncPrivateVaultRotationPreparationEvidence *preparation,
+    NSArray<NSData *> *encodedAcknowledgements,
+    const uint8_t *_Nonnull pendingEpochKey, uint64_t now,
+    AncPrivateVaultRotationEvidenceStatus *_Nullable status);
+
+FOUNDATION_EXPORT AncPrivateVaultRotationDestructionEvidence *_Nullable
+AncPrivateVaultVerifyRotationDestructionEvidence(
+    AncPrivateVaultRotationPreparationEvidence *preparation,
+    NSArray<NSData *> *encodedDestructions, uint64_t now,
     AncPrivateVaultRotationEvidenceStatus *_Nullable status);
 
 /* Sole native success predicate for a completed attended rotation. Secret

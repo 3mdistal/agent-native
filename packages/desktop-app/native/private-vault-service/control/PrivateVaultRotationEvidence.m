@@ -122,6 +122,26 @@ static const uint8_t kLiveRevisionSetHashDomain[] =
 - (instancetype)initPrivate { return [super init]; }
 @end
 
+@interface AncPrivateVaultRotationAcknowledgementEvidence ()
+@property(nonatomic, readwrite) AncPrivateVaultRotationPreparationEvidence *preparation;
+@property(nonatomic, readwrite) uint64_t notBefore;
+- (instancetype)initPrivate;
+@end
+
+@implementation AncPrivateVaultRotationAcknowledgementEvidence
+- (instancetype)initPrivate { return [super init]; }
+@end
+
+@interface AncPrivateVaultRotationDestructionEvidence ()
+@property(nonatomic, readwrite) AncPrivateVaultRotationPreparationEvidence *preparation;
+@property(nonatomic, readwrite) uint64_t notBefore;
+- (instancetype)initPrivate;
+@end
+
+@implementation AncPrivateVaultRotationDestructionEvidence
+- (instancetype)initPrivate { return [super init]; }
+@end
+
 static void SetStatus(AncPrivateVaultRotationEvidenceStatus *status,
                       AncPrivateVaultRotationEvidenceStatus value) {
   if (status != NULL)
@@ -938,11 +958,10 @@ AncPrivateVaultVerifyRotationPreparationEvidence(
   return result;
 }
 
-AncPrivateVaultRotationCustodyEvidence *
-AncPrivateVaultVerifyRotationCustodyEvidence(
+AncPrivateVaultRotationAcknowledgementEvidence *
+AncPrivateVaultVerifyRotationAcknowledgementEvidence(
     AncPrivateVaultRotationPreparationEvidence *preparation,
     NSArray<NSData *> *encodedAcknowledgements,
-    NSArray<NSData *> *encodedDestructions,
     const uint8_t pendingEpochKey[32], uint64_t now,
     AncPrivateVaultRotationEvidenceStatus *status) {
   SetStatus(status, AncPrivateVaultRotationEvidenceStatusInvalid);
@@ -958,17 +977,12 @@ AncPrivateVaultVerifyRotationCustodyEvidence(
       !Exact(preparation.signerSigningPublicKey, 32) ||
       !Exact(preparation.checkpointHash, 32) ||
       ![encodedAcknowledgements isKindOfClass:NSArray.class] ||
-      ![encodedDestructions isKindOfClass:NSArray.class] ||
       encodedAcknowledgements.count != preparation.recipients.count ||
-      encodedDestructions.count != preparation.recipients.count ||
       pendingEpochKey == NULL || !Positive(now))
     return nil;
   NSDictionary *checkpoint = preparation.checkpoint;
   NSData *ceremonyId =
       Field(checkpoint, @10, AncPrivateVaultCanonicalTypeBytes).bytesValue;
-  NSData *controlEntryHash =
-      Field(checkpoint, @26, AncPrivateVaultCanonicalTypeBytes).bytesValue;
-  uint64_t baseEpoch = Unsigned(checkpoint, @23, YES);
   uint64_t targetEpoch = Unsigned(checkpoint, @13, YES);
   uint64_t notBefore = 0;
   NSMutableSet<NSData *> *seenAcknowledgements = [NSMutableSet set];
@@ -1017,6 +1031,41 @@ AncPrivateVaultVerifyRotationCustodyEvidence(
   if (seenAcknowledgements.count != preparation.recipients.count)
     return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
 
+  AncPrivateVaultRotationAcknowledgementEvidence *result =
+      [[AncPrivateVaultRotationAcknowledgementEvidence alloc] initPrivate];
+  result.preparation = preparation;
+  result.notBefore = notBefore;
+  SetStatus(status, AncPrivateVaultRotationEvidenceStatusOK);
+  return result;
+}
+
+AncPrivateVaultRotationDestructionEvidence *
+AncPrivateVaultVerifyRotationDestructionEvidence(
+    AncPrivateVaultRotationPreparationEvidence *preparation,
+    NSArray<NSData *> *encodedDestructions, uint64_t now,
+    AncPrivateVaultRotationEvidenceStatus *status) {
+  SetStatus(status, AncPrivateVaultRotationEvidenceStatusInvalid);
+  if (![preparation
+          isKindOfClass:AncPrivateVaultRotationPreparationEvidence.class] ||
+      preparation.recipients.count < 1 ||
+      preparation.recipients.count > kRecipientLimit ||
+      preparation.recipientsById.count != preparation.recipients.count ||
+      ![preparation.checkpoint isKindOfClass:NSDictionary.class] ||
+      !Exact(preparation.expectedVaultId, 16) ||
+      !Exact(preparation.checkpointHash, 32) ||
+      ![encodedDestructions isKindOfClass:NSArray.class] ||
+      encodedDestructions.count != preparation.recipients.count ||
+      !Positive(now))
+    return nil;
+  NSDictionary *checkpoint = preparation.checkpoint;
+  NSData *ceremonyId =
+      Field(checkpoint, @10, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  NSData *controlEntryHash =
+      Field(checkpoint, @26, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+  uint64_t baseEpoch = Unsigned(checkpoint, @23, YES);
+  uint64_t targetEpoch = Unsigned(checkpoint, @13, YES);
+  uint64_t notBefore = 0;
+
   NSMutableSet<NSData *> *seenDestructions = [NSMutableSet set];
   for (NSData *encoded in encodedDestructions) {
     NSDictionary *destruction =
@@ -1052,10 +1101,36 @@ AncPrivateVaultVerifyRotationCustodyEvidence(
   if (seenDestructions.count != preparation.recipients.count)
     return RejectObject(status, AncPrivateVaultRotationEvidenceStatusBinding);
 
+  AncPrivateVaultRotationDestructionEvidence *result =
+      [[AncPrivateVaultRotationDestructionEvidence alloc] initPrivate];
+  result.preparation = preparation;
+  result.notBefore = notBefore;
+  SetStatus(status, AncPrivateVaultRotationEvidenceStatusOK);
+  return result;
+}
+
+AncPrivateVaultRotationCustodyEvidence *
+AncPrivateVaultVerifyRotationCustodyEvidence(
+    AncPrivateVaultRotationPreparationEvidence *preparation,
+    NSArray<NSData *> *encodedAcknowledgements,
+    NSArray<NSData *> *encodedDestructions,
+    const uint8_t pendingEpochKey[32], uint64_t now,
+    AncPrivateVaultRotationEvidenceStatus *status) {
+  AncPrivateVaultRotationAcknowledgementEvidence *acknowledgements =
+      AncPrivateVaultVerifyRotationAcknowledgementEvidence(
+          preparation, encodedAcknowledgements, pendingEpochKey, now, status);
+  if (acknowledgements == nil)
+    return nil;
+  AncPrivateVaultRotationDestructionEvidence *destructions =
+      AncPrivateVaultVerifyRotationDestructionEvidence(
+          preparation, encodedDestructions, now, status);
+  if (destructions == nil)
+    return nil;
+
   AncPrivateVaultRotationCustodyEvidence *result =
       [[AncPrivateVaultRotationCustodyEvidence alloc] initPrivate];
   result.preparation = preparation;
-  result.notBefore = notBefore;
+  result.notBefore = MAX(acknowledgements.notBefore, destructions.notBefore);
   SetStatus(status, AncPrivateVaultRotationEvidenceStatusOK);
   return result;
 }

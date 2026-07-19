@@ -204,6 +204,24 @@ static void CoreNativeVectorsAndAggregate(void) {
           UINT64_C(1784451801), &status);
   assert(preparation != nil &&
          status == AncPrivateVaultRotationEvidenceStatusOK);
+  AncPrivateVaultRotationAcknowledgementEvidence *acknowledgementEvidence =
+      AncPrivateVaultVerifyRotationAcknowledgementEvidence(
+          preparation, @[ ackOne, ackTwo ], epochKey,
+          UINT64_C(1784451801), &status);
+  assert(acknowledgementEvidence != nil &&
+         status == AncPrivateVaultRotationEvidenceStatusOK);
+  AncPrivateVaultRotationDestructionEvidence *destructionEvidence =
+      AncPrivateVaultVerifyRotationDestructionEvidence(
+          preparation, @[ destroyOne, destroyTwo ],
+          UINT64_C(1784451801), &status);
+  assert(destructionEvidence != nil &&
+         status == AncPrivateVaultRotationEvidenceStatusOK);
+  assert(AncPrivateVaultVerifyRotationAcknowledgementEvidence(
+             preparation, @[ ackOne ], epochKey, UINT64_C(1784451801),
+             &status) == nil);
+  assert(AncPrivateVaultVerifyRotationDestructionEvidence(
+             preparation, @[ destroyOne ], UINT64_C(1784451801),
+             &status) == nil);
   AncPrivateVaultRotationCustodyEvidence *custody =
       AncPrivateVaultVerifyRotationCustodyEvidence(
           preparation, @[ ackOne, ackTwo ], @[ destroyOne, destroyTwo ],
