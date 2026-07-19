@@ -26,6 +26,8 @@ export const ANC_ROTATION_EVIDENCE_FIELDS = Object.freeze({
     signature: 22,
     baseEpoch: 23,
     liveRevisionCount: 24,
+    recipientSetHash: 25,
+    controlEntryHash: 26,
   }),
   offer: Object.freeze({
     ceremonyId: 30,
@@ -45,18 +47,47 @@ export const ANC_ROTATION_EVIDENCE_FIELDS = Object.freeze({
     targetEpoch: 44,
     possessionMac: 45,
     signature: 46,
+    offerHash: 47,
+  }),
+  destruction: Object.freeze({
+    ceremonyId: 50,
+    checkpointHash: 51,
+    controlEntryHash: 52,
+    endpointId: 53,
+    destroyedEpoch: 54,
+    activatedEpoch: 55,
+    custodyGeneration: 56,
+    signature: 57,
+  }),
+  completion: Object.freeze({
+    ceremonyId: 60,
+    checkpointHash: 61,
+    controlEntryHash: 62,
+    hostedReceiptHash: 63,
+    signerEndpointId: 64,
+    committedSequence: 65,
+    committedHeadHash: 66,
+    recipientSetHash: 67,
+    signature: 68,
   }),
 });
 export const ANC_ROTATION_EVIDENCE_SIZE_LIMITS = Object.freeze({
   checkpointBytes: 1_024,
   offerBytes: 1_024,
   acknowledgementBytes: 1_024,
+  destructionBytes: 1_024,
+  completionBytes: 1_024,
   acknowledgements: 64,
+  liveRevisions: 10_000,
+  clockSkewSeconds: 60,
+  timestampUnit: "unix-seconds",
 });
 
 const CHECKPOINT = ANC_ROTATION_EVIDENCE_FIELDS.checkpoint;
 const OFFER = ANC_ROTATION_EVIDENCE_FIELDS.offer;
 const ACK = ANC_ROTATION_EVIDENCE_FIELDS.acknowledgement;
+const DESTRUCTION = ANC_ROTATION_EVIDENCE_FIELDS.destruction;
+const COMPLETION = ANC_ROTATION_EVIDENCE_FIELDS.completion;
 const ID_BYTES = 16;
 const HASH_BYTES = 32;
 const REVISION_ID_BYTES = 32;
@@ -66,8 +97,17 @@ const KEY_BYTES = 32;
 type RotationType =
   | "rotation-manifest-checkpoint"
   | "rotation-recipient-offer"
-  | "rotation-recipient-acknowledgement";
-type RotationDomain = RotationType | "rotation-live-revision-set";
+  | "rotation-recipient-acknowledgement"
+  | "rotation-epoch-destruction-attestation"
+  | "rotation-control-commit-attestation";
+type RotationHashDomain =
+  | "rotation-live-revision-set-hash"
+  | "rotation-recipient-set-hash"
+  | "rotation-manifest-checkpoint-hash"
+  | "rotation-recipient-offer-hash"
+  | "rotation-hosted-receipt-hash"
+  | "rotation-recipient-acknowledgement-mac";
+type RotationDomain = RotationType | RotationHashDomain;
 
 interface RotationCommon {
   readonly suite: typeof ANC_ROTATION_EVIDENCE_SUITE_ID;
@@ -91,6 +131,8 @@ export interface AncV1UnsignedRotationManifestCheckpoint extends RotationCommon 
   readonly liveObjectCount: number;
   readonly liveRevisionCount: number;
   readonly liveRevisionSetHash: Uint8Array;
+  readonly recipientSetHash: Uint8Array;
+  readonly controlEntryHash: Uint8Array;
   readonly signerEndpointId: Uint8Array;
   readonly removedEndpointId: Uint8Array;
 }
@@ -119,12 +161,44 @@ export interface AncV1UnsignedRotationRecipientAcknowledgement extends RotationC
   readonly ceremonyId: Uint8Array;
   readonly checkpointHash: Uint8Array;
   readonly eekWrapHash: Uint8Array;
+  readonly offerHash: Uint8Array;
   readonly recipientEndpointId: Uint8Array;
   readonly targetEpoch: number;
 }
 
 export interface AncV1RotationRecipientAcknowledgement extends AncV1UnsignedRotationRecipientAcknowledgement {
   readonly possessionMac: Uint8Array;
+  readonly signature: Uint8Array;
+}
+
+export interface AncV1UnsignedRotationEpochDestructionAttestation extends RotationCommon {
+  readonly type: "rotation-epoch-destruction-attestation";
+  readonly ceremonyId: Uint8Array;
+  readonly checkpointHash: Uint8Array;
+  readonly controlEntryHash: Uint8Array;
+  readonly endpointId: Uint8Array;
+  readonly destroyedEpoch: number;
+  readonly activatedEpoch: number;
+  readonly custodyGeneration: number;
+}
+
+export interface AncV1RotationEpochDestructionAttestation extends AncV1UnsignedRotationEpochDestructionAttestation {
+  readonly signature: Uint8Array;
+}
+
+export interface AncV1UnsignedRotationControlCommitAttestation extends RotationCommon {
+  readonly type: "rotation-control-commit-attestation";
+  readonly ceremonyId: Uint8Array;
+  readonly checkpointHash: Uint8Array;
+  readonly controlEntryHash: Uint8Array;
+  readonly hostedReceiptHash: Uint8Array;
+  readonly signerEndpointId: Uint8Array;
+  readonly committedSequence: number;
+  readonly committedHeadHash: Uint8Array;
+  readonly recipientSetHash: Uint8Array;
+}
+
+export interface AncV1RotationControlCommitAttestation extends AncV1UnsignedRotationControlCommitAttestation {
   readonly signature: Uint8Array;
 }
 
@@ -139,6 +213,8 @@ const commonKeys = Object.values(COMMON);
 const checkpointKeys = [...commonKeys, ...Object.values(CHECKPOINT)];
 const offerKeys = [...commonKeys, ...Object.values(OFFER)];
 const acknowledgementKeys = [...commonKeys, ...Object.values(ACK)];
+const destructionKeys = [...commonKeys, ...Object.values(DESTRUCTION)];
+const completionKeys = [...commonKeys, ...Object.values(COMPLETION)];
 
 function fail(message: string): never {
   throw new AncV1RotationEvidenceError(message);
@@ -170,6 +246,13 @@ function nonnegative(value: unknown, name: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0)
     fail(`${name} must be a non-negative safe integer`);
   return value as number;
+}
+
+function boundedCount(value: unknown, name: string): number {
+  const count = nonnegative(value, name);
+  if (count > ANC_ROTATION_EVIDENCE_SIZE_LIMITS.liveRevisions)
+    fail(`${name} exceeds the v1 rotation limit`);
+  return count;
 }
 
 function same(left: Uint8Array, right: Uint8Array): boolean {
@@ -240,7 +323,7 @@ function preimage(type: RotationDomain, encoded: Uint8Array): Uint8Array {
   return output;
 }
 
-async function hash(type: RotationDomain, encoded: Uint8Array) {
+async function hash(type: RotationHashDomain, encoded: Uint8Array) {
   await sodium.ready;
   const message = preimage(type, encoded);
   try {
@@ -257,13 +340,12 @@ async function sign(
 ) {
   await sodium.ready;
   const message = preimage(type, encoded);
+  const key = bytes(privateKey, 64, "signingPrivateKey");
   try {
-    return sodium.crypto_sign_detached(
-      message,
-      bytes(privateKey, 64, "signingPrivateKey"),
-    );
+    return sodium.crypto_sign_detached(message, key);
   } finally {
     message.fill(0);
+    key.fill(0);
   }
 }
 
@@ -304,6 +386,8 @@ const checkpointUnsignedFields = [
   "liveObjectCount",
   "liveRevisionCount",
   "liveRevisionSetHash",
+  "recipientSetHash",
+  "controlEntryHash",
   "signerEndpointId",
   "removedEndpointId",
 ] as const;
@@ -332,6 +416,7 @@ const acknowledgementUnsignedFields = [
   "ceremonyId",
   "checkpointHash",
   "eekWrapHash",
+  "offerHash",
   "recipientEndpointId",
   "targetEpoch",
 ] as const;
@@ -340,6 +425,37 @@ const acknowledgementFields = [
   "possessionMac",
   "signature",
 ] as const;
+const destructionUnsignedFields = [
+  "suite",
+  "vaultId",
+  "type",
+  "createdAt",
+  "envelopeId",
+  "ceremonyId",
+  "checkpointHash",
+  "controlEntryHash",
+  "endpointId",
+  "destroyedEpoch",
+  "activatedEpoch",
+  "custodyGeneration",
+] as const;
+const destructionFields = [...destructionUnsignedFields, "signature"] as const;
+const completionUnsignedFields = [
+  "suite",
+  "vaultId",
+  "type",
+  "createdAt",
+  "envelopeId",
+  "ceremonyId",
+  "checkpointHash",
+  "controlEntryHash",
+  "hostedReceiptHash",
+  "signerEndpointId",
+  "committedSequence",
+  "committedHeadHash",
+  "recipientSetHash",
+] as const;
+const completionFields = [...completionUnsignedFields, "signature"] as const;
 
 function checkpointMap(value: AncV1UnsignedRotationManifestCheckpoint) {
   exact(value, checkpointUnsignedFields, "Unsigned rotation checkpoint");
@@ -368,15 +484,23 @@ function checkpointMap(value: AncV1UnsignedRotationManifestCheckpoint) {
     ],
     [
       CHECKPOINT.liveObjectCount,
-      nonnegative(value.liveObjectCount, "liveObjectCount"),
+      boundedCount(value.liveObjectCount, "liveObjectCount"),
     ],
     [
       CHECKPOINT.liveRevisionCount,
-      nonnegative(value.liveRevisionCount, "liveRevisionCount"),
+      boundedCount(value.liveRevisionCount, "liveRevisionCount"),
     ],
     [
       CHECKPOINT.liveRevisionSetHash,
       bytes(value.liveRevisionSetHash, HASH_BYTES, "liveRevisionSetHash"),
+    ],
+    [
+      CHECKPOINT.recipientSetHash,
+      bytes(value.recipientSetHash, HASH_BYTES, "recipientSetHash"),
+    ],
+    [
+      CHECKPOINT.controlEntryHash,
+      bytes(value.controlEntryHash, HASH_BYTES, "controlEntryHash"),
     ],
     [
       CHECKPOINT.signerEndpointId,
@@ -481,11 +605,11 @@ export function decodeAncV1RotationManifestCheckpoint(
       32,
       "ciphertextHash",
     ),
-    liveObjectCount: nonnegative(
+    liveObjectCount: boundedCount(
       field(map, CHECKPOINT.liveObjectCount, "liveObjectCount"),
       "liveObjectCount",
     ),
-    liveRevisionCount: nonnegative(
+    liveRevisionCount: boundedCount(
       field(map, CHECKPOINT.liveRevisionCount, "liveRevisionCount"),
       "liveRevisionCount",
     ),
@@ -493,6 +617,16 @@ export function decodeAncV1RotationManifestCheckpoint(
       field(map, CHECKPOINT.liveRevisionSetHash, "liveRevisionSetHash"),
       32,
       "liveRevisionSetHash",
+    ),
+    recipientSetHash: bytes(
+      field(map, CHECKPOINT.recipientSetHash, "recipientSetHash"),
+      32,
+      "recipientSetHash",
+    ),
+    controlEntryHash: bytes(
+      field(map, CHECKPOINT.controlEntryHash, "controlEntryHash"),
+      32,
+      "controlEntryHash",
     ),
     signerEndpointId: bytes(
       field(map, CHECKPOINT.signerEndpointId, "signerEndpointId"),
@@ -516,12 +650,13 @@ export async function verifyAncV1RotationManifestCheckpoint(
   encoded: Uint8Array,
   binding: {
     readonly expectedVaultId: Uint8Array;
+    readonly expectedSignerEndpointId: Uint8Array;
     readonly signerSigningPublicKey: Uint8Array;
   },
 ) {
   exact(
     binding,
-    ["expectedVaultId", "signerSigningPublicKey"],
+    ["expectedVaultId", "expectedSignerEndpointId", "signerSigningPublicKey"],
     "Rotation checkpoint verification binding",
   );
   const decoded = decodeAncV1RotationManifestCheckpoint(encoded, {
@@ -529,7 +664,13 @@ export async function verifyAncV1RotationManifestCheckpoint(
   });
   if (
     decoded.baseEpoch === Number.MAX_SAFE_INTEGER ||
-    decoded.targetEpoch !== decoded.baseEpoch + 1
+    decoded.targetEpoch !== decoded.baseEpoch + 1 ||
+    !same(
+      decoded.signerEndpointId,
+      bytes(binding.expectedSignerEndpointId, 16, "expectedSignerEndpointId"),
+    ) ||
+    same(decoded.signerEndpointId, decoded.removedEndpointId) ||
+    decoded.liveObjectCount > decoded.liveRevisionCount
   )
     fail("Rotation checkpoint must advance exactly one epoch");
   const { signature, ...unsigned } = decoded;
@@ -550,7 +691,7 @@ export async function hashAncV1RotationManifestCheckpoint(
   expectedVaultId: Uint8Array,
 ) {
   decodeAncV1RotationManifestCheckpoint(encoded, { expectedVaultId });
-  return hash("rotation-manifest-checkpoint", encoded.slice());
+  return hash("rotation-manifest-checkpoint-hash", encoded.slice());
 }
 
 export interface AncV1RotationLiveRevision {
@@ -569,7 +710,10 @@ function hex(value: Uint8Array): string {
 export async function hashAncV1RotationLiveRevisionSet(
   revisions: readonly AncV1RotationLiveRevision[],
 ): Promise<Uint8Array> {
-  if (!Array.isArray(revisions) || revisions.length > 10_000)
+  if (
+    !Array.isArray(revisions) ||
+    revisions.length > ANC_ROTATION_EVIDENCE_SIZE_LIMITS.liveRevisions
+  )
     fail("Rotation live revision set exceeds its limit");
   const normalized = revisions.map((revision) => {
     exact(
@@ -593,8 +737,11 @@ export async function hashAncV1RotationLiveRevisionSet(
     };
   });
   normalized.sort((left, right) => {
-    const coordinate = hex(left.objectId).localeCompare(hex(right.objectId));
-    return coordinate || left.revision - right.revision;
+    for (let index = 0; index < ID_BYTES; index += 1) {
+      const difference = left.objectId[index]! - right.objectId[index]!;
+      if (difference !== 0) return difference;
+    }
+    return left.revision - right.revision;
   });
   for (let index = 1; index < normalized.length; index += 1) {
     const left = normalized[index - 1]!;
@@ -610,7 +757,88 @@ export async function hashAncV1RotationLiveRevisionSet(
       revision.rotatedRevisionId,
     ]),
   );
-  return hash("rotation-live-revision-set", encoded);
+  return hash("rotation-live-revision-set-hash", encoded);
+}
+
+export async function verifyAncV1RotationLiveRevisionSetAgainstCheckpoint(
+  revisions: readonly AncV1RotationLiveRevision[],
+  checkpoint: AncV1RotationManifestCheckpoint,
+): Promise<void> {
+  if (revisions.length !== checkpoint.liveRevisionCount)
+    fail("Rotation live revision coverage is incomplete");
+  const objects = new Set(revisions.map((revision) => hex(revision.objectId)));
+  if (objects.size !== checkpoint.liveObjectCount)
+    fail("Rotation live object coverage is incomplete");
+  if (
+    !same(
+      await hashAncV1RotationLiveRevisionSet(revisions),
+      checkpoint.liveRevisionSetHash,
+    )
+  )
+    fail("Rotation live revision set does not match the checkpoint");
+}
+
+export interface AncV1RotationRecipient {
+  readonly endpointId: Uint8Array;
+  readonly signingPublicKey: Uint8Array;
+  readonly keyAgreementPublicKey: Uint8Array;
+  readonly eekWrapHash: Uint8Array;
+}
+
+export async function hashAncV1RotationRecipientSet(
+  recipients: readonly AncV1RotationRecipient[],
+): Promise<Uint8Array> {
+  if (
+    !Array.isArray(recipients) ||
+    recipients.length < 1 ||
+    recipients.length > ANC_ROTATION_EVIDENCE_SIZE_LIMITS.acknowledgements
+  )
+    fail("Rotation recipient set is outside its limit");
+  const normalized = recipients.map((recipient) => {
+    exact(
+      recipient,
+      [
+        "endpointId",
+        "signingPublicKey",
+        "keyAgreementPublicKey",
+        "eekWrapHash",
+      ],
+      "Rotation recipient",
+    );
+    return {
+      endpointId: bytes(recipient.endpointId, 16, "endpointId"),
+      signingPublicKey: bytes(
+        recipient.signingPublicKey,
+        32,
+        "signingPublicKey",
+      ),
+      keyAgreementPublicKey: bytes(
+        recipient.keyAgreementPublicKey,
+        32,
+        "keyAgreementPublicKey",
+      ),
+      eekWrapHash: bytes(recipient.eekWrapHash, 32, "eekWrapHash"),
+    };
+  });
+  normalized.sort((left, right) => {
+    for (let index = 0; index < ID_BYTES; index += 1) {
+      const difference = left.endpointId[index]! - right.endpointId[index]!;
+      if (difference !== 0) return difference;
+    }
+    return 0;
+  });
+  for (let index = 1; index < normalized.length; index += 1)
+    if (same(normalized[index - 1]!.endpointId, normalized[index]!.endpointId))
+      fail("Rotation recipients must be unique");
+  const encoded = encodeAncV1Canonical(
+    normalized.map((recipient) => [
+      recipient.endpointId,
+      recipient.signingPublicKey,
+      recipient.keyAgreementPublicKey,
+      recipient.eekWrapHash,
+    ]),
+  );
+  return hash("rotation-recipient-set-hash", encoded);
 }
 
 function offerMap(value: AncV1UnsignedRotationRecipientOffer) {
@@ -722,22 +950,45 @@ export async function verifyAncV1RotationRecipientOffer(
   encoded: Uint8Array,
   binding: {
     readonly expectedVaultId: Uint8Array;
+    readonly expectedIssuerEndpointId: Uint8Array;
+    readonly expectedRecipientEndpointId: Uint8Array;
     readonly issuerSigningPublicKey: Uint8Array;
     readonly now: number;
   },
 ): Promise<AncV1RotationRecipientOffer> {
   exact(
     binding,
-    ["expectedVaultId", "issuerSigningPublicKey", "now"],
+    [
+      "expectedVaultId",
+      "expectedIssuerEndpointId",
+      "expectedRecipientEndpointId",
+      "issuerSigningPublicKey",
+      "now",
+    ],
     "Rotation offer verification binding",
   );
   const offer = decodeAncV1RotationRecipientOffer(encoded, {
     expectedVaultId: binding.expectedVaultId,
   });
   const { signature, ...unsigned } = offer;
+  const now = positive(binding.now, "now");
   if (
-    positive(binding.now, "now") < offer.createdAt ||
-    binding.now > offer.expiresAt ||
+    now + ANC_ROTATION_EVIDENCE_SIZE_LIMITS.clockSkewSeconds <
+      offer.createdAt ||
+    now >
+      offer.expiresAt + ANC_ROTATION_EVIDENCE_SIZE_LIMITS.clockSkewSeconds ||
+    !same(
+      offer.issuerEndpointId,
+      bytes(binding.expectedIssuerEndpointId, 16, "expectedIssuerEndpointId"),
+    ) ||
+    !same(
+      offer.recipientEndpointId,
+      bytes(
+        binding.expectedRecipientEndpointId,
+        16,
+        "expectedRecipientEndpointId",
+      ),
+    ) ||
     !(await verify(
       "rotation-recipient-offer",
       encodeAncV1UnsignedRotationRecipientOffer(unsigned),
@@ -747,6 +998,14 @@ export async function verifyAncV1RotationRecipientOffer(
   )
     fail("Rotation offer verification failed");
   return offer;
+}
+
+export async function hashAncV1RotationRecipientOffer(
+  encoded: Uint8Array,
+  expectedVaultId: Uint8Array,
+): Promise<Uint8Array> {
+  decodeAncV1RotationRecipientOffer(encoded, { expectedVaultId });
+  return hash("rotation-recipient-offer-hash", encoded.slice());
 }
 
 function acknowledgementMap(
@@ -762,6 +1021,7 @@ function acknowledgementMap(
     [ACK.ceremonyId, bytes(value.ceremonyId, 16, "ceremonyId")],
     [ACK.checkpointHash, bytes(value.checkpointHash, 32, "checkpointHash")],
     [ACK.eekWrapHash, bytes(value.eekWrapHash, 32, "eekWrapHash")],
+    [ACK.offerHash, bytes(value.offerHash, 32, "offerHash")],
     [
       ACK.recipientEndpointId,
       bytes(value.recipientEndpointId, 16, "recipientEndpointId"),
@@ -782,14 +1042,20 @@ async function possessionMac(
 ) {
   await sodium.ready;
   const message = preimage(
-    "rotation-recipient-acknowledgement",
+    "rotation-recipient-acknowledgement-mac",
     encodeAncV1UnsignedRotationRecipientAcknowledgement(value),
   );
-  const key = bytes(epochKey, KEY_BYTES, "epochKey");
+  const epoch = bytes(epochKey, KEY_BYTES, "epochKey");
+  const context = new TextEncoder().encode(
+    `${ANC_ROTATION_EVIDENCE_SUITE_ID}/possession-key\0`,
+  );
+  const key = sodium.crypto_generichash(KEY_BYTES, context, epoch);
   try {
     return sodium.crypto_generichash(HASH_BYTES, message, key);
   } finally {
     message.fill(0);
+    epoch.fill(0);
+    context.fill(0);
     key.fill(0);
   }
 }
@@ -870,6 +1136,7 @@ export function decodeAncV1RotationRecipientAcknowledgement(
       32,
       "eekWrapHash",
     ),
+    offerHash: bytes(field(map, ACK.offerHash, "offerHash"), 32, "offerHash"),
     recipientEndpointId: bytes(
       field(map, ACK.recipientEndpointId, "recipientEndpointId"),
       16,
@@ -922,29 +1189,373 @@ export async function verifyAncV1RotationRecipientAcknowledgement(
   return acknowledgement;
 }
 
+function destructionMap(
+  value: AncV1UnsignedRotationEpochDestructionAttestation,
+) {
+  exact(value, destructionUnsignedFields, "Unsigned destruction attestation");
+  return new Map<number, AncV1CanonicalValue>([
+    ...commonMap(value, "rotation-epoch-destruction-attestation"),
+    [DESTRUCTION.ceremonyId, bytes(value.ceremonyId, 16, "ceremonyId")],
+    [
+      DESTRUCTION.checkpointHash,
+      bytes(value.checkpointHash, 32, "checkpointHash"),
+    ],
+    [
+      DESTRUCTION.controlEntryHash,
+      bytes(value.controlEntryHash, 32, "controlEntryHash"),
+    ],
+    [DESTRUCTION.endpointId, bytes(value.endpointId, 16, "endpointId")],
+    [
+      DESTRUCTION.destroyedEpoch,
+      positive(value.destroyedEpoch, "destroyedEpoch"),
+    ],
+    [
+      DESTRUCTION.activatedEpoch,
+      positive(value.activatedEpoch, "activatedEpoch"),
+    ],
+    [
+      DESTRUCTION.custodyGeneration,
+      positive(value.custodyGeneration, "custodyGeneration"),
+    ],
+  ]);
+}
+
+export function encodeAncV1UnsignedRotationEpochDestructionAttestation(
+  value: AncV1UnsignedRotationEpochDestructionAttestation,
+) {
+  return encodeAncV1Canonical(destructionMap(value));
+}
+
+export function encodeAncV1RotationEpochDestructionAttestation(
+  value: AncV1RotationEpochDestructionAttestation,
+) {
+  exact(value, destructionFields, "Rotation destruction attestation");
+  const { signature, ...unsigned } = value;
+  const encoded = encodeAncV1Canonical(
+    new Map([
+      ...destructionMap(unsigned),
+      [DESTRUCTION.signature, bytes(signature, 64, "signature")],
+    ]),
+  );
+  if (encoded.byteLength > ANC_ROTATION_EVIDENCE_SIZE_LIMITS.destructionBytes)
+    fail("Rotation destruction attestation exceeds its size limit");
+  return encoded;
+}
+
+export async function signAncV1RotationEpochDestructionAttestation(
+  value: AncV1UnsignedRotationEpochDestructionAttestation,
+  privateKey: Uint8Array,
+): Promise<AncV1RotationEpochDestructionAttestation> {
+  return {
+    ...value,
+    signature: await sign(
+      "rotation-epoch-destruction-attestation",
+      encodeAncV1UnsignedRotationEpochDestructionAttestation(value),
+      privateKey,
+    ),
+  };
+}
+
+export function decodeAncV1RotationEpochDestructionAttestation(
+  encoded: Uint8Array,
+  binding: { readonly expectedVaultId: Uint8Array },
+): AncV1RotationEpochDestructionAttestation {
+  exact(binding, ["expectedVaultId"], "Destruction attestation binding");
+  const map = decodeAncV1Envelope(encoded, destructionKeys, {
+    maxBytes: ANC_ROTATION_EVIDENCE_SIZE_LIMITS.destructionBytes,
+  });
+  return {
+    ...decodeCommon(
+      map,
+      "rotation-epoch-destruction-attestation",
+      binding.expectedVaultId,
+    ),
+    type: "rotation-epoch-destruction-attestation",
+    ceremonyId: bytes(
+      field(map, DESTRUCTION.ceremonyId, "ceremonyId"),
+      16,
+      "ceremonyId",
+    ),
+    checkpointHash: bytes(
+      field(map, DESTRUCTION.checkpointHash, "checkpointHash"),
+      32,
+      "checkpointHash",
+    ),
+    controlEntryHash: bytes(
+      field(map, DESTRUCTION.controlEntryHash, "controlEntryHash"),
+      32,
+      "controlEntryHash",
+    ),
+    endpointId: bytes(
+      field(map, DESTRUCTION.endpointId, "endpointId"),
+      16,
+      "endpointId",
+    ),
+    destroyedEpoch: positive(
+      field(map, DESTRUCTION.destroyedEpoch, "destroyedEpoch"),
+      "destroyedEpoch",
+    ),
+    activatedEpoch: positive(
+      field(map, DESTRUCTION.activatedEpoch, "activatedEpoch"),
+      "activatedEpoch",
+    ),
+    custodyGeneration: positive(
+      field(map, DESTRUCTION.custodyGeneration, "custodyGeneration"),
+      "custodyGeneration",
+    ),
+    signature: bytes(
+      field(map, DESTRUCTION.signature, "signature"),
+      64,
+      "signature",
+    ),
+  };
+}
+
+export async function verifyAncV1RotationEpochDestructionAttestation(
+  encoded: Uint8Array,
+  binding: {
+    readonly expectedVaultId: Uint8Array;
+    readonly expectedEndpointId: Uint8Array;
+    readonly endpointSigningPublicKey: Uint8Array;
+  },
+): Promise<AncV1RotationEpochDestructionAttestation> {
+  exact(
+    binding,
+    ["expectedVaultId", "expectedEndpointId", "endpointSigningPublicKey"],
+    "Destruction attestation verification binding",
+  );
+  const decoded = decodeAncV1RotationEpochDestructionAttestation(encoded, {
+    expectedVaultId: binding.expectedVaultId,
+  });
+  const { signature, ...unsigned } = decoded;
+  if (
+    !same(
+      decoded.endpointId,
+      bytes(binding.expectedEndpointId, 16, "expectedEndpointId"),
+    ) ||
+    !(await verify(
+      "rotation-epoch-destruction-attestation",
+      encodeAncV1UnsignedRotationEpochDestructionAttestation(unsigned),
+      signature,
+      binding.endpointSigningPublicKey,
+    ))
+  )
+    fail("Rotation destruction attestation verification failed");
+  return decoded;
+}
+
+function completionMap(value: AncV1UnsignedRotationControlCommitAttestation) {
+  exact(value, completionUnsignedFields, "Unsigned control commit attestation");
+  return new Map<number, AncV1CanonicalValue>([
+    ...commonMap(value, "rotation-control-commit-attestation"),
+    [COMPLETION.ceremonyId, bytes(value.ceremonyId, 16, "ceremonyId")],
+    [
+      COMPLETION.checkpointHash,
+      bytes(value.checkpointHash, 32, "checkpointHash"),
+    ],
+    [
+      COMPLETION.controlEntryHash,
+      bytes(value.controlEntryHash, 32, "controlEntryHash"),
+    ],
+    [
+      COMPLETION.hostedReceiptHash,
+      bytes(value.hostedReceiptHash, 32, "hostedReceiptHash"),
+    ],
+    [
+      COMPLETION.signerEndpointId,
+      bytes(value.signerEndpointId, 16, "signerEndpointId"),
+    ],
+    [
+      COMPLETION.committedSequence,
+      positive(value.committedSequence, "committedSequence"),
+    ],
+    [
+      COMPLETION.committedHeadHash,
+      bytes(value.committedHeadHash, 32, "committedHeadHash"),
+    ],
+    [
+      COMPLETION.recipientSetHash,
+      bytes(value.recipientSetHash, 32, "recipientSetHash"),
+    ],
+  ]);
+}
+
+export function encodeAncV1UnsignedRotationControlCommitAttestation(
+  value: AncV1UnsignedRotationControlCommitAttestation,
+) {
+  return encodeAncV1Canonical(completionMap(value));
+}
+
+export function encodeAncV1RotationControlCommitAttestation(
+  value: AncV1RotationControlCommitAttestation,
+) {
+  exact(value, completionFields, "Rotation control commit attestation");
+  const { signature, ...unsigned } = value;
+  const encoded = encodeAncV1Canonical(
+    new Map([
+      ...completionMap(unsigned),
+      [COMPLETION.signature, bytes(signature, 64, "signature")],
+    ]),
+  );
+  if (encoded.byteLength > ANC_ROTATION_EVIDENCE_SIZE_LIMITS.completionBytes)
+    fail("Rotation control commit attestation exceeds its size limit");
+  return encoded;
+}
+
+export async function signAncV1RotationControlCommitAttestation(
+  value: AncV1UnsignedRotationControlCommitAttestation,
+  privateKey: Uint8Array,
+): Promise<AncV1RotationControlCommitAttestation> {
+  return {
+    ...value,
+    signature: await sign(
+      "rotation-control-commit-attestation",
+      encodeAncV1UnsignedRotationControlCommitAttestation(value),
+      privateKey,
+    ),
+  };
+}
+
+export function decodeAncV1RotationControlCommitAttestation(
+  encoded: Uint8Array,
+  binding: { readonly expectedVaultId: Uint8Array },
+): AncV1RotationControlCommitAttestation {
+  exact(binding, ["expectedVaultId"], "Control commit attestation binding");
+  const map = decodeAncV1Envelope(encoded, completionKeys, {
+    maxBytes: ANC_ROTATION_EVIDENCE_SIZE_LIMITS.completionBytes,
+  });
+  return {
+    ...decodeCommon(
+      map,
+      "rotation-control-commit-attestation",
+      binding.expectedVaultId,
+    ),
+    type: "rotation-control-commit-attestation",
+    ceremonyId: bytes(
+      field(map, COMPLETION.ceremonyId, "ceremonyId"),
+      16,
+      "ceremonyId",
+    ),
+    checkpointHash: bytes(
+      field(map, COMPLETION.checkpointHash, "checkpointHash"),
+      32,
+      "checkpointHash",
+    ),
+    controlEntryHash: bytes(
+      field(map, COMPLETION.controlEntryHash, "controlEntryHash"),
+      32,
+      "controlEntryHash",
+    ),
+    hostedReceiptHash: bytes(
+      field(map, COMPLETION.hostedReceiptHash, "hostedReceiptHash"),
+      32,
+      "hostedReceiptHash",
+    ),
+    signerEndpointId: bytes(
+      field(map, COMPLETION.signerEndpointId, "signerEndpointId"),
+      16,
+      "signerEndpointId",
+    ),
+    committedSequence: positive(
+      field(map, COMPLETION.committedSequence, "committedSequence"),
+      "committedSequence",
+    ),
+    committedHeadHash: bytes(
+      field(map, COMPLETION.committedHeadHash, "committedHeadHash"),
+      32,
+      "committedHeadHash",
+    ),
+    recipientSetHash: bytes(
+      field(map, COMPLETION.recipientSetHash, "recipientSetHash"),
+      32,
+      "recipientSetHash",
+    ),
+    signature: bytes(
+      field(map, COMPLETION.signature, "signature"),
+      64,
+      "signature",
+    ),
+  };
+}
+
+export async function hashAncV1RotationHostedReceipt(
+  encodedReceipt: Uint8Array,
+): Promise<Uint8Array> {
+  if (
+    !(encodedReceipt instanceof Uint8Array) ||
+    encodedReceipt.byteLength < 1 ||
+    encodedReceipt.byteLength > 1_024
+  )
+    fail("Rotation hosted receipt is outside its limit");
+  return hash("rotation-hosted-receipt-hash", encodedReceipt.slice());
+}
+
+export async function verifyAncV1RotationControlCommitAttestation(
+  encoded: Uint8Array,
+  binding: {
+    readonly expectedVaultId: Uint8Array;
+    readonly expectedSignerEndpointId: Uint8Array;
+    readonly signerSigningPublicKey: Uint8Array;
+    readonly expectedHostedReceiptHash: Uint8Array;
+  },
+): Promise<AncV1RotationControlCommitAttestation> {
+  exact(
+    binding,
+    [
+      "expectedVaultId",
+      "expectedSignerEndpointId",
+      "signerSigningPublicKey",
+      "expectedHostedReceiptHash",
+    ],
+    "Control commit attestation verification binding",
+  );
+  const decoded = decodeAncV1RotationControlCommitAttestation(encoded, {
+    expectedVaultId: binding.expectedVaultId,
+  });
+  const { signature, ...unsigned } = decoded;
+  if (
+    !same(
+      decoded.signerEndpointId,
+      bytes(binding.expectedSignerEndpointId, 16, "expectedSignerEndpointId"),
+    ) ||
+    !same(
+      decoded.hostedReceiptHash,
+      bytes(binding.expectedHostedReceiptHash, 32, "expectedHostedReceiptHash"),
+    ) ||
+    !(await verify(
+      "rotation-control-commit-attestation",
+      encodeAncV1UnsignedRotationControlCommitAttestation(unsigned),
+      signature,
+      binding.signerSigningPublicKey,
+    ))
+  )
+    fail("Rotation control commit attestation verification failed");
+  return decoded;
+}
+
 export async function verifyAncV1RotationAcknowledgementSet(input: {
   readonly encodedAcknowledgements: readonly Uint8Array[];
+  readonly encodedCheckpoint: Uint8Array;
   readonly expectedVaultId: Uint8Array;
-  readonly expectedCeremonyId: Uint8Array;
-  readonly expectedCheckpointHash: Uint8Array;
-  readonly expectedTargetEpoch: number;
-  readonly expectedRecipients: readonly {
-    readonly endpointId: Uint8Array;
-    readonly signingPublicKey: Uint8Array;
-    readonly eekWrapHash: Uint8Array;
-  }[];
+  readonly expectedSignerEndpointId: Uint8Array;
+  readonly signerSigningPublicKey: Uint8Array;
+  readonly expectedRecipients: readonly (AncV1RotationRecipient & {
+    readonly encodedOffer: Uint8Array;
+  })[];
   readonly pendingEpochKey: Uint8Array;
+  readonly now: number;
 }): Promise<readonly AncV1RotationRecipientAcknowledgement[]> {
   exact(
     input,
     [
       "encodedAcknowledgements",
+      "encodedCheckpoint",
       "expectedVaultId",
-      "expectedCeremonyId",
-      "expectedCheckpointHash",
-      "expectedTargetEpoch",
+      "expectedSignerEndpointId",
+      "signerSigningPublicKey",
       "expectedRecipients",
       "pendingEpochKey",
+      "now",
     ],
     "Rotation acknowledgement set input",
   );
@@ -955,18 +1566,82 @@ export async function verifyAncV1RotationAcknowledgementSet(input: {
     input.encodedAcknowledgements.length !== input.expectedRecipients.length
   )
     fail("Rotation acknowledgement coverage is incomplete");
+  const checkpoint = await verifyAncV1RotationManifestCheckpoint(
+    input.encodedCheckpoint,
+    {
+      expectedVaultId: input.expectedVaultId,
+      expectedSignerEndpointId: input.expectedSignerEndpointId,
+      signerSigningPublicKey: input.signerSigningPublicKey,
+    },
+  );
+  const checkpointHash = await hashAncV1RotationManifestCheckpoint(
+    input.encodedCheckpoint,
+    input.expectedVaultId,
+  );
+  const recipientSet = input.expectedRecipients.map((recipient) => {
+    exact(
+      recipient,
+      [
+        "endpointId",
+        "signingPublicKey",
+        "keyAgreementPublicKey",
+        "eekWrapHash",
+        "encodedOffer",
+      ],
+      "Rotation recipient evidence",
+    );
+    return {
+      endpointId: recipient.endpointId,
+      signingPublicKey: recipient.signingPublicKey,
+      keyAgreementPublicKey: recipient.keyAgreementPublicKey,
+      eekWrapHash: recipient.eekWrapHash,
+    };
+  });
+  if (
+    !same(
+      await hashAncV1RotationRecipientSet(recipientSet),
+      checkpoint.recipientSetHash,
+    ) ||
+    recipientSet.some((recipient) =>
+      same(recipient.endpointId, checkpoint.removedEndpointId),
+    ) ||
+    !recipientSet.some(
+      (recipient) =>
+        same(recipient.endpointId, checkpoint.signerEndpointId) &&
+        same(recipient.signingPublicKey, input.signerSigningPublicKey),
+    )
+  )
+    fail("Rotation recipient set does not match the signed checkpoint");
   const recipients = new Map(
-    input.expectedRecipients.map((recipient) => {
-      exact(
-        recipient,
-        ["endpointId", "signingPublicKey", "eekWrapHash"],
-        "Rotation recipient",
-      );
-      return [
-        hex(bytes(recipient.endpointId, 16, "recipient endpointId")),
-        recipient,
-      ] as const;
-    }),
+    await Promise.all(
+      input.expectedRecipients.map(async (recipient) => {
+        const offer = await verifyAncV1RotationRecipientOffer(
+          recipient.encodedOffer,
+          {
+            expectedVaultId: input.expectedVaultId,
+            expectedIssuerEndpointId: checkpoint.signerEndpointId,
+            expectedRecipientEndpointId: recipient.endpointId,
+            issuerSigningPublicKey: input.signerSigningPublicKey,
+            now: input.now,
+          },
+        );
+        const offerHash = await hashAncV1RotationRecipientOffer(
+          recipient.encodedOffer,
+          input.expectedVaultId,
+        );
+        if (
+          !same(offer.ceremonyId, checkpoint.ceremonyId) ||
+          !same(offer.checkpointHash, checkpointHash) ||
+          !same(offer.eekWrapHash, recipient.eekWrapHash) ||
+          offer.targetEpoch !== checkpoint.targetEpoch
+        )
+          fail("Rotation recipient offer does not match the checkpoint");
+        return [
+          hex(bytes(recipient.endpointId, 16, "recipient endpointId")),
+          { ...recipient, offer, offerHash },
+        ] as const;
+      }),
+    ),
   );
   if (recipients.size !== input.expectedRecipients.length)
     fail("Rotation recipients must be unique");
@@ -981,10 +1656,19 @@ export async function verifyAncV1RotationAcknowledgementSet(input: {
     if (
       !recipient ||
       seen.has(id) ||
-      !same(decoded.ceremonyId, input.expectedCeremonyId) ||
-      !same(decoded.checkpointHash, input.expectedCheckpointHash) ||
-      decoded.targetEpoch !== input.expectedTargetEpoch ||
-      !same(decoded.eekWrapHash, recipient.eekWrapHash)
+      !same(decoded.ceremonyId, checkpoint.ceremonyId) ||
+      !same(decoded.checkpointHash, checkpointHash) ||
+      decoded.targetEpoch !== checkpoint.targetEpoch ||
+      !same(decoded.eekWrapHash, recipient.eekWrapHash) ||
+      !same(decoded.offerHash, recipient.offerHash) ||
+      decoded.createdAt + ANC_ROTATION_EVIDENCE_SIZE_LIMITS.clockSkewSeconds <
+        recipient.offer.createdAt ||
+      decoded.createdAt >
+        recipient.offer.expiresAt +
+          ANC_ROTATION_EVIDENCE_SIZE_LIMITS.clockSkewSeconds ||
+      decoded.createdAt >
+        positive(input.now, "now") +
+          ANC_ROTATION_EVIDENCE_SIZE_LIMITS.clockSkewSeconds
     )
       fail("Rotation acknowledgement set is not bound to the ceremony");
     verified.push(
@@ -997,4 +1681,163 @@ export async function verifyAncV1RotationAcknowledgementSet(input: {
     seen.add(id);
   }
   return Object.freeze(verified);
+}
+
+export async function verifyAncV1RotationDestructionSet(input: {
+  readonly encodedAttestations: readonly Uint8Array[];
+  readonly encodedCheckpoint: Uint8Array;
+  readonly expectedVaultId: Uint8Array;
+  readonly expectedSignerEndpointId: Uint8Array;
+  readonly signerSigningPublicKey: Uint8Array;
+  readonly expectedRecipients: readonly AncV1RotationRecipient[];
+  readonly now: number;
+}): Promise<readonly AncV1RotationEpochDestructionAttestation[]> {
+  exact(
+    input,
+    [
+      "encodedAttestations",
+      "encodedCheckpoint",
+      "expectedVaultId",
+      "expectedSignerEndpointId",
+      "signerSigningPublicKey",
+      "expectedRecipients",
+      "now",
+    ],
+    "Rotation destruction set input",
+  );
+  if (
+    input.expectedRecipients.length < 1 ||
+    input.expectedRecipients.length >
+      ANC_ROTATION_EVIDENCE_SIZE_LIMITS.acknowledgements ||
+    input.encodedAttestations.length !== input.expectedRecipients.length
+  )
+    fail("Rotation destruction coverage is incomplete");
+  const checkpoint = await verifyAncV1RotationManifestCheckpoint(
+    input.encodedCheckpoint,
+    {
+      expectedVaultId: input.expectedVaultId,
+      expectedSignerEndpointId: input.expectedSignerEndpointId,
+      signerSigningPublicKey: input.signerSigningPublicKey,
+    },
+  );
+  const checkpointHash = await hashAncV1RotationManifestCheckpoint(
+    input.encodedCheckpoint,
+    input.expectedVaultId,
+  );
+  if (
+    !same(
+      await hashAncV1RotationRecipientSet(input.expectedRecipients),
+      checkpoint.recipientSetHash,
+    ) ||
+    input.expectedRecipients.some((recipient) =>
+      same(recipient.endpointId, checkpoint.removedEndpointId),
+    )
+  )
+    fail("Rotation destruction roster does not match the checkpoint");
+  const recipients = new Map(
+    input.expectedRecipients.map((recipient) => [
+      hex(recipient.endpointId),
+      recipient,
+    ]),
+  );
+  if (recipients.size !== input.expectedRecipients.length)
+    fail("Rotation destruction recipients must be unique");
+  const seen = new Set<string>();
+  const verified: AncV1RotationEpochDestructionAttestation[] = [];
+  for (const encoded of input.encodedAttestations) {
+    const decoded = decodeAncV1RotationEpochDestructionAttestation(encoded, {
+      expectedVaultId: input.expectedVaultId,
+    });
+    const id = hex(decoded.endpointId);
+    const recipient = recipients.get(id);
+    if (
+      !recipient ||
+      seen.has(id) ||
+      !same(decoded.ceremonyId, checkpoint.ceremonyId) ||
+      !same(decoded.checkpointHash, checkpointHash) ||
+      !same(decoded.controlEntryHash, checkpoint.controlEntryHash) ||
+      decoded.destroyedEpoch !== checkpoint.baseEpoch ||
+      decoded.activatedEpoch !== checkpoint.targetEpoch ||
+      decoded.createdAt >
+        positive(input.now, "now") +
+          ANC_ROTATION_EVIDENCE_SIZE_LIMITS.clockSkewSeconds
+    )
+      fail("Rotation destruction set is not bound to the ceremony");
+    verified.push(
+      await verifyAncV1RotationEpochDestructionAttestation(encoded, {
+        expectedVaultId: input.expectedVaultId,
+        expectedEndpointId: recipient.endpointId,
+        endpointSigningPublicKey: recipient.signingPublicKey,
+      }),
+    );
+    seen.add(id);
+  }
+  return Object.freeze(verified);
+}
+
+export async function verifyAncV1RotationCommittedCompletion(input: {
+  readonly encodedCompletion: Uint8Array;
+  readonly encodedCheckpoint: Uint8Array;
+  readonly encodedHostedReceipt: Uint8Array;
+  readonly expectedVaultId: Uint8Array;
+  readonly expectedSignerEndpointId: Uint8Array;
+  readonly signerSigningPublicKey: Uint8Array;
+  readonly notBefore: number;
+  readonly now: number;
+}): Promise<AncV1RotationControlCommitAttestation> {
+  exact(
+    input,
+    [
+      "encodedCompletion",
+      "encodedCheckpoint",
+      "encodedHostedReceipt",
+      "expectedVaultId",
+      "expectedSignerEndpointId",
+      "signerSigningPublicKey",
+      "notBefore",
+      "now",
+    ],
+    "Rotation committed completion input",
+  );
+  const checkpoint = await verifyAncV1RotationManifestCheckpoint(
+    input.encodedCheckpoint,
+    {
+      expectedVaultId: input.expectedVaultId,
+      expectedSignerEndpointId: input.expectedSignerEndpointId,
+      signerSigningPublicKey: input.signerSigningPublicKey,
+    },
+  );
+  const checkpointHash = await hashAncV1RotationManifestCheckpoint(
+    input.encodedCheckpoint,
+    input.expectedVaultId,
+  );
+  const receiptHash = await hashAncV1RotationHostedReceipt(
+    input.encodedHostedReceipt,
+  );
+  const completion = await verifyAncV1RotationControlCommitAttestation(
+    input.encodedCompletion,
+    {
+      expectedVaultId: input.expectedVaultId,
+      expectedSignerEndpointId: input.expectedSignerEndpointId,
+      signerSigningPublicKey: input.signerSigningPublicKey,
+      expectedHostedReceiptHash: receiptHash,
+    },
+  );
+  const notBefore = positive(input.notBefore, "notBefore");
+  const now = positive(input.now, "now");
+  if (
+    !same(completion.ceremonyId, checkpoint.ceremonyId) ||
+    !same(completion.checkpointHash, checkpointHash) ||
+    !same(completion.controlEntryHash, checkpoint.controlEntryHash) ||
+    !same(completion.committedHeadHash, checkpoint.controlEntryHash) ||
+    !same(completion.recipientSetHash, checkpoint.recipientSetHash) ||
+    checkpoint.baseSequence === Number.MAX_SAFE_INTEGER ||
+    completion.committedSequence !== checkpoint.baseSequence + 1 ||
+    completion.createdAt + ANC_ROTATION_EVIDENCE_SIZE_LIMITS.clockSkewSeconds <
+      notBefore ||
+    completion.createdAt >
+      now + ANC_ROTATION_EVIDENCE_SIZE_LIMITS.clockSkewSeconds
+  )
+    fail("Rotation completion is not bound to committed ceremony evidence");
+  return completion;
 }
