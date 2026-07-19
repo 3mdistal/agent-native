@@ -82,6 +82,21 @@ AncPrivateVaultInspectObjectRevision(
     AncPrivateVaultControlLogState *authenticatedState,
     AncPrivateVaultObjectRevisionStatus *_Nullable status);
 
+/* Authenticates the complete old revision, unwraps its DEK under the active
+ * epoch, authenticates (but does not re-encrypt) the ciphertext chunk, and
+ * emits a newly signed header plus DEK wrap for exactly the next epoch. The
+ * returned bundle preserves the original chunk bytes and revision number. */
+FOUNDATION_EXPORT AncPrivateVaultSealedObjectRevision *_Nullable
+AncPrivateVaultRewrapObjectRevision(
+    NSData *encodedRevision, NSData *expectedVaultId, NSData *expectedObjectId,
+    NSData *rewrapWriterEndpointId, uint64_t targetEpoch,
+    NSData *dekEnvelopeId, NSData *headerEnvelopeId, NSData *dekNonce,
+    AncPrivateVaultControlLogState *authenticatedBaseState,
+    AncPrivateVaultGuardedMemory *rewrapWriterSigningSeed,
+    AncPrivateVaultGuardedMemory *baseEpochKey,
+    AncPrivateVaultGuardedMemory *targetEpochKey,
+    AncPrivateVaultObjectRevisionStatus *_Nullable status);
+
 FOUNDATION_EXPORT NSString *AncPrivateVaultObjectRevisionCategory(
     AncPrivateVaultObjectRevisionStatus status);
 

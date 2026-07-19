@@ -554,6 +554,297 @@ AncPrivateVaultInspectedObjectRevision *AncPrivateVaultInspectObjectRevision(
   return result;
 }
 
+AncPrivateVaultSealedObjectRevision *AncPrivateVaultRewrapObjectRevision(
+    NSData *encodedRevision, NSData *expectedVaultId, NSData *expectedObjectId,
+    NSData *rewrapWriterEndpointId, uint64_t targetEpoch,
+    NSData *dekEnvelopeId, NSData *headerEnvelopeId, NSData *dekNonce,
+    AncPrivateVaultControlLogState *authenticatedBaseState,
+    AncPrivateVaultGuardedMemory *rewrapWriterSigningSeed,
+    AncPrivateVaultGuardedMemory *baseEpochKey,
+    AncPrivateVaultGuardedMemory *targetEpochKey,
+    AncPrivateVaultObjectRevisionStatus *status) {
+  SetStatus(status, AncPrivateVaultObjectRevisionStatusInvalid);
+  AncPrivateVaultGuardedMemory *signingPrivate = nil;
+  AncPrivateVaultGuardedMemory *dek = nil;
+  AncPrivateVaultGuardedMemory *authenticatedPlaintext = nil;
+  AncPrivateVaultSealedObjectRevision *result = nil;
+  @try {
+    NSData *source = [encodedRevision copy];
+    if (source.length == 0 || source.length > kMaximumEncoded ||
+        !Exact(expectedVaultId, 16) || !Exact(expectedObjectId, 16) ||
+        !Exact(rewrapWriterEndpointId, 16) || targetEpoch == 0 ||
+        targetEpoch > kMaxSafeInteger || !Exact(dekEnvelopeId, 16) ||
+        !Exact(headerEnvelopeId, 16) || !Exact(dekNonce, 24) ||
+        authenticatedBaseState == nil ||
+        authenticatedBaseState.epoch == UINT64_MAX ||
+        targetEpoch != authenticatedBaseState.epoch + 1 ||
+        rewrapWriterSigningSeed.length != 32 ||
+        rewrapWriterSigningSeed.isClosed || baseEpochKey.length != 32 ||
+        baseEpochKey.isClosed || targetEpochKey.length != 32 ||
+        targetEpochKey.isClosed)
+      @throw [NSException exceptionWithName:@"AncInvalid" reason:nil userInfo:nil];
+
+    AncPrivateVaultObjectRevisionStatus inspectedStatus;
+    AncPrivateVaultInspectedObjectRevision *inspected =
+        AncPrivateVaultInspectObjectRevision(
+            source, expectedVaultId, expectedObjectId,
+            authenticatedBaseState, &inspectedStatus);
+    if (inspected == nil) {
+      if (inspectedStatus == AncPrivateVaultObjectRevisionStatusSignature)
+        @throw [NSException exceptionWithName:@"AncSignature" reason:nil userInfo:nil];
+      if (inspectedStatus == AncPrivateVaultObjectRevisionStatusBinding)
+        @throw [NSException exceptionWithName:@"AncBinding" reason:nil userInfo:nil];
+      @throw [NSException exceptionWithName:@"AncEncoding" reason:nil userInfo:nil];
+    }
+
+    __block BOOL keysDiffer = NO;
+    AncPrivateVaultGuardedMemoryStatus baseBorrow =
+        [baseEpochKey borrow:^BOOL(uint8_t *baseBytes, size_t baseLength) {
+      return [targetEpochKey borrow:^BOOL(uint8_t *targetBytes,
+                                          size_t targetLength) {
+        keysDiffer = baseLength == 32 && targetLength == 32 &&
+            anc_pv_memcmp(baseBytes, targetBytes, 32) != ANC_PV_CRYPTO_OK;
+        return keysDiffer;
+      }] == AncPrivateVaultGuardedMemoryStatusOK && keysDiffer;
+    }];
+    if (baseBorrow != AncPrivateVaultGuardedMemoryStatusOK || !keysDiffer)
+      @throw [NSException exceptionWithName:@"AncCrypto" reason:nil userInfo:nil];
+
+    NSDictionary *bundle = DecodeMap(source, kMaximumEncoded);
+    NSArray *parts =
+        Field(bundle, @4, AncPrivateVaultCanonicalTypeArray).arrayValue;
+    if (!Keys(bundle, @[@1, @2, @3, @4]) ||
+        ![Field(bundle, @1, AncPrivateVaultCanonicalTypeText).textValue
+            isEqualToString:@"anc/v1-object-bundle"] ||
+        parts.count != 1 ||
+        ((AncPrivateVaultCanonicalValue *)parts[0]).type !=
+            AncPrivateVaultCanonicalTypeBytes)
+      @throw [NSException exceptionWithName:@"AncEncoding" reason:nil userInfo:nil];
+    NSData *encodedDek =
+        Field(bundle, @2, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+    NSData *encodedHeader =
+        Field(bundle, @3, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+    NSData *encodedChunk =
+        ((AncPrivateVaultCanonicalValue *)parts[0]).bytesValue;
+    NSDictionary *dekMap = DecodeMap(encodedDek, 64 * 1024);
+    NSDictionary *headerMap = DecodeMap(encodedHeader, 64 * 1024);
+    NSDictionary *chunkMap = DecodeMap(encodedChunk, kMaximumEncoded);
+    if (!Keys(dekMap, @[@1,@2,@3,@4,@5,@40,@41,@42,@43,@44]) ||
+        !Keys(headerMap, @[@1,@2,@3,@4,@5,@50,@51,@52,@53,@54,@55,@56,@57,@58]) ||
+        !Keys(chunkMap, @[@1,@2,@3,@4,@5,@130,@131,@132,@133,@134,@135]))
+      @throw [NSException exceptionWithName:@"AncEncoding" reason:nil userInfo:nil];
+    NSData *objectId =
+        Field(dekMap, @40, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+    uint64_t revision = PositiveInteger(dekMap, @41);
+    uint64_t baseEpoch = PositiveInteger(dekMap, @42);
+    uint64_t createdAt = CreatedAt(dekMap);
+    uint64_t plaintextLength = PositiveInteger(headerMap, @54);
+    NSString *contentType =
+        Field(headerMap, @55, AncPrivateVaultCanonicalTypeText).textValue;
+    NSData *oldNonce =
+        Field(dekMap, @43, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+    NSData *wrappedDek =
+        Field(dekMap, @44, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+    NSData *streamHeader =
+        Field(chunkMap, @134, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+    NSData *streamCiphertext =
+        Field(chunkMap, @135, AncPrivateVaultCanonicalTypeBytes).bytesValue;
+    if (!Same(objectId, expectedObjectId) ||
+        revision != inspected.revision || baseEpoch != inspected.epoch ||
+        baseEpoch != authenticatedBaseState.epoch || createdAt == 0 ||
+        plaintextLength == 0 || plaintextLength > kMaximumPlaintext ||
+        ![contentType isEqualToString:inspected.contentType] ||
+        !Exact(oldNonce, 24) || !Exact(wrappedDek, 48) ||
+        !Exact(streamHeader, 24) ||
+        streamCiphertext.length != plaintextLength + 17)
+      @throw [NSException exceptionWithName:@"AncBinding" reason:nil userInfo:nil];
+
+    AncPrivateVaultGuardedMemoryStatus memoryStatus;
+    dek = [AncPrivateVaultGuardedMemory memoryWithLength:32 status:&memoryStatus];
+    authenticatedPlaintext =
+        [AncPrivateVaultGuardedMemory memoryWithLength:plaintextLength
+                                               status:&memoryStatus];
+    signingPrivate =
+        [AncPrivateVaultGuardedMemory memoryWithLength:64 status:&memoryStatus];
+    if (dek == nil || authenticatedPlaintext == nil || signingPrivate == nil)
+      @throw [NSException exceptionWithName:@"AncCrypto" reason:nil userInfo:nil];
+
+    NSMutableDictionary *oldDekAADMap = [dekMap mutableCopy];
+    [oldDekAADMap removeObjectForKey:@44];
+    NSData *oldDekAAD = DomainData(
+        kDekDomain, sizeof kDekDomain, EncodeMap(oldDekAADMap));
+    __block BOOL unwrapped = NO;
+    __block size_t dekLength = 0;
+    AncPrivateVaultGuardedMemoryStatus unwrapBorrow =
+        [baseEpochKey borrow:^BOOL(uint8_t *epochBytes, size_t epochLength) {
+      if (epochLength != 32) return NO;
+      return [dek borrow:^BOOL(uint8_t *dekBytes, size_t capacity) {
+        unwrapped = capacity == 32 &&
+            anc_pv_xchacha20poly1305_decrypt(
+                dekBytes, capacity, &dekLength, wrappedDek.bytes,
+                wrappedDek.length, oldDekAAD.bytes, oldDekAAD.length,
+                oldNonce.bytes, epochBytes) == ANC_PV_CRYPTO_OK &&
+            dekLength == 32;
+        return unwrapped;
+      }] == AncPrivateVaultGuardedMemoryStatusOK && unwrapped;
+    }];
+    if (unwrapBorrow != AncPrivateVaultGuardedMemoryStatusOK || !unwrapped)
+      @throw [NSException exceptionWithName:@"AncCrypto" reason:nil userInfo:nil];
+
+    NSData *chunkAAD = ChunkAAD(objectId, revision);
+    NSData *chunkDomainAAD =
+        DomainData(kChunkDomain, sizeof kChunkDomain, chunkAAD);
+    __block BOOL chunkAuthenticated = NO;
+    __block size_t authenticatedLength = 0;
+    AncPrivateVaultGuardedMemoryStatus plaintextBorrow =
+        [authenticatedPlaintext borrow:^BOOL(uint8_t *plaintextBytes,
+                                              size_t plaintextCapacity) {
+      return [dek borrow:^BOOL(uint8_t *dekBytes, size_t length) {
+        chunkAuthenticated = length == 32 &&
+            plaintextCapacity == plaintextLength &&
+            anc_pv_secretstream_decrypt_final(
+                plaintextBytes, plaintextCapacity, &authenticatedLength,
+                streamHeader.bytes, streamCiphertext.bytes,
+                streamCiphertext.length, chunkDomainAAD.bytes,
+                chunkDomainAAD.length, dekBytes) == ANC_PV_CRYPTO_OK &&
+            authenticatedLength == plaintextLength;
+        return chunkAuthenticated;
+      }] == AncPrivateVaultGuardedMemoryStatusOK && chunkAuthenticated;
+    }];
+    if (plaintextBorrow != AncPrivateVaultGuardedMemoryStatusOK ||
+        !chunkAuthenticated)
+      @throw [NSException exceptionWithName:@"AncCrypto" reason:nil userInfo:nil];
+
+    NSMutableData *rewrapWriterPublic = [NSMutableData dataWithLength:32];
+    __block BOOL signingDerived = NO;
+    AncPrivateVaultGuardedMemoryStatus signingBorrow =
+        [signingPrivate borrow:^BOOL(uint8_t *privateBytes,
+                                     size_t privateLength) {
+      return [rewrapWriterSigningSeed borrow:^BOOL(uint8_t *seed,
+                                                    size_t seedLength) {
+        signingDerived = privateLength == 64 && seedLength == 32 &&
+            anc_pv_ed25519_seed_keypair(rewrapWriterPublic.mutableBytes,
+                                        privateBytes, seed) ==
+                ANC_PV_CRYPTO_OK;
+        return signingDerived;
+      }] == AncPrivateVaultGuardedMemoryStatusOK && signingDerived;
+    }];
+    NSMutableString *writerHex = [NSMutableString stringWithCapacity:32];
+    const uint8_t *writerBytes = rewrapWriterEndpointId.bytes;
+    for (NSUInteger index = 0; index < 16; index++)
+      [writerHex appendFormat:@"%02x", writerBytes[index]];
+    AncPrivateVaultControlLogMember *writer = nil;
+    for (AncPrivateVaultControlLogMember *candidate in
+         authenticatedBaseState.activeMembers) {
+      if ([candidate.endpointId isEqualToString:writerHex]) {
+        if (writer != nil)
+          @throw [NSException exceptionWithName:@"AncBinding" reason:nil userInfo:nil];
+        writer = candidate;
+      }
+    }
+    if (signingBorrow != AncPrivateVaultGuardedMemoryStatusOK ||
+        !signingDerived || writer == nil ||
+        !Same(writer.signingPublicKey, rewrapWriterPublic))
+      @throw [NSException exceptionWithName:@"AncBinding" reason:nil userInfo:nil];
+
+    NSMutableDictionary *newDekMap =
+        [Common(expectedVaultId, @"dek-wrap", createdAt, dekEnvelopeId)
+            mutableCopy];
+    newDekMap[@40] = B(objectId);
+    newDekMap[@41] = I(revision);
+    newDekMap[@42] = I(targetEpoch);
+    newDekMap[@43] = B(dekNonce);
+    NSData *newDekAAD = EncodeMap(newDekMap);
+    NSData *newDekDomainAAD =
+        DomainData(kDekDomain, sizeof kDekDomain, newDekAAD);
+    NSMutableData *newWrappedDek = [NSMutableData dataWithLength:48];
+    __block BOOL wrapped = NO;
+    __block size_t wrappedLength = 0;
+    AncPrivateVaultGuardedMemoryStatus wrapBorrow =
+        [targetEpochKey borrow:^BOOL(uint8_t *epochBytes, size_t epochLength) {
+      if (epochLength != 32) return NO;
+      return [dek borrow:^BOOL(uint8_t *dekBytes, size_t length) {
+        wrapped = length == 32 &&
+            anc_pv_xchacha20poly1305_encrypt(
+                newWrappedDek.mutableBytes, newWrappedDek.length,
+                &wrappedLength, dekBytes, length, newDekDomainAAD.bytes,
+                newDekDomainAAD.length, dekNonce.bytes, epochBytes) ==
+                ANC_PV_CRYPTO_OK &&
+            wrappedLength == 48;
+        return wrapped;
+      }] == AncPrivateVaultGuardedMemoryStatusOK && wrapped;
+    }];
+    if (wrapBorrow != AncPrivateVaultGuardedMemoryStatusOK || !wrapped)
+      @throw [NSException exceptionWithName:@"AncCrypto" reason:nil userInfo:nil];
+    newDekMap[@44] = B(newWrappedDek);
+    NSData *newEncodedDek = EncodeMap(newDekMap);
+    NSData *newDekHash =
+        Hash(kDekDomain, sizeof kDekDomain, newEncodedDek);
+    NSMutableDictionary *newHeaderMap =
+        [Common(expectedVaultId, @"object-header", createdAt,
+                headerEnvelopeId) mutableCopy];
+    newHeaderMap[@50] = B(objectId);
+    newHeaderMap[@51] = I(revision);
+    newHeaderMap[@52] = I(targetEpoch);
+    newHeaderMap[@53] = I(1);
+    newHeaderMap[@54] = I(plaintextLength);
+    newHeaderMap[@55] = T(contentType);
+    newHeaderMap[@56] = B(newDekHash);
+    newHeaderMap[@57] = B(rewrapWriterEndpointId);
+    NSData *newUnsignedHeader = EncodeMap(newHeaderMap);
+    NSData *newHeaderSignature = Sign(newUnsignedHeader, signingPrivate,
+                                      kHeaderDomain, sizeof kHeaderDomain);
+    if (newEncodedDek == nil || newDekHash == nil ||
+        newUnsignedHeader == nil || newHeaderSignature == nil)
+      @throw [NSException exceptionWithName:@"AncCrypto" reason:nil userInfo:nil];
+    newHeaderMap[@58] = B(newHeaderSignature);
+    NSData *newEncodedHeader = EncodeMap(newHeaderMap);
+    NSData *rewrappedBundle = EncodeMap(@{
+      @1 : T(@"anc/v1-object-bundle"),
+      @2 : B(newEncodedDek),
+      @3 : B(newEncodedHeader),
+      @4 : [AncPrivateVaultCanonicalValue array:@[ B(encodedChunk) ]]
+    });
+    NSData *newRevisionId =
+        Hash(kHeaderDomain, sizeof kHeaderDomain, newEncodedHeader);
+    if (rewrappedBundle == nil || newRevisionId == nil ||
+        rewrappedBundle.length > kMaximumEncoded)
+      @throw [NSException exceptionWithName:@"AncEncoding" reason:nil userInfo:nil];
+    result = class_createInstance(AncPrivateVaultSealedObjectRevision.class, 0);
+    result.encodedRevision = rewrappedBundle;
+    result.revisionId = newRevisionId;
+    result.objectId = [objectId copy];
+    result.revision = revision;
+    result.epoch = targetEpoch;
+    result.contentType = [contentType copy];
+    result.plaintextLength = plaintextLength;
+    object_setClass(result,
+                    AncPrivateVaultImmutableSealedObjectRevision.class);
+    SetStatus(status, AncPrivateVaultObjectRevisionStatusOK);
+  } @catch (NSException *exception) {
+    if ([exception.name isEqualToString:@"AncBinding"])
+      SetStatus(status, AncPrivateVaultObjectRevisionStatusBinding);
+    else if ([exception.name isEqualToString:@"AncSignature"])
+      SetStatus(status, AncPrivateVaultObjectRevisionStatusSignature);
+    else if ([exception.name isEqualToString:@"AncCrypto"])
+      SetStatus(status, AncPrivateVaultObjectRevisionStatusCrypto);
+    else if ([exception.name isEqualToString:@"AncEncoding"])
+      SetStatus(status, AncPrivateVaultObjectRevisionStatusEncoding);
+  }
+  BOOL signingClosed = signingPrivate == nil ||
+      [signingPrivate close] == AncPrivateVaultGuardedMemoryStatusOK;
+  BOOL dekClosed =
+      dek == nil || [dek close] == AncPrivateVaultGuardedMemoryStatusOK;
+  BOOL plaintextClosed = authenticatedPlaintext == nil ||
+      [authenticatedPlaintext close] ==
+          AncPrivateVaultGuardedMemoryStatusOK;
+  if (!signingClosed || !dekClosed || !plaintextClosed) {
+    SetStatus(status, AncPrivateVaultObjectRevisionStatusCleanup);
+    return nil;
+  }
+  return result;
+}
+
 AncPrivateVaultOpenedObjectRevision *AncPrivateVaultOpenObjectRevision(
     NSData *encodedRevision, NSData *expectedVaultId,
     NSData *expectedObjectId, AncPrivateVaultControlLogState *authenticatedState,

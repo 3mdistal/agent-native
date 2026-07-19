@@ -66,6 +66,21 @@ static NSData *ReframeLegacyFixture(NSData *legacy) {
   return encoded;
 }
 
+static NSData *ChunkBytes(NSData *bundleBytes) {
+  AncPrivateVaultCanonicalStatus status;
+  AncPrivateVaultCanonicalValue *bundle =
+      AncPrivateVaultCanonicalDecode(bundleBytes, 1024 * 1024 + 64 * 1024,
+                                     &status);
+  AncPrivateVaultCanonicalValue *chunks = bundle.mapValue[@4];
+  AncPrivateVaultCanonicalValue *chunk = chunks.arrayValue.firstObject;
+  assert(status == AncPrivateVaultCanonicalStatusOK &&
+         bundle.type == AncPrivateVaultCanonicalTypeMap &&
+         chunks.type == AncPrivateVaultCanonicalTypeArray &&
+         chunks.arrayValue.count == 1 &&
+         chunk.type == AncPrivateVaultCanonicalTypeBytes);
+  return chunk.bytesValue;
+}
+
 static AncPrivateVaultControlLogState *State(NSData *vaultId,
                                               NSData *writerId,
                                               NSData *signingPublic) {
@@ -166,6 +181,68 @@ int main(void) {
            [opened.plaintext isEqualToData:plaintext] &&
            [opened.revisionId isEqualToData:sealed.revisionId] &&
            [opened.writerEndpointId isEqualToData:writerId]);
+
+    NSData *targetEpochBytes = Pattern(0x57, 32);
+    AncPrivateVaultGuardedMemory *targetEpoch = Secret(targetEpochBytes);
+    NSData *rewrapWriterId = Pattern(0x34, 16);
+    NSData *rewrapSigningSeedBytes = Pattern(0x45, 32);
+    uint8_t rewrapSigningPublic[32] = {0}, rewrapSigningPrivate[64] = {0};
+    assert(anc_pv_ed25519_seed_keypair(
+               rewrapSigningPublic, rewrapSigningPrivate,
+               rewrapSigningSeedBytes.bytes) == ANC_PV_CRYPTO_OK);
+    anc_pv_zeroize(rewrapSigningPrivate, sizeof rewrapSigningPrivate);
+    NSData *rewrapSigningPublicData =
+        [NSData dataWithBytes:rewrapSigningPublic
+                       length:sizeof rewrapSigningPublic];
+    anc_pv_zeroize(rewrapSigningPublic, sizeof rewrapSigningPublic);
+    AncPrivateVaultGuardedMemory *rewrapSigning =
+        Secret(rewrapSigningSeedBytes);
+    AncPrivateVaultControlLogState *rewrapWriterState =
+        State(vaultId, rewrapWriterId, rewrapSigningPublicData);
+    AncPrivateVaultControlLogState *rotationBaseState =
+        State(vaultId, writerId, signingPublicData);
+    [rotationBaseState
+        setValue:[rotationBaseState.activeMembers
+                     arrayByAddingObjectsFromArray:
+                         rewrapWriterState.activeMembers]
+          forKey:@"activeMembers"];
+    AncPrivateVaultSealedObjectRevision *rewrapped =
+        AncPrivateVaultRewrapObjectRevision(
+            sealed.encodedRevision, vaultId, objectId, rewrapWriterId, 8,
+            Pattern(0x81, 16), Pattern(0x82, 16), Pattern(0x83, 24),
+            rotationBaseState, rewrapSigning, epoch, targetEpoch, &status);
+    assert(rewrapped != nil &&
+           status == AncPrivateVaultObjectRevisionStatusOK &&
+           rewrapped.revision == sealed.revision && rewrapped.epoch == 8 &&
+           ![rewrapped.revisionId isEqualToData:sealed.revisionId] &&
+           [ChunkBytes(rewrapped.encodedRevision)
+               isEqualToData:ChunkBytes(sealed.encodedRevision)]);
+    AncPrivateVaultControlLogState *targetState =
+        State(vaultId, rewrapWriterId, rewrapSigningPublicData);
+    [targetState setValue:@8 forKey:@"epoch"];
+    AncPrivateVaultOpenedObjectRevision *rewrappedOpened =
+        AncPrivateVaultOpenObjectRevision(
+            rewrapped.encodedRevision, vaultId, objectId, targetState,
+            targetEpoch, &status);
+    assert(rewrappedOpened != nil &&
+           status == AncPrivateVaultObjectRevisionStatusOK &&
+           [rewrappedOpened.plaintext isEqualToData:plaintext] &&
+           rewrappedOpened.revision == 3 && rewrappedOpened.epoch == 8 &&
+           [rewrappedOpened.writerEndpointId isEqualToData:rewrapWriterId]);
+    assert(AncPrivateVaultOpenObjectRevision(
+               rewrapped.encodedRevision, vaultId, objectId, state, epoch,
+               &status) == nil &&
+           status != AncPrivateVaultObjectRevisionStatusOK);
+    AncPrivateVaultGuardedMemory *unchangedTarget = Secret(epochBytes);
+    assert(AncPrivateVaultRewrapObjectRevision(
+               sealed.encodedRevision, vaultId, objectId, rewrapWriterId, 8,
+               Pattern(0x84, 16), Pattern(0x85, 16), Pattern(0x86, 24),
+               rotationBaseState, rewrapSigning, epoch, unchangedTarget,
+               &status) == nil &&
+           status == AncPrivateVaultObjectRevisionStatusCrypto);
+    assert([unchangedTarget close] == AncPrivateVaultGuardedMemoryStatusOK);
+    assert([rewrapSigning close] == AncPrivateVaultGuardedMemoryStatusOK);
+    assert([targetEpoch close] == AncPrivateVaultGuardedMemoryStatusOK);
 
     NSMutableData *tampered = [sealed.encodedRevision mutableCopy];
     ((uint8_t *)tampered.mutableBytes)[tampered.length - 1] ^= 1;
