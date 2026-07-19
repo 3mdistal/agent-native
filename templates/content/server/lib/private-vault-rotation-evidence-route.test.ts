@@ -14,6 +14,7 @@ const appendDestruction = vi.hoisted(() => vi.fn());
 const readForInitiator = vi.hoisted(() => vi.fn());
 const appendHostedReceipt = vi.hoisted(() => vi.fn());
 const appendCompletionAttestation = vi.hoisted(() => vi.fn());
+const appendControlBundle = vi.hoisted(() => vi.fn());
 
 vi.mock("h3", () => ({
   getHeader: (event: TestEvent, name: string) => event.headers[name],
@@ -41,6 +42,7 @@ vi.mock("./private-vault-rotation-evidence-runtime.js", () => ({
     readForInitiator,
     appendHostedReceipt,
     appendCompletionAttestation,
+    appendControlBundle,
   },
 }));
 
@@ -96,6 +98,13 @@ beforeEach(() => {
     recipientEndpointId: principal.endpointId,
     offer: Uint8Array.of(7),
     eekWrap: Uint8Array.of(8),
+    checkpoint: Uint8Array.of(6),
+    signedEntry: Uint8Array.of(11),
+    recoveryWrap: Uint8Array.of(12),
+  });
+  appendControlBundle.mockResolvedValue({
+    ...status,
+    phase: "awaiting_acknowledgements",
   });
   appendAcknowledgement.mockResolvedValue({
     ...status,
@@ -193,8 +202,11 @@ describe("Private Vault rotation evidence routes", () => {
     ).resolves.toMatchObject({
       ceremonyId,
       recipientEndpointId: principal.endpointId,
+      checkpoint: "Bg",
       offer: "Bw",
       eekWrap: "CA",
+      signedEntry: "Cw",
+      recoveryWrap: "DA",
     });
     expect(authenticateRecipient).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -218,6 +230,35 @@ describe("Private Vault rotation evidence routes", () => {
       principal.endpointId,
       expect.objectContaining({ byteLength: 2 }),
     );
+  });
+
+  it("uploads an exact bounded control bundle on its own proof path", async () => {
+    const bundle = event(Uint8Array.of(31, 32, 33));
+    await expect(
+      handlePrivateVaultRotationEvidenceExchange(
+        bundle as never,
+        "controlBundle",
+        ceremonyId,
+      ),
+    ).resolves.toMatchObject({ phase: "awaiting_acknowledgements" });
+    expect(appendControlBundle).toHaveBeenCalledWith(
+      { proof: true },
+      `/api/private-vault/rotation-evidence/${ceremonyId}/control-bundle`,
+      ceremonyId,
+      expect.objectContaining({ byteLength: 3 }),
+    );
+    expect(authenticateRecipient).not.toHaveBeenCalled();
+
+    const oversized = event(Uint8Array.of(1));
+    oversized.headers["content-length"] = "9999999";
+    await expect(
+      handlePrivateVaultRotationEvidenceExchange(
+        oversized as never,
+        "controlBundle",
+        ceremonyId,
+      ),
+    ).resolves.toEqual({ error: "Not found" });
+    expect(appendControlBundle).toHaveBeenCalledTimes(1);
   });
 
   it("returns exact collected bytes only to the proof-authenticated initiator", async () => {

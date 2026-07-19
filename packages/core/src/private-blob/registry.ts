@@ -43,7 +43,19 @@ interface PublicUploadDescriptor {
   createdAt: string;
 }
 
+interface EncryptedPrivateBlobDescriptor {
+  kind: "agent-native.private-blob.encrypted-provider";
+  version: 1;
+  underlying: PrivateBlobHandle;
+  encryption: EncryptionParams;
+  mimeType?: string;
+  metadata?: PrivateBlobHandle["metadata"];
+  size: number;
+  createdAt: string;
+}
+
 const PUBLIC_UPLOAD_HANDLE_PREFIX = "public-upload:v1:";
+const ENCRYPTED_PROVIDER_HANDLE_PREFIX = "encrypted-provider:v1:";
 const globals = globalThis as typeof globalThis & PrivateBlobGlobals;
 const providers: Map<string, PrivateBlobProvider> =
   (globals.__agentNativePrivateBlobProviders ??= new Map());
@@ -113,6 +125,40 @@ function decodePublicUploadDescriptor(id: string): PublicUploadDescriptor {
 
 function isPublicUploadFallbackHandle(handle: PrivateBlobHandle): boolean {
   return handle.id.startsWith(PUBLIC_UPLOAD_HANDLE_PREFIX);
+}
+
+function encodeEncryptedProviderDescriptor(
+  descriptor: EncryptedPrivateBlobDescriptor,
+): string {
+  return `${ENCRYPTED_PROVIDER_HANDLE_PREFIX}${encryptSecretValue(
+    JSON.stringify(descriptor),
+  )}`;
+}
+
+function decodeEncryptedProviderDescriptor(
+  handle: PrivateBlobHandle,
+): EncryptedPrivateBlobDescriptor {
+  if (
+    handle.provider !== "encrypted-private-blob" ||
+    !handle.id.startsWith(ENCRYPTED_PROVIDER_HANDLE_PREFIX)
+  )
+    throw new Error("Private blob handle is not encrypted-provider storage");
+  const raw = decryptSecretValue(
+    handle.id.slice(ENCRYPTED_PROVIDER_HANDLE_PREFIX.length),
+  );
+  const value = JSON.parse(raw) as EncryptedPrivateBlobDescriptor;
+  if (
+    value?.kind !== "agent-native.private-blob.encrypted-provider" ||
+    value.version !== 1 ||
+    value.underlying?.opaque !== true ||
+    typeof value.underlying.provider !== "string" ||
+    typeof value.encryption?.iv !== "string" ||
+    typeof value.encryption?.tag !== "string" ||
+    !Number.isSafeInteger(value.size) ||
+    value.size < 1
+  )
+    throw new Error("Encrypted private blob descriptor is invalid");
+  return value;
 }
 
 async function putViaEncryptedPublicUpload(
@@ -212,6 +258,77 @@ export async function putPrivateBlob(
     return null;
   }
   return putViaEncryptedPublicUpload(input);
+}
+
+/** Store bytes encrypted by the deployment key inside a configured private provider. */
+export async function putEncryptedPrivateBlob(
+  input: PrivateBlobPutInput,
+): Promise<PrivateBlobHandle | null> {
+  const provider = getActivePrivateBlobProvider();
+  if (!provider) return null;
+  const bytes = toBytes(input.data);
+  const encrypted = encryptBytes(bytes);
+  const underlying = await provider.put({
+    ...input,
+    data: encrypted.ciphertext,
+    mimeType: "application/octet-stream",
+    metadata: undefined,
+  });
+  const createdAt = new Date().toISOString();
+  try {
+    const descriptor: EncryptedPrivateBlobDescriptor = {
+      kind: "agent-native.private-blob.encrypted-provider",
+      version: 1,
+      underlying,
+      encryption: { iv: encrypted.iv, tag: encrypted.tag },
+      mimeType: input.mimeType,
+      metadata: input.metadata,
+      size: bytes.byteLength,
+      createdAt,
+    };
+    return {
+      id: encodeEncryptedProviderDescriptor(descriptor),
+      provider: "encrypted-private-blob",
+      opaque: true,
+      encrypted: true,
+      mimeType: input.mimeType,
+      size: bytes.byteLength,
+      createdAt,
+      metadata: input.metadata,
+    };
+  } catch (error) {
+    await provider.delete(underlying).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function readEncryptedPrivateBlob(
+  handle: PrivateBlobHandle,
+): Promise<PrivateBlobReadResult> {
+  const descriptor = decodeEncryptedProviderDescriptor(handle);
+  const provider = providers.get(descriptor.underlying.provider);
+  if (!provider || !provider.isConfigured())
+    throw new Error("Encrypted private blob provider is unavailable");
+  const stored = await provider.read(descriptor.underlying);
+  const data = decryptBytes(descriptor.encryption, stored.data);
+  if (data.byteLength !== descriptor.size)
+    throw new Error("Encrypted private blob length mismatch");
+  return {
+    data,
+    mimeType: descriptor.mimeType,
+    metadata: descriptor.metadata,
+    handle,
+  };
+}
+
+export async function deleteEncryptedPrivateBlob(
+  handle: PrivateBlobHandle,
+): Promise<PrivateBlobDeleteResult> {
+  const descriptor = decodeEncryptedProviderDescriptor(handle);
+  const provider = providers.get(descriptor.underlying.provider);
+  if (!provider || !provider.isConfigured())
+    throw new Error("Encrypted private blob provider is unavailable");
+  return provider.delete(descriptor.underlying);
 }
 
 export async function readPrivateBlob(

@@ -1642,6 +1642,26 @@ const runContentMigrations = runMigrations(
         ON content_encrypted_vault_rotation_evidence_artifacts
         (phase, purge_eligible_at)`,
     },
+    {
+      version: 116,
+      name: "content-private-vault-rotation-control-bundle",
+      sql: `ALTER TABLE content_encrypted_vault_rotation_evidence_artifacts
+        ADD COLUMN IF NOT EXISTS private_blob_handle_json TEXT;
+      ALTER TABLE content_encrypted_vault_rotation_evidence_artifacts
+        ADD COLUMN IF NOT EXISTS private_blob_sha256 TEXT;
+      ALTER TABLE content_encrypted_vault_rotation_evidence_artifacts
+        ADD COLUMN IF NOT EXISTS private_blob_byte_length INTEGER;
+      ALTER TABLE content_encrypted_vault_rotation_evidence_artifacts
+        ADD COLUMN IF NOT EXISTS bundle_sha256 TEXT;
+      ALTER TABLE content_encrypted_vault_rotation_evidence_artifacts
+        ADD COLUMN IF NOT EXISTS signed_entry_sha256 TEXT;
+      ALTER TABLE content_encrypted_vault_rotation_evidence_artifacts
+        ADD COLUMN IF NOT EXISTS signed_entry_byte_length INTEGER;
+      ALTER TABLE content_encrypted_vault_rotation_evidence_artifacts
+        ADD COLUMN IF NOT EXISTS recovery_wrap_sha256 TEXT;
+      ALTER TABLE content_encrypted_vault_rotation_evidence_artifacts
+        ADD COLUMN IF NOT EXISTS recovery_wrap_byte_length INTEGER`,
+    },
   ],
   { table: "content_migrations" },
 );

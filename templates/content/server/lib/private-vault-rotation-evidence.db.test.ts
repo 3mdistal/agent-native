@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,6 +39,54 @@ const bytes = (value: string) => Uint8Array.from(Buffer.from(value));
 const ceremony = (value: number) => value.toString(16).padStart(32, "0");
 const recipient = (value: number) =>
   (value + 1_000).toString(16).padStart(32, "0");
+const blobBytes = new Map<string, Uint8Array>();
+let blobSequence = 0;
+let failBlobDelete = false;
+const blobs = {
+  async put(input: { data: Uint8Array | Buffer }) {
+    const id = `blob:${++blobSequence}`;
+    blobBytes.set(id, Uint8Array.from(input.data));
+    return { id, provider: "test", opaque: true as const, encrypted: true };
+  },
+  async read(handle: { id: string; provider: string; opaque: true }) {
+    const data = blobBytes.get(handle.id);
+    if (!data) throw new Error();
+    return { data: data.slice(), handle: { ...handle, encrypted: true } };
+  },
+  async delete(handle: { id: string; provider: string; opaque: true }) {
+    if (failBlobDelete) throw new Error("injected blob delete interruption");
+    return { deleted: blobBytes.delete(handle.id), provider: "test" };
+  },
+};
+
+function bundleInput(suffix = "exact") {
+  const signedEntry = bytes(`signed-entry:${suffix}`);
+  const recoveryWrap = bytes(`recovery-wrap:${suffix}`);
+  const encoded = encodeAncV1ControlLogRotationAppendRequest({
+    version: 1,
+    suite: "anc/v1",
+    type: "control-log-rotation-append-request",
+    signedEntry,
+    recoveryWrap,
+  });
+  return {
+    signedEntry,
+    recoveryWrap,
+    bundleSha256: createHash("sha256").update(encoded).digest("hex"),
+  };
+}
+
+async function putBundle(
+  store: ReturnType<typeof createStore>,
+  scope: Awaited<ReturnType<typeof seed>>,
+  ceremonyId: string,
+  suffix = "exact",
+) {
+  return store.putControlBundle(scope, {
+    ceremonyId,
+    ...bundleInput(suffix),
+  });
+}
 
 async function seed(suffix: string) {
   const scope = {
@@ -74,6 +123,7 @@ async function complete(
       offer: bytes(`offer:${value}`),
       eekWrap: bytes(`eek-wrap:${value}`),
     });
+  await putBundle(store, scope, ceremonyId);
   for (const value of [1, 2])
     await store.putRecipientAcknowledgement(scope, {
       ceremonyId,
@@ -99,7 +149,7 @@ async function complete(
 describe("Private Vault opaque rotation evidence store", () => {
   it("persists one exact bounded ceremony through the ordered public evidence phases", async () => {
     const scope = await seed("flow");
-    const store = createStore({ now: () => clock });
+    const store = createStore({ now: () => clock, blobs });
     const ceremonyId = ceremony(1);
     let status = await store.establish(scope, {
       ceremonyId,
@@ -124,6 +174,11 @@ describe("Private Vault opaque rotation evidence store", () => {
       eekWrap: bytes("wrap:1"),
     });
     expect(status.phase).toBe("awaiting_acknowledgements");
+    status = await putBundle(store, scope, ceremonyId);
+    expect(status.controlBundle).toMatchObject({
+      recoveryWrapByteLength: bytes("recovery-wrap:exact").byteLength,
+      bundleSha256: bundleInput().bundleSha256,
+    });
     expect(status.recipients.map((value) => value.recipientEndpointId)).toEqual(
       [recipient(1), recipient(2)],
     );
@@ -180,7 +235,15 @@ describe("Private Vault opaque rotation evidence store", () => {
           ),
         ),
       );
-    expect(rows).toHaveLength(10);
+    expect(rows).toHaveLength(11);
+    const bundleRow = rows.find(
+      (row) => row.artifactKind === "control_bundle",
+    )!;
+    expect(bundleRow.evidenceBytesBase64url).toBeNull();
+    expect(bundleRow.eekWrapBytesBase64url).toBeNull();
+    expect(bundleRow.privateBlobHandleJson).not.toContain(
+      "recovery-wrap:exact",
+    );
     expect(
       Object.keys(rows[0]!).some((key) =>
         /plaintext|private.*key|epoch.*key/i.test(key),
@@ -190,7 +253,7 @@ describe("Private Vault opaque rotation evidence store", () => {
 
   it("makes exact retries idempotent while rejecting substitutions, duplicates, and phase skips", async () => {
     const scope = await seed("hostile");
-    const store = createStore({ now: () => clock });
+    const store = createStore({ now: () => clock, blobs });
     const ceremonyId = ceremony(2);
     const established = await store.establish(scope, {
       ceremonyId,
@@ -235,6 +298,31 @@ describe("Private Vault opaque rotation evidence store", () => {
         offer: bytes("offer:substitution"),
       }),
     ).rejects.toMatchObject({ code: "conflict" });
+    const bundled = await putBundle(store, scope, ceremonyId);
+    await expect(putBundle(store, scope, ceremonyId)).resolves.toEqual(bundled);
+    await expect(
+      store.assertAuthoritativeControlBundle({
+        ownerEmail: scope.ownerEmail,
+        orgId: scope.orgId,
+        vaultId: scope.vaultId,
+        signedEntry: bytes("signed-entry:exact"),
+        recoveryWrap: bytes("recovery-wrap:exact"),
+        bundleSha256: bundleInput().bundleSha256,
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      store.assertAuthoritativeControlBundle({
+        ownerEmail: scope.ownerEmail,
+        orgId: scope.orgId,
+        vaultId: scope.vaultId,
+        signedEntry: bytes("different-signed-entry"),
+        recoveryWrap: bytes("recovery-wrap:exact"),
+        bundleSha256: bundleInput().bundleSha256,
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    await expect(
+      putBundle(store, scope, ceremonyId, "substitution"),
+    ).rejects.toMatchObject({ code: "conflict" });
     await expect(
       store.putDestructionAttestation(scope, {
         ceremonyId,
@@ -252,7 +340,7 @@ describe("Private Vault opaque rotation evidence store", () => {
 
   it("enforces stable scope, recipient limits, and artifact bounds", async () => {
     const scope = await seed("scope");
-    const store = createStore({ now: () => clock });
+    const store = createStore({ now: () => clock, blobs });
     const ceremonyId = ceremony(3);
     await store.establish(scope, {
       ceremonyId,
@@ -295,9 +383,63 @@ describe("Private Vault opaque rotation evidence store", () => {
     ).rejects.toMatchObject({ code: "invalid_request" });
   });
 
+  it("fails closed without protected blob storage and detects stored wrap tampering", async () => {
+    const scope = await seed("blob-fail-closed");
+    const ceremonyId = ceremony(30);
+    const unavailable = createStore({
+      now: () => clock,
+      blobs: {
+        put: async () => null,
+        read: blobs.read as never,
+        delete: blobs.delete as never,
+      },
+    });
+    await expect(
+      unavailable.assertAuthoritativeControlBundle({
+        ownerEmail: scope.ownerEmail,
+        orgId: scope.orgId,
+        vaultId: scope.vaultId,
+        ...bundleInput(),
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    await unavailable.establish(scope, {
+      ceremonyId,
+      expectedRecipientCount: 1,
+      checkpoint: bytes("checkpoint"),
+    });
+    await unavailable.putRecipientOffer(scope, {
+      ceremonyId,
+      recipientEndpointId: recipient(1),
+      offer: bytes("offer"),
+      eekWrap: bytes("eek-wrap"),
+    });
+    await expect(
+      putBundle(unavailable, scope, ceremonyId),
+    ).rejects.toMatchObject({ code: "unavailable" });
+
+    const store = createStore({ now: () => clock, blobs });
+    await putBundle(store, scope, ceremonyId);
+    const row = (
+      await getDb()
+        .select()
+        .from(schema.contentEncryptedVaultRotationEvidenceArtifacts)
+        .where(
+          eq(
+            schema.contentEncryptedVaultRotationEvidenceArtifacts.artifactKind,
+            "control_bundle",
+          ),
+        )
+    ).find((candidate) => candidate.ceremonyId === ceremonyId)!;
+    const handle = JSON.parse(row.privateBlobHandleJson!) as { id: string };
+    blobBytes.set(handle.id, bytes("tampered-wrap"));
+    await expect(
+      store.readControlBundle(scope, ceremonyId),
+    ).rejects.toMatchObject({ code: "unavailable" });
+  });
+
   it("fails closed on unknown or unsupported persisted artifact formats", async () => {
     const scope = await seed("corrupt");
-    const store = createStore({ now: () => clock });
+    const store = createStore({ now: () => clock, blobs });
     const ceremonyId = ceremony(8);
     await store.establish(scope, {
       ceremonyId,
@@ -336,7 +478,7 @@ describe("Private Vault opaque rotation evidence store", () => {
 
   it("never purges active ceremonies and retains terminal evidence for 90 days", async () => {
     const scope = await seed("retention");
-    const store = createStore({ now: () => clock });
+    const store = createStore({ now: () => clock, blobs });
     const activeCeremony = ceremony(6);
     const completedCeremony = ceremony(7);
     await store.establish(scope, {
@@ -353,10 +495,12 @@ describe("Private Vault opaque rotation evidence store", () => {
     ).toEqual({ ceremoniesDeleted: 0, artifactsDeleted: 0 });
     await expect(store.read(scope, completedCeremony)).resolves.toBeDefined();
 
+    failBlobDelete = true;
     const purged = await store.purgeEligibleTerminalEvidence(scope, {
       at: new Date(START.getTime() + 90 * DAY),
     });
-    expect(purged).toEqual({ ceremoniesDeleted: 1, artifactsDeleted: 10 });
+    failBlobDelete = false;
+    expect(purged).toEqual({ ceremoniesDeleted: 1, artifactsDeleted: 11 });
     await expect(store.read(scope, completedCeremony)).rejects.toMatchObject({
       code: "not_found",
     });
@@ -372,3 +516,4 @@ describe("Private Vault opaque rotation evidence store", () => {
     await expect(store.read(scope, activeCeremony)).resolves.toBeDefined();
   });
 });
+import { encodeAncV1ControlLogRotationAppendRequest } from "@agent-native/core/e2ee";

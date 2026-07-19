@@ -18,6 +18,7 @@ import {
   encodeAncV1ControlLogRecoveryAppendReceipt,
   encodeAncV1RecoveryControlEvidence,
   hashAncV1RecoveryWrap,
+  verifyAndReduceControlLogEntry,
   verifyEndpointRequestProofWithIdentity,
   verifyAncV1RecoveryWrap,
   verifyAncV1RecoveryAuthorizationPublicEvidence,
@@ -45,6 +46,10 @@ import {
 } from "./private-vault-control-log-runtime.js";
 import type { PrivateVaultVerifiedControlAppend } from "./private-vault-control-log.js";
 import { sqlPrivateVaultEndpointRequestNonceStore } from "./private-vault-endpoint-request-nonces.js";
+import {
+  PrivateVaultRotationEvidenceError,
+  privateVaultRotationEvidenceStore,
+} from "./private-vault-rotation-evidence.js";
 
 export const PRIVATE_VAULT_CONTROL_LOG_APPEND_PATH =
   "/api/private-vault/control-log/append";
@@ -61,6 +66,136 @@ export class PrivateVaultControlLogAppendError extends Error {
     super("Private Vault control append failed");
     this.name = "PrivateVaultControlLogAppendError";
   }
+}
+
+async function validateUncommittedRotationCandidate(input: {
+  request: ReturnType<typeof decodeAncV1ControlLogRotationAppendRequest>;
+  entry: ReturnType<typeof decodeSignedControlLogEntry>;
+  current: NonNullable<
+    Awaited<ReturnType<typeof privateVaultControlLogService.loadVerifiedState>>
+  >;
+  proofIssuedAt: string;
+}) {
+  const { request, entry, current } = input;
+  const rotation = entry.innerEnvelope;
+  if (
+    entry.sequence < 1 ||
+    rotation.type !== "membership_commit" ||
+    !(
+      rotation.ceremonyKind === "remove_device" ||
+      rotation.ceremonyKind === "remove_broker" ||
+      rotation.ceremonyKind === "broker_replacement"
+    ) ||
+    !rotation.rotationCompleted ||
+    !entryCreatedNoLaterThanProof(entry.createdAt, input.proofIssuedAt) ||
+    entry.sequence !== current.sequence + 1 ||
+    rotation.epoch !== current.epoch + 1 ||
+    rotation.recoveryWrapHash === current.recoveryWrapHash
+  )
+    throw new PrivateVaultControlLogAppendError("invalid_request");
+  const signer = current.activeMembers.find(
+    (member) =>
+      member.endpointId === entry.signerEndpointId &&
+      member.role === "endpoint",
+  );
+  if (!signer) throw new PrivateVaultControlLogAppendError("unauthorized");
+  let recoveryWrapHash: string;
+  try {
+    recoveryWrapHash = ancV1BytesToHex(
+      await hashAncV1RecoveryWrap(
+        request.recoveryWrap,
+        ancV1LifecycleIdFromHex(entry.vaultId),
+      ),
+    );
+    if (rotation.recoveryWrapHash !== recoveryWrapHash) throw new Error();
+    const reduced = await verifyAndReduceControlLogEntry({
+      current,
+      entry: request.signedEntry,
+      verifyRecoveryWrapRotation: async ({ commit }) =>
+        commit.recoveryWrapHash === recoveryWrapHash,
+    });
+    if (reduced.idempotent) throw new Error();
+    return { signer, recoveryWrapHash, entryHash: reduced.entryHash };
+  } catch (error) {
+    if (error instanceof PrivateVaultControlLogAppendError) throw error;
+    throw new PrivateVaultControlLogAppendError("invalid_request");
+  }
+}
+
+/**
+ * Authenticates and fully replays a rotation append against the current head
+ * without staging ciphertext, mutating the control log, or changing endpoint
+ * state. The authoritative append uses the same candidate validator below.
+ */
+export async function verifyPrivateVaultControlLogRotationCandidate(input: {
+  body: Uint8Array;
+  proof: EndpointRequestProof;
+  expectedProofPath: string;
+  now?: Date;
+}) {
+  let request: ReturnType<typeof decodeAncV1ControlLogRotationAppendRequest>;
+  let entry: ReturnType<typeof decodeSignedControlLogEntry>;
+  try {
+    request = decodeAncV1ControlLogRotationAppendRequest(input.body);
+    entry = decodeSignedControlLogEntry(request.signedEntry);
+  } catch {
+    throw new PrivateVaultControlLogAppendError("invalid_request");
+  }
+  const scope = await resolveActivePrivateVaultControlScope(entry.vaultId);
+  if (!scope) throw new PrivateVaultControlLogAppendError("not_found");
+  const current = await privateVaultControlLogService.loadVerifiedState(scope);
+  if (!current) throw new PrivateVaultControlLogAppendError("not_found");
+  const signer = current.activeMembers.find(
+    (member) =>
+      member.endpointId === entry.signerEndpointId &&
+      member.role === "endpoint",
+  );
+  if (!signer) throw new PrivateVaultControlLogAppendError("unauthorized");
+  try {
+    const authenticated = await verifyEndpointRequestProofWithIdentity({
+      proof: input.proof,
+      expectedMethod: "POST",
+      expectedPath: input.expectedProofPath,
+      body: input.body,
+      now: input.now ?? new Date(),
+      resolveAuthorizedEndpoint: async ({ vaultId, endpointId }) =>
+        vaultId === scope.vaultId && endpointId === signer.endpointId
+          ? {
+              vaultId,
+              endpointId,
+              state: "active" as const,
+              signingPublicKey: Uint8Array.from(
+                ancV1HexToBytes(signer.signingPublicKey),
+              ),
+            }
+          : null,
+      claimNonce: ({ vaultId, endpointId, nonce, expiresAt }) =>
+        sqlPrivateVaultEndpointRequestNonceStore.claimAuthorizedControlRequest({
+          ...scope,
+          vaultId,
+          endpointId,
+          nonce,
+          expiresAt,
+        }),
+    });
+    if (authenticated.endpointId !== entry.signerEndpointId) throw new Error();
+  } catch {
+    throw new PrivateVaultControlLogAppendError("unauthorized");
+  }
+  const validated = await validateUncommittedRotationCandidate({
+    request,
+    entry,
+    current,
+    proofIssuedAt: input.proof.issuedAt,
+  });
+  return Object.freeze({
+    scope,
+    current,
+    request,
+    entry,
+    recoveryWrapHash: validated.recoveryWrapHash,
+    entryHash: validated.entryHash,
+  });
 }
 
 function bindingId(vaultId: string, entryId: string): string {
@@ -1032,6 +1167,14 @@ export async function appendPrivateVaultControlLogRotation(input: {
   } catch {
     throw new PrivateVaultControlLogAppendError("unauthorized");
   }
+  if (!committed) {
+    await validateUncommittedRotationCandidate({
+      request,
+      entry,
+      current,
+      proofIssuedAt: input.proof.issuedAt,
+    });
+  }
 
   let recoveryWrapHash: string;
   try {
@@ -1046,6 +1189,23 @@ export async function appendPrivateVaultControlLogRotation(input: {
   }
   if (rotation.recoveryWrapHash !== recoveryWrapHash) {
     throw new PrivateVaultControlLogAppendError("invalid_request");
+  }
+  if (!committed) {
+    try {
+      await privateVaultRotationEvidenceStore.assertAuthoritativeControlBundle({
+        ...scope,
+        signedEntry: request.signedEntry,
+        recoveryWrap: request.recoveryWrap,
+        bundleSha256: createHash("sha256").update(input.body).digest("hex"),
+      });
+    } catch (error) {
+      if (error instanceof PrivateVaultRotationEvidenceError) {
+        throw new PrivateVaultControlLogAppendError(
+          error.code === "unavailable" ? "unavailable" : "conflict",
+        );
+      }
+      throw error;
+    }
   }
 
   const exact = {

@@ -163,6 +163,97 @@ async function fixture() {
 }
 
 describe("Private Vault verified rotation evidence ingress", () => {
+  it("binds the immutable pre-append control bundle to the checkpoint before ACKs", async () => {
+    const value = await fixture();
+    const scope = {
+      ownerEmail: "alice@example.test",
+      accountId: "account:alice",
+      orgId: "org:alice",
+      workspaceId: "workspace:alice",
+      vaultId: value.state.vaultId,
+    };
+    const principal = {
+      ownerEmail: scope.ownerEmail,
+      orgId: scope.orgId,
+      vaultId: scope.vaultId,
+      endpointId: ancV1BytesToHex(issuerId),
+    };
+    const status: any = {
+      ceremonyId: ancV1BytesToHex(ceremonyId),
+      phase: "awaiting_acknowledgements",
+      expectedRecipientCount: 1,
+      checkpoint: value.checkpoint,
+      controlBundle: null,
+      recipients: [
+        {
+          recipientEndpointId: principal.endpointId,
+          offer: value.offer,
+          eekWrap: value.encodedWrap,
+          acknowledgement: null,
+          destructionAttestation: null,
+        },
+      ],
+      hostedReceipt: null,
+      completionAttestation: null,
+      terminalAt: null,
+      purgeEligibleAt: null,
+    };
+    const putControlBundle = vi.fn(async () => ({
+      ...status,
+      controlBundle: {},
+    }));
+    const verifyControlBundle = vi.fn(async () => ({
+      principal,
+      scope,
+      entryHash: ancV1BytesToHex(fill(19, 32)),
+      signedEntry: Uint8Array.of(1, 2),
+      recoveryWrap: Uint8Array.of(3, 4),
+      sequence: 5,
+      targetEpoch: 2,
+      removedEndpointIds: [ancV1BytesToHex(removedId)],
+      signerEndpointId: principal.endpointId,
+    }));
+    const store = { read: vi.fn(async () => status), putControlBundle };
+    const ingress = createPrivateVaultRotationEvidenceIngress({
+      loadState: async () => value.state,
+      resolveScope: async () => scope,
+      store: store as never,
+      verifyControlBundle,
+      now: () => now,
+    });
+    const body = Uint8Array.of(9, 8, 7);
+    await expect(
+      ingress.appendControlBundle(
+        { signed: true },
+        "/control-bundle",
+        ancV1BytesToHex(ceremonyId),
+        body,
+      ),
+    ).resolves.toMatchObject({ controlBundle: {} });
+    expect(putControlBundle).toHaveBeenCalledWith(
+      scope,
+      expect.objectContaining({
+        ceremonyId: ancV1BytesToHex(ceremonyId),
+        signedEntry: Uint8Array.of(1, 2),
+        recoveryWrap: Uint8Array.of(3, 4),
+      }),
+    );
+
+    verifyControlBundle.mockResolvedValueOnce({
+      ...(await verifyControlBundle()),
+      entryHash: "ff".repeat(32),
+    });
+    await expect(
+      ingress.appendControlBundle(
+        {},
+        "/control-bundle",
+        ancV1BytesToHex(ceremonyId),
+        body,
+      ),
+    ).rejects.toBeDefined();
+    expect(putControlBundle).toHaveBeenCalledTimes(1);
+  });
+
   it("binds the checkpoint and final offer set to the authenticated control state", async () => {
     const value = await fixture();
     const scope = {
@@ -354,6 +445,11 @@ describe("Private Vault verified rotation evidence ingress", () => {
     };
     const store = {
       read: vi.fn(async () => status),
+      readControlBundle: vi.fn(async () => ({
+        signedEntry: Uint8Array.of(41),
+        recoveryWrap: Uint8Array.of(42),
+        bundleSha256: "ab".repeat(32),
+      })),
       putRecipientAcknowledgement: vi.fn(async (_scope, input) => {
         status = {
           ...status,
@@ -390,7 +486,12 @@ describe("Private Vault verified rotation evidence ingress", () => {
         ancV1BytesToHex(ceremonyId),
         recipientId,
       ),
-    ).resolves.toMatchObject({ recipientEndpointId: recipientId });
+    ).resolves.toMatchObject({
+      recipientEndpointId: recipientId,
+      checkpoint: value.checkpoint,
+      signedEntry: Uint8Array.of(41),
+      recoveryWrap: Uint8Array.of(42),
+    });
     await expect(
       ingress.appendAcknowledgement(
         principal,

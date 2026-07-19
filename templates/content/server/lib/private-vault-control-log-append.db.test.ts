@@ -54,6 +54,23 @@ const CEREMONY_ID = "55".repeat(16);
 const WRAP_ID = "66".repeat(16);
 const blobs = new Map<string, Uint8Array>();
 let beforeNextPut: (() => Promise<void>) | null = null;
+const assertAuthoritativeControlBundle = vi.hoisted(() =>
+  vi.fn(async () => true),
+);
+
+vi.mock("./private-vault-rotation-evidence.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import("./private-vault-rotation-evidence.js")
+    >();
+  return {
+    ...actual,
+    privateVaultRotationEvidenceStore: {
+      ...actual.privateVaultRotationEvidenceStore,
+      assertAuthoritativeControlBundle,
+    },
+  };
+});
 
 vi.mock("@agent-native/core/protected-ciphertext", async (importOriginal) => {
   const actual =
@@ -111,6 +128,7 @@ let controlLog: typeof import("./private-vault-control-log-runtime.js");
 let appendGenesis: (typeof import("./private-vault-control-log-append.js"))["appendPrivateVaultControlLogGenesis"];
 let appendGrantRevocation: (typeof import("./private-vault-control-log-append.js"))["appendPrivateVaultControlLogGrantRevocation"];
 let appendRotation: (typeof import("./private-vault-control-log-append.js"))["appendPrivateVaultControlLogRotation"];
+let verifyRotation: (typeof import("./private-vault-control-log-append.js"))["verifyPrivateVaultControlLogRotationCandidate"];
 
 function member(
   endpointId: string,
@@ -192,6 +210,7 @@ beforeAll(async () => {
   appendGenesis = append.appendPrivateVaultControlLogGenesis;
   appendGrantRevocation = append.appendPrivateVaultControlLogGrantRevocation;
   appendRotation = append.appendPrivateVaultControlLogRotation;
+  verifyRotation = append.verifyPrivateVaultControlLogRotationCandidate;
 }, 60_000);
 
 afterAll(() => {
@@ -679,6 +698,34 @@ describe("Private Vault authenticated rotation append", () => {
         .select()
         .from(schema.contentEncryptedVaultEndpoints)
         .where(eq(schema.contentEncryptedVaultEndpoints.endpointId, FOURTH_ID)),
+    ).toHaveLength(0);
+    const verifyPath = `/api/private-vault/rotation-evidence/${CEREMONY_ID}/control-bundle`;
+    const verifyProof = await createEndpointRequestProof({
+      vaultId: VAULT_ID,
+      endpointId: OWNER_ID,
+      method: "POST",
+      path: verifyPath,
+      body,
+      issuedAt: rotation.createdAt,
+      nonce: "ed".repeat(16),
+      signingPrivateKey: ownerSigning.privateKey,
+    });
+    await expect(
+      verifyRotation({
+        body,
+        proof: verifyProof,
+        expectedProofPath: verifyPath,
+        now: new Date(requestTime.getTime() + 4_500),
+      }),
+    ).resolves.toMatchObject({
+      entryHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      recoveryWrapHash,
+    });
+    expect(
+      await controlLog.privateVaultControlLogService.loadVerifiedState(scope),
+    ).toMatchObject({ sequence: 2, epoch: 1 });
+    expect(
+      await getDb().select().from(schema.contentEncryptedVaultRecoveryWraps),
     ).toHaveLength(0);
     const committedProof = await createEndpointRequestProof({
       vaultId: VAULT_ID,

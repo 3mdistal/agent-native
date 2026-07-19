@@ -1,6 +1,19 @@
 import { createHash } from "node:crypto";
 
-import { and, asc, eq, lte } from "drizzle-orm";
+import {
+  ANC_V1_CONTROL_LOG_APPEND_RECOVERY_WRAP_MAX_BYTES,
+  ANC_V1_CONTROL_LOG_APPEND_REQUEST_MAX_BYTES,
+  ANC_V1_CONTROL_LOG_APPEND_SIGNED_ENTRY_MAX_BYTES,
+  decodeAncV1ControlLogRotationAppendRequest,
+  encodeAncV1ControlLogRotationAppendRequest,
+} from "@agent-native/core/e2ee";
+import {
+  deleteEncryptedPrivateBlob,
+  putEncryptedPrivateBlob,
+  readEncryptedPrivateBlob,
+  type PrivateBlobHandle,
+} from "@agent-native/core/private-blob";
+import { and, asc, eq, inArray, lte, ne } from "drizzle-orm";
 import { z } from "zod";
 
 import { getDb, schema } from "../db/index.js";
@@ -51,6 +64,14 @@ export interface PrivateVaultRotationEvidenceStatus {
   readonly phase: PrivateVaultRotationEvidencePhase;
   readonly expectedRecipientCount: number;
   readonly checkpoint: Uint8Array;
+  readonly controlBundle: {
+    readonly signedEntrySha256: string;
+    readonly signedEntryByteLength: number;
+    readonly recoveryWrapSha256: string;
+    readonly recoveryWrapByteLength: number;
+    readonly bundleSha256: string;
+    readonly bundleByteLength: number;
+  } | null;
   readonly recipients: readonly PrivateVaultRotationRecipientEvidence[];
   readonly hostedReceipt: Uint8Array | null;
   readonly completionAttestation: Uint8Array | null;
@@ -92,6 +113,7 @@ function opaqueId(value: unknown): string {
 const ARTIFACT_KINDS = [
   "ceremony",
   "checkpoint",
+  "control_bundle",
   "recipient_offer",
   "recipient_acknowledgement",
   "destruction_attestation",
@@ -105,6 +127,19 @@ function hasOnlyNullMetadata(row: ArtifactRow): boolean {
     row.phase === null &&
     row.terminalAt === null &&
     row.purgeEligibleAt === null
+  );
+}
+
+function hasOnlyNullBlobMetadata(row: ArtifactRow): boolean {
+  return (
+    row.privateBlobHandleJson === null &&
+    row.privateBlobSha256 === null &&
+    row.privateBlobByteLength === null &&
+    row.bundleSha256 === null &&
+    row.signedEntrySha256 === null &&
+    row.signedEntryByteLength === null &&
+    row.recoveryWrapSha256 === null &&
+    row.recoveryWrapByteLength === null
   );
 }
 
@@ -122,13 +157,30 @@ function validateArtifactRow(row: ArtifactRow): void {
     row.artifactKey === "ceremony" &&
     row.recipientEndpointId === null &&
     row.evidenceBytesBase64url === null &&
-    row.eekWrapBytesBase64url === null;
+    row.eekWrapBytesBase64url === null &&
+    hasOnlyNullBlobMetadata(row);
   const isCheckpoint =
     row.artifactKind === "checkpoint" &&
     row.artifactKey === "singleton" &&
     row.recipientEndpointId === null &&
     row.evidenceBytesBase64url !== null &&
     row.eekWrapBytesBase64url === null &&
+    hasOnlyNullMetadata(row) &&
+    hasOnlyNullBlobMetadata(row);
+  const isControlBundle =
+    row.artifactKind === "control_bundle" &&
+    row.artifactKey === "singleton" &&
+    row.recipientEndpointId === null &&
+    row.evidenceBytesBase64url === null &&
+    row.eekWrapBytesBase64url === null &&
+    row.privateBlobHandleJson !== null &&
+    row.privateBlobSha256 !== null &&
+    row.privateBlobByteLength !== null &&
+    row.bundleSha256 !== null &&
+    row.signedEntrySha256 !== null &&
+    row.signedEntryByteLength !== null &&
+    row.recoveryWrapSha256 !== null &&
+    row.recoveryWrapByteLength !== null &&
     hasOnlyNullMetadata(row);
   const isRecipient =
     (row.artifactKind === "recipient_offer" ||
@@ -140,7 +192,8 @@ function validateArtifactRow(row: ArtifactRow): void {
     (row.artifactKind === "recipient_offer"
       ? row.eekWrapBytesBase64url !== null
       : row.eekWrapBytesBase64url === null) &&
-    hasOnlyNullMetadata(row);
+    hasOnlyNullMetadata(row) &&
+    hasOnlyNullBlobMetadata(row);
   const isSingleton =
     (row.artifactKind === "hosted_receipt" ||
       row.artifactKind === "completion_attestation") &&
@@ -148,8 +201,15 @@ function validateArtifactRow(row: ArtifactRow): void {
     row.recipientEndpointId === null &&
     row.evidenceBytesBase64url !== null &&
     row.eekWrapBytesBase64url === null &&
-    hasOnlyNullMetadata(row);
-  if (!isCeremony && !isCheckpoint && !isRecipient && !isSingleton)
+    hasOnlyNullMetadata(row) &&
+    hasOnlyNullBlobMetadata(row);
+  if (
+    !isCeremony &&
+    !isCheckpoint &&
+    !isControlBundle &&
+    !isRecipient &&
+    !isSingleton
+  )
     throw new PrivateVaultRotationEvidenceError("unavailable");
 }
 
@@ -184,6 +244,28 @@ function exact(left: Uint8Array, right: Uint8Array): boolean {
     left.byteLength === right.byteLength &&
     left.every((byte, index) => byte === right[index])
   );
+}
+
+function sha256(value: Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function parseBlobHandle(value: string | null): PrivateBlobHandle | null {
+  if (!value || value.length > 16_384) return null;
+  try {
+    const handle = JSON.parse(value) as PrivateBlobHandle;
+    return handle &&
+      handle.opaque === true &&
+      handle.encrypted === true &&
+      typeof handle.id === "string" &&
+      handle.id.length > 0 &&
+      typeof handle.provider === "string" &&
+      handle.provider.length > 0
+      ? handle
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function scopeWhere(
@@ -288,6 +370,41 @@ function parseRows(
       ? decode(checkpointRows[0]!.evidenceBytesBase64url, EVIDENCE_MAX_BYTES)
       : null;
   if (!checkpoint) throw new PrivateVaultRotationEvidenceError("unavailable");
+  const controlRows = rows.filter(
+    (row) => row.artifactKind === "control_bundle",
+  );
+  const controlRow = controlRows.length === 1 ? controlRows[0]! : null;
+  const controlBundle = controlRow
+    ? parseBlobHandle(controlRow.privateBlobHandleJson) &&
+      /^[0-9a-f]{64}$/.test(controlRow.privateBlobSha256 ?? "") &&
+      Number.isSafeInteger(controlRow.privateBlobByteLength) &&
+      controlRow.privateBlobByteLength! > 0 &&
+      controlRow.privateBlobByteLength! <=
+        ANC_V1_CONTROL_LOG_APPEND_REQUEST_MAX_BYTES &&
+      controlRow.privateBlobSha256 === controlRow.bundleSha256 &&
+      /^[0-9a-f]{64}$/.test(controlRow.bundleSha256 ?? "") &&
+      /^[0-9a-f]{64}$/.test(controlRow.signedEntrySha256 ?? "") &&
+      Number.isSafeInteger(controlRow.signedEntryByteLength) &&
+      controlRow.signedEntryByteLength! > 0 &&
+      controlRow.signedEntryByteLength! <=
+        ANC_V1_CONTROL_LOG_APPEND_SIGNED_ENTRY_MAX_BYTES &&
+      /^[0-9a-f]{64}$/.test(controlRow.recoveryWrapSha256 ?? "") &&
+      Number.isSafeInteger(controlRow.recoveryWrapByteLength) &&
+      controlRow.recoveryWrapByteLength! > 0 &&
+      controlRow.recoveryWrapByteLength! <=
+        ANC_V1_CONTROL_LOG_APPEND_RECOVERY_WRAP_MAX_BYTES
+      ? Object.freeze({
+          signedEntrySha256: controlRow.signedEntrySha256!,
+          signedEntryByteLength: controlRow.signedEntryByteLength!,
+          recoveryWrapSha256: controlRow.recoveryWrapSha256!,
+          recoveryWrapByteLength: controlRow.recoveryWrapByteLength!,
+          bundleSha256: controlRow.bundleSha256!,
+          bundleByteLength: controlRow.privateBlobByteLength!,
+        })
+      : null
+    : null;
+  if (controlRows.length > 1 || (controlRow && !controlBundle))
+    throw new PrivateVaultRotationEvidenceError("unavailable");
 
   const offers = new Map<
     string,
@@ -415,6 +532,7 @@ function parseRows(
     phase,
     expectedRecipientCount: expected,
     checkpoint,
+    controlBundle,
     recipients: Object.freeze(recipients),
     hostedReceipt,
     completionAttestation,
@@ -446,8 +564,70 @@ async function requireVaultScope(
 
 export function createPrivateVaultRotationEvidenceStore(input?: {
   now?: () => Date;
+  blobs?: {
+    put: typeof putEncryptedPrivateBlob;
+    read: typeof readEncryptedPrivateBlob;
+    delete: typeof deleteEncryptedPrivateBlob;
+  };
 }) {
   const now = input?.now ?? (() => new Date());
+  const blobs = input?.blobs ?? {
+    put: putEncryptedPrivateBlob,
+    read: readEncryptedPrivateBlob,
+    delete: deleteEncryptedPrivateBlob,
+  };
+
+  async function readControlBundle(
+    scopeInput: PrivateVaultRotationEvidenceScope,
+    ceremonyIdInput: string,
+  ) {
+    const scope = normalizeScope(scopeInput);
+    const ceremonyId = opaqueId(ceremonyIdInput);
+    const rows = await getDb().transaction((tx) =>
+      rowsFor(tx, scope, ceremonyId),
+    );
+    const status = parseRows(rows);
+    const row = rows.find((value) => value.artifactKind === "control_bundle");
+    if (!row || !status.controlBundle)
+      throw new PrivateVaultRotationEvidenceError("not_found");
+    const handle = parseBlobHandle(row.privateBlobHandleJson);
+    if (!handle) throw new PrivateVaultRotationEvidenceError("unavailable");
+    let encodedBundle: Uint8Array;
+    try {
+      const result = await blobs.read(handle);
+      encodedBundle = bounded(
+        result.data,
+        ANC_V1_CONTROL_LOG_APPEND_REQUEST_MAX_BYTES,
+      );
+    } catch {
+      throw new PrivateVaultRotationEvidenceError("unavailable");
+    }
+    if (
+      encodedBundle.byteLength !== status.controlBundle.bundleByteLength ||
+      sha256(encodedBundle) !== status.controlBundle.bundleSha256
+    )
+      throw new PrivateVaultRotationEvidenceError("unavailable");
+    let bundle: ReturnType<typeof decodeAncV1ControlLogRotationAppendRequest>;
+    try {
+      bundle = decodeAncV1ControlLogRotationAppendRequest(encodedBundle);
+    } catch {
+      throw new PrivateVaultRotationEvidenceError("unavailable");
+    }
+    if (
+      bundle.signedEntry.byteLength !==
+        status.controlBundle.signedEntryByteLength ||
+      sha256(bundle.signedEntry) !== status.controlBundle.signedEntrySha256 ||
+      bundle.recoveryWrap.byteLength !==
+        status.controlBundle.recoveryWrapByteLength ||
+      sha256(bundle.recoveryWrap) !== status.controlBundle.recoveryWrapSha256
+    )
+      throw new PrivateVaultRotationEvidenceError("unavailable");
+    return Object.freeze({
+      signedEntry: bundle.signedEntry,
+      recoveryWrap: bundle.recoveryWrap,
+      bundleSha256: status.controlBundle.bundleSha256,
+    });
+  }
 
   async function read(
     scopeInput: PrivateVaultRotationEvidenceScope,
@@ -518,6 +698,11 @@ export function createPrivateVaultRotationEvidenceStore(input?: {
             ? "awaiting_acknowledgements"
             : "awaiting_destructions";
       if (ceremony.phase !== expectedPhase)
+        throw new PrivateVaultRotationEvidenceError("conflict");
+      if (
+        input.kind === "recipient_acknowledgement" &&
+        !before.some((row) => row.artifactKind === "control_bundle")
+      )
         throw new PrivateVaultRotationEvidenceError("conflict");
       const offer = before.find(
         (row) =>
@@ -666,6 +851,194 @@ export function createPrivateVaultRotationEvidenceStore(input?: {
 
   return {
     read,
+    readControlBundle,
+    async assertAuthoritativeControlBundle(inputValue: {
+      ownerEmail: string;
+      orgId: string;
+      vaultId: string;
+      signedEntry: Uint8Array;
+      recoveryWrap: Uint8Array;
+      bundleSha256: string;
+    }) {
+      const signedEntry = bounded(
+        inputValue.signedEntry,
+        ANC_V1_CONTROL_LOG_APPEND_SIGNED_ENTRY_MAX_BYTES,
+      );
+      const recoveryWrap = bounded(
+        inputValue.recoveryWrap,
+        ANC_V1_CONTROL_LOG_APPEND_RECOVERY_WRAP_MAX_BYTES,
+      );
+      const encodedBundle = encodeAncV1ControlLogRotationAppendRequest({
+        version: 1,
+        suite: "anc/v1",
+        type: "control-log-rotation-append-request",
+        signedEntry: Uint8Array.from(signedEntry),
+        recoveryWrap: Uint8Array.from(recoveryWrap),
+      });
+      if (!/^[0-9a-f]{64}$/.test(inputValue.bundleSha256))
+        throw new PrivateVaultRotationEvidenceError("invalid_request");
+      if (sha256(encodedBundle) !== inputValue.bundleSha256)
+        throw new PrivateVaultRotationEvidenceError("conflict");
+      const table = schema.contentEncryptedVaultRotationEvidenceArtifacts;
+      const activeCeremonies = await getDb()
+        .select({ ceremonyId: table.ceremonyId })
+        .from(table)
+        .where(
+          and(
+            eq(table.ownerEmail, inputValue.ownerEmail.toLowerCase()),
+            eq(table.orgId, inputValue.orgId),
+            eq(table.vaultId, inputValue.vaultId),
+            eq(table.artifactKind, "ceremony"),
+            ne(table.phase, "completed"),
+          ),
+        )
+        .limit(2);
+      if (activeCeremonies.length === 0)
+        throw new PrivateVaultRotationEvidenceError("conflict");
+      if (activeCeremonies.length !== 1)
+        throw new PrivateVaultRotationEvidenceError("unavailable");
+      const rows = await getDb()
+        .select()
+        .from(table)
+        .where(
+          and(
+            eq(table.ownerEmail, inputValue.ownerEmail.toLowerCase()),
+            eq(table.orgId, inputValue.orgId),
+            eq(table.vaultId, inputValue.vaultId),
+            eq(table.artifactKind, "control_bundle"),
+            inArray(
+              table.ceremonyId,
+              activeCeremonies.map((value) => value.ceremonyId),
+            ),
+          ),
+        )
+        .limit(2);
+      if (rows.length === 0)
+        throw new PrivateVaultRotationEvidenceError("conflict");
+      if (rows.length !== 1)
+        throw new PrivateVaultRotationEvidenceError("unavailable");
+      const row = rows[0]!;
+      const bundle = await readControlBundle(
+        {
+          ownerEmail: row.ownerEmail,
+          accountId: row.accountId,
+          orgId: row.orgId,
+          workspaceId: row.workspaceId,
+          vaultId: row.vaultId,
+        },
+        row.ceremonyId,
+      );
+      if (
+        bundle.bundleSha256 !== inputValue.bundleSha256 ||
+        !exact(bundle.signedEntry, signedEntry) ||
+        !exact(bundle.recoveryWrap, recoveryWrap)
+      )
+        throw new PrivateVaultRotationEvidenceError("conflict");
+      return true;
+    },
+    async putControlBundle(
+      scopeInput: PrivateVaultRotationEvidenceScope,
+      inputValue: {
+        ceremonyId: string;
+        signedEntry: Uint8Array;
+        recoveryWrap: Uint8Array;
+        bundleSha256: string;
+      },
+    ) {
+      const scope = normalizeScope(scopeInput);
+      const ceremonyId = opaqueId(inputValue.ceremonyId);
+      const signedEntry = bounded(
+        inputValue.signedEntry,
+        ANC_V1_CONTROL_LOG_APPEND_SIGNED_ENTRY_MAX_BYTES,
+      );
+      const recoveryWrap = bounded(
+        inputValue.recoveryWrap,
+        ANC_V1_CONTROL_LOG_APPEND_RECOVERY_WRAP_MAX_BYTES,
+      );
+      const encodedBundle = encodeAncV1ControlLogRotationAppendRequest({
+        version: 1,
+        suite: "anc/v1",
+        type: "control-log-rotation-append-request",
+        signedEntry: Uint8Array.from(signedEntry),
+        recoveryWrap: Uint8Array.from(recoveryWrap),
+      });
+      if (!/^[0-9a-f]{64}$/.test(inputValue.bundleSha256))
+        throw new PrivateVaultRotationEvidenceError("invalid_request");
+      if (sha256(encodedBundle) !== inputValue.bundleSha256)
+        throw new PrivateVaultRotationEvidenceError("conflict");
+      const prior = await read(scope, ceremonyId);
+      if (prior.controlBundle) {
+        const exactPrior = await readControlBundle(scope, ceremonyId);
+        if (
+          exact(exactPrior.signedEntry, signedEntry) &&
+          exact(exactPrior.recoveryWrap, recoveryWrap) &&
+          exactPrior.bundleSha256 === inputValue.bundleSha256
+        )
+          return prior;
+        throw new PrivateVaultRotationEvidenceError("conflict");
+      }
+      if (
+        prior.phase !== "awaiting_acknowledgements" ||
+        prior.recipients.some((recipient) => recipient.acknowledgement !== null)
+      )
+        throw new PrivateVaultRotationEvidenceError("conflict");
+      let handle: PrivateBlobHandle | null;
+      try {
+        handle = await blobs.put({
+          data: encodedBundle,
+          filename: "rotation-control-bundle.bin",
+          mimeType: "application/octet-stream",
+          ownerEmail: scope.ownerEmail,
+          metadata: { ceremonyId, vaultId: scope.vaultId },
+        });
+      } catch {
+        throw new PrivateVaultRotationEvidenceError("unavailable");
+      }
+      if (!handle) throw new PrivateVaultRotationEvidenceError("unavailable");
+      if (!parseBlobHandle(JSON.stringify(handle))) {
+        await blobs.delete(handle).catch(() => undefined);
+        throw new PrivateVaultRotationEvidenceError("unavailable");
+      }
+      try {
+        await getDb().transaction(async (tx) => {
+          const current = parseRows(await rowsFor(tx, scope, ceremonyId));
+          if (
+            current.controlBundle ||
+            current.phase !== "awaiting_acknowledgements" ||
+            current.recipients.some(
+              (recipient) => recipient.acknowledgement !== null,
+            )
+          )
+            throw new PrivateVaultRotationEvidenceError("conflict");
+          const at = now();
+          if (!Number.isFinite(at.getTime()))
+            throw new PrivateVaultRotationEvidenceError("unavailable");
+          await tx
+            .insert(schema.contentEncryptedVaultRotationEvidenceArtifacts)
+            .values({
+              id: rowId(scope, ceremonyId, "control_bundle", "singleton"),
+              ...scope,
+              ceremonyId,
+              artifactKind: "control_bundle",
+              artifactKey: "singleton",
+              privateBlobHandleJson: JSON.stringify(handle),
+              privateBlobSha256: inputValue.bundleSha256,
+              privateBlobByteLength: encodedBundle.byteLength,
+              bundleSha256: inputValue.bundleSha256,
+              signedEntrySha256: sha256(signedEntry),
+              signedEntryByteLength: signedEntry.byteLength,
+              recoveryWrapSha256: sha256(recoveryWrap),
+              recoveryWrapByteLength: recoveryWrap.byteLength,
+              updatedAt: at.toISOString(),
+            });
+        });
+      } catch (error) {
+        await blobs.delete(handle).catch(() => undefined);
+        if (error instanceof PrivateVaultRotationEvidenceError) throw error;
+        throw new PrivateVaultRotationEvidenceError("conflict");
+      }
+      return read(scope, ceremonyId);
+    },
     async establish(
       scopeInput: PrivateVaultRotationEvidenceScope,
       inputValue: {
@@ -820,7 +1193,7 @@ export function createPrivateVaultRotationEvidenceStore(input?: {
         limit > 1_000
       )
         throw new PrivateVaultRotationEvidenceError("invalid_request");
-      return getDb().transaction(async (tx) => {
+      const purged = await getDb().transaction(async (tx) => {
         const table = schema.contentEncryptedVaultRotationEvidenceArtifacts;
         const candidates = await tx
           .select({ ceremonyId: table.ceremonyId })
@@ -836,17 +1209,38 @@ export function createPrivateVaultRotationEvidenceStore(input?: {
           .orderBy(asc(table.purgeEligibleAt))
           .limit(limit);
         let artifactsDeleted = 0;
+        const blobHandles: PrivateBlobHandle[] = [];
         for (const candidate of candidates) {
+          const ceremonyRows = await rowsFor(tx, scope, candidate.ceremonyId);
+          const blobRows = ceremonyRows.filter(
+            (row) => row.artifactKind === "control_bundle",
+          );
+          for (const blobRow of blobRows) {
+            const handle = parseBlobHandle(blobRow.privateBlobHandleJson);
+            if (!handle)
+              throw new PrivateVaultRotationEvidenceError("unavailable");
+            blobHandles.push(handle);
+          }
           const deleted = await tx
             .delete(table)
             .where(ceremonyWhere(scope, candidate.ceremonyId))
             .returning({ id: table.id });
           artifactsDeleted += deleted.length;
         }
-        return Object.freeze({
+        return {
           ceremoniesDeleted: candidates.length,
           artifactsDeleted,
-        });
+          blobHandles,
+        };
+      });
+      // SQL commits first so a provider failure or process interruption can
+      // leave only an unreachable encrypted orphan, never a live row pointing
+      // at bytes that were already deleted.
+      for (const handle of purged.blobHandles)
+        await blobs.delete(handle).catch(() => undefined);
+      return Object.freeze({
+        ceremoniesDeleted: purged.ceremoniesDeleted,
+        artifactsDeleted: purged.artifactsDeleted,
       });
     },
   };

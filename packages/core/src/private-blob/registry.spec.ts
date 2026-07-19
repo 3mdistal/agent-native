@@ -69,6 +69,49 @@ describe("private blob registry", () => {
     });
   });
 
+  it("adds deployment-key encryption over a configured private provider", async () => {
+    const registry = await freshRegistry();
+    let stored = new Uint8Array();
+    const underlying = {
+      id: "memory:encrypted",
+      provider: "memory-encrypted",
+      opaque: true as const,
+      encrypted: false,
+    };
+    const provider: PrivateBlobProvider = {
+      id: "memory-encrypted",
+      name: "Memory encrypted overlay test",
+      isConfigured: () => true,
+      put: vi.fn(async (input) => {
+        stored = Uint8Array.from(input.data);
+        return underlying;
+      }),
+      read: vi.fn(async () => ({ data: stored.slice(), handle: underlying })),
+      delete: vi.fn(async () => ({
+        deleted: true,
+        provider: "memory-encrypted",
+      })),
+    };
+    registry.registerPrivateBlobProvider(provider);
+    const plaintext = new TextEncoder().encode("rotation control bundle");
+    const handle = await registry.putEncryptedPrivateBlob({ data: plaintext });
+    expect(handle).toMatchObject({
+      provider: "encrypted-private-blob",
+      opaque: true,
+      encrypted: true,
+      size: plaintext.byteLength,
+    });
+    expect(new TextDecoder().decode(stored)).not.toContain(
+      "rotation control bundle",
+    );
+    await expect(registry.readEncryptedPrivateBlob(handle!)).resolves.toEqual(
+      expect.objectContaining({ data: plaintext }),
+    );
+    await expect(registry.deleteEncryptedPrivateBlob(handle!)).resolves.toEqual(
+      { deleted: true, provider: "memory-encrypted" },
+    );
+  });
+
   it("wraps public uploads in encrypted opaque handles without exposing URLs", async () => {
     const registry = await freshRegistry();
     let uploadedInput: FileUploadInput | null = null;

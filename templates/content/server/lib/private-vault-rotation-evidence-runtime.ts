@@ -3,10 +3,12 @@ import {
   assertFreshControlLogHead,
   controlLogStateSchema,
   verifyEndpointRequestProofWithIdentity,
+  type EndpointRequestProof,
 } from "@agent-native/core/e2ee";
 import { and, eq } from "drizzle-orm";
 
 import { getDb, schema } from "../db/index.js";
+import { verifyPrivateVaultControlLogRotationCandidate } from "./private-vault-control-log-append.js";
 import {
   privateVaultControlLogService,
   resolveActivePrivateVaultControlScope,
@@ -95,6 +97,51 @@ export async function authenticatePrivateVaultRotationEvidenceRecipient(input: {
 export const privateVaultRotationEvidenceIngress =
   createPrivateVaultRotationEvidenceIngress({
     store: privateVaultRotationEvidenceStore,
+    async verifyControlBundle(input) {
+      const verified = await verifyPrivateVaultControlLogRotationCandidate({
+        body: input.body,
+        proof: input.proof as EndpointRequestProof,
+        expectedProofPath: input.path,
+      });
+      const table = schema.contentEncryptedVaults;
+      const [scope] = await getDb()
+        .select({
+          ownerEmail: table.ownerEmail,
+          accountId: table.accountId,
+          orgId: table.orgId,
+          workspaceId: table.workspaceId,
+          vaultId: table.vaultId,
+        })
+        .from(table)
+        .where(
+          and(
+            eq(table.ownerEmail, verified.scope.ownerEmail),
+            eq(table.orgId, verified.scope.orgId),
+            eq(table.vaultId, verified.scope.vaultId),
+            eq(table.vaultState, "active"),
+          ),
+        )
+        .limit(1);
+      if (!scope) throw new Error();
+      const rotation = verified.entry.innerEnvelope;
+      if (rotation.type !== "membership_commit") throw new Error();
+      return {
+        principal: {
+          ownerEmail: scope.ownerEmail,
+          orgId: scope.orgId,
+          vaultId: scope.vaultId,
+          endpointId: verified.entry.signerEndpointId,
+        },
+        scope,
+        entryHash: verified.entryHash,
+        signedEntry: verified.request.signedEntry,
+        recoveryWrap: verified.request.recoveryWrap,
+        sequence: verified.entry.sequence,
+        targetEpoch: rotation.epoch,
+        removedEndpointIds: rotation.removedEndpointIds,
+        signerEndpointId: verified.entry.signerEndpointId,
+      };
+    },
     async loadCommittedWrapBinding(scope, recoveryWrapHash) {
       const table = schema.contentEncryptedVaultRecoveryWraps;
       const rows = await getDb()

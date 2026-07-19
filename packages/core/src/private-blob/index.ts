@@ -8,9 +8,12 @@ export type {
 } from "./types.js";
 export {
   deletePrivateBlob,
+  deleteEncryptedPrivateBlob,
   getActivePrivateBlobProvider,
   listPrivateBlobProviders,
   putPrivateBlob,
+  putEncryptedPrivateBlob,
+  readEncryptedPrivateBlob,
   readPrivateBlob,
   registerPrivateBlobProvider,
   setPrivateBlobPublicUploadFallbackEnabled,

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   ANC_ROTATION_EVIDENCE_SIZE_LIMITS,
   ancV1BytesToHex,
@@ -51,6 +53,21 @@ export interface PrivateVaultRotationEvidenceIngressDependencies {
     principal: PrivateVaultRotationEvidencePrincipal,
   ) => Promise<PrivateVaultRotationEvidenceScope | null>;
   readonly store: ReturnType<typeof createPrivateVaultRotationEvidenceStore>;
+  readonly verifyControlBundle?: (input: {
+    body: Uint8Array;
+    proof: unknown;
+    path: string;
+  }) => Promise<{
+    principal: PrivateVaultRotationEvidencePrincipal;
+    scope: PrivateVaultRotationEvidenceScope;
+    entryHash: string;
+    signedEntry: Uint8Array;
+    recoveryWrap: Uint8Array;
+    sequence: number;
+    targetEpoch: number;
+    removedEndpointIds: readonly string[];
+    signerEndpointId: string;
+  }>;
   readonly loadCommittedWrapBinding?: (
     scope: PrivateVaultRotationEvidenceScope,
     recoveryWrapHash: string,
@@ -238,6 +255,48 @@ export function createPrivateVaultRotationEvidenceIngress(
   }
 
   return {
+    async appendControlBundle(
+      proof: unknown,
+      path: string,
+      ceremonyId: string,
+      encodedBundle: Uint8Array,
+    ) {
+      if (!dependencies.verifyControlBundle) fail();
+      const verified = await dependencies.verifyControlBundle!({
+        body: encodedBundle,
+        proof,
+        path,
+      });
+      const value = await ceremonyContext(verified.principal, ceremonyId);
+      const removedId = ancV1BytesToHex(value.checkpoint.removedEndpointId);
+      if (
+        verified.scope.ownerEmail !== value.scope.ownerEmail ||
+        verified.scope.accountId !== value.scope.accountId ||
+        verified.scope.orgId !== value.scope.orgId ||
+        verified.scope.workspaceId !== value.scope.workspaceId ||
+        verified.scope.vaultId !== value.scope.vaultId ||
+        verified.principal.endpointId !== value.signerId ||
+        verified.signerEndpointId !== value.signerId ||
+        verified.entryHash !==
+          ancV1BytesToHex(value.checkpoint.controlEntryHash) ||
+        verified.sequence !== value.checkpoint.baseSequence + 1 ||
+        verified.targetEpoch !== value.checkpoint.targetEpoch ||
+        verified.removedEndpointIds.length !== 1 ||
+        verified.removedEndpointIds[0] !== removedId ||
+        value.status.phase !== "awaiting_acknowledgements" ||
+        value.status.recipients.some(
+          (recipient) => recipient.acknowledgement !== null,
+        )
+      )
+        fail();
+      return dependencies.store.putControlBundle(value.scope, {
+        ceremonyId,
+        signedEntry: verified.signedEntry,
+        recoveryWrap: verified.recoveryWrap,
+        bundleSha256: createHash("sha256").update(encodedBundle).digest("hex"),
+      });
+    },
+
     async appendCheckpoint(
       principal: PrivateVaultRotationEvidencePrincipal,
       encodedCheckpoint: Uint8Array,
@@ -397,6 +456,10 @@ export function createPrivateVaultRotationEvidenceIngress(
         (recipient) => recipient.recipientEndpointId === recipientEndpointId,
       );
       if (!evidence?.offer || !evidence.eekWrap) fail();
+      const controlBundle = await dependencies.store.readControlBundle(
+        value.scope,
+        ceremonyId,
+      );
       const offer = await verifyAncV1RotationRecipientOffer(evidence.offer, {
         expectedVaultId: value.vaultId,
         expectedIssuerEndpointId: value.checkpoint.signerEndpointId,
@@ -432,8 +495,11 @@ export function createPrivateVaultRotationEvidenceIngress(
       return {
         ceremonyId,
         recipientEndpointId,
+        checkpoint: value.status.checkpoint.slice(),
         offer: evidence.offer.slice(),
         eekWrap: evidence.eekWrap.slice(),
+        signedEntry: controlBundle.signedEntry,
+        recoveryWrap: controlBundle.recoveryWrap,
       };
     },
 
