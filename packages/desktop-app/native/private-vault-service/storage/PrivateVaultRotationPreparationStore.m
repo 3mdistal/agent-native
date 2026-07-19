@@ -1479,6 +1479,84 @@ AncRotationPreparationTransitionValidate(
   return status;
 }
 
+static BOOL AncRotationPreparationEvidenceMatches(
+    const uint8_t vaultId[16],
+    AncPrivateVaultRotationPreparationCheckpoint *preparation,
+    AncPrivateVaultRotationEvidenceStoreCheckpoint *evidence,
+    AncPrivateVaultRotationEvidenceStorePhase phase) {
+  if (vaultId == NULL || preparation == nil || evidence == nil)
+    return NO;
+  BOOL preparedTransition = preparation.snapshot.phase ==
+      ANC_PV_ROTATION_PREPARATION_PHASE_PREPARED;
+  BOOL acknowledgedTransition = preparation.snapshot.phase ==
+      ANC_PV_ROTATION_PREPARATION_PHASE_REWRAPPED;
+  BOOL chainBinding = preparedTransition
+      ? evidence.preparationFenceGeneration == preparation.fenceGeneration &&
+          [evidence.preparationRecordDigest
+              isEqualToData:preparation.recordDigest]
+      : acknowledgedTransition && preparation.fenceGeneration > 0 &&
+          evidence.preparationFenceGeneration ==
+              preparation.fenceGeneration - 1;
+  if (object_getClass(evidence) !=
+          AncPrivateVaultRotationEvidenceStoreCheckpoint.class ||
+      evidence.phase != phase || evidence.vaultId.length != 16 ||
+      evidence.ceremonyId.length != 16 ||
+      evidence.targetEndpointId.length != 16 ||
+      evidence.preparationRecordDigest.length != 32 || !chainBinding ||
+      anc_pv_memcmp(vaultId, evidence.vaultId.bytes, 16) != ANC_PV_CRYPTO_OK ||
+      anc_pv_memcmp(preparation.snapshot.vault_id, evidence.vaultId.bytes, 16) !=
+          ANC_PV_CRYPTO_OK ||
+      anc_pv_memcmp(preparation.snapshot.ceremony_id,
+                    evidence.ceremonyId.bytes, 16) != ANC_PV_CRYPTO_OK)
+    return NO;
+  return preparedTransition
+             ? phase ==
+                   AncPrivateVaultRotationEvidenceStorePhaseAcknowledgements
+             : acknowledgedTransition
+                   ? phase ==
+                         AncPrivateVaultRotationEvidenceStorePhaseDestructions
+                   : NO;
+}
+
+- (AncPrivateVaultRotationPreparationStoreStatus)
+    markVerifiedRewrappedVaultId:(const uint8_t[16])vaultId
+              expectedCheckpoint:
+                  (AncPrivateVaultRotationPreparationCheckpoint *)expected
+              evidenceCheckpoint:
+                  (AncPrivateVaultRotationEvidenceStoreCheckpoint *)evidence
+                       checkpoint:
+                           (AncPrivateVaultRotationPreparationCheckpoint **)
+                               checkpoint {
+  if (!AncRotationPreparationEvidenceMatches(
+          vaultId, expected, evidence,
+          AncPrivateVaultRotationEvidenceStorePhaseAcknowledgements))
+    return AncPrivateVaultRotationPreparationStoreStatusConflict;
+  return [self advanceVaultId:vaultId
+           expectedCheckpoint:expected
+                      toPhase:ANC_PV_ROTATION_PREPARATION_PHASE_REWRAPPED
+                   checkpoint:checkpoint];
+}
+
+- (AncPrivateVaultRotationPreparationStoreStatus)
+    markVerifiedAcknowledgedVaultId:(const uint8_t[16])vaultId
+                 expectedCheckpoint:
+                     (AncPrivateVaultRotationPreparationCheckpoint *)expected
+                 evidenceCheckpoint:
+                     (AncPrivateVaultRotationEvidenceStoreCheckpoint *)evidence
+                          checkpoint:
+                              (AncPrivateVaultRotationPreparationCheckpoint **)
+                                  checkpoint {
+  if (!AncRotationPreparationEvidenceMatches(
+          vaultId, expected, evidence,
+          AncPrivateVaultRotationEvidenceStorePhaseDestructions))
+    return AncPrivateVaultRotationPreparationStoreStatusConflict;
+  return [self advanceVaultId:vaultId
+           expectedCheckpoint:expected
+                      toPhase:ANC_PV_ROTATION_PREPARATION_PHASE_ACKNOWLEDGED
+                   checkpoint:checkpoint];
+}
+
+#if ANC_PRIVATE_VAULT_TESTING
 - (AncPrivateVaultRotationPreparationStoreStatus)
     markRewrappedVaultId:(const uint8_t[16])vaultId
       expectedCheckpoint:
@@ -1502,6 +1580,7 @@ AncRotationPreparationTransitionValidate(
                       toPhase:ANC_PV_ROTATION_PREPARATION_PHASE_ACKNOWLEDGED
                    checkpoint:checkpoint];
 }
+#endif
 
 - (AncPrivateVaultRotationPreparationStoreStatus)
     armAwaitingControlCommitVaultId:(const uint8_t[16])vaultId

@@ -16,6 +16,8 @@ AncPrivateVaultRotationEndpointRemovalTargetMatchesPreparedForTesting(
               authorityStore:(AncPrivateVaultAuthorityStore *)authorityStore
            custodyRepository:
                (AncPrivateVaultCustodyRepository *)custodyRepository
+               evidenceStore:
+                   (AncPrivateVaultRotationEvidenceStore *)evidenceStore
                   controlLog:(AncPrivateVaultControlLog *)controlLog
                 trustedClock:(id<AncPrivateVaultTrustedClock>)trustedClock;
 @end

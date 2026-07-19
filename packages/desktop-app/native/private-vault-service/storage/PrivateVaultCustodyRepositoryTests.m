@@ -4,6 +4,7 @@
 #import "PrivateVaultCustodyRepositoryEnrollmentInternal.h"
 #import "PrivateVaultCustodyRepositoryGenesisInternal.h"
 #import "PrivateVaultCustodyRepositoryRecoveryInternal.h"
+#import "PrivateVaultCustodyRepositoryRotationInternal.h"
 
 #include <assert.h>
 
@@ -332,6 +333,12 @@ static AncPrivateVaultCustodyRepository *Repository(void) {
 static void Fill(uint8_t *bytes, size_t length, uint8_t start) {
   for (size_t index = 0; index < length; index += 1)
     bytes[index] = (uint8_t)(start + index);
+}
+
+static NSData *Pattern(NSUInteger length, uint8_t start) {
+  NSMutableData *data = [NSMutableData dataWithLength:length];
+  Fill(data.mutableBytes, length, start);
+  return data;
 }
 
 static void SetId(uint8_t output[160], size_t *length, NSString *value) {
@@ -2505,6 +2512,258 @@ static void TestLegacyCodecMigrations(void) {
          handle == nil);
 }
 
+static AncPrivateVaultCustodySnapshot RotationSuccessor(
+    const AncPrivateVaultCustodySnapshot *base,
+    AncPrivateVaultPreparedRotationCustodyCheckpoint *prepared) {
+  AncPrivateVaultCustodySnapshot next = *base;
+  next.custody_generation = prepared.targetCustodyGeneration;
+  next.active_epoch = prepared.pendingEpoch;
+  next.pending_epoch = 0;
+  next.anchored_sequence = prepared.expectedNextSequence;
+  Fill(next.anchored_head, 32, 0xa1);
+  memcpy(next.membership_digest, prepared.successorMembershipDigest.bytes, 32);
+  next.signed_at_ms += 100;
+  next.freshness_ms += 100;
+  Fill(next.snapshot_digest, 32, 0xb1);
+  next.expected_edge_present = 0;
+  next.pending_kind = ANC_PV_CUSTODY_PENDING_NONE;
+  next.rotation_phase = ANC_PV_CUSTODY_ROTATION_NONE;
+  next.enrollment_phase = ANC_PV_CUSTODY_ENROLLMENT_NONE;
+  next.expected_next_sequence = 0;
+  memset(next.expected_previous_head, 0, 32);
+  memset(next.pending_transcript_digest, 0, 32);
+  memset(next.ceremony_id, 0, sizeof next.ceremony_id);
+  next.ceremony_id_length = 0;
+  return next;
+}
+
+static AncPrivateVaultPreparedRotationCustodyCheckpoint *StageRotation(
+    AncPrivateVaultCustodyRepository *repository,
+    const AncPrivateVaultCustodySnapshot *base, const uint8_t pendingKey[32],
+    AncPrivateVaultCustodyRepositoryStatus expectedStatus) {
+  NSData *target = Pattern(16, 0x31);
+  NSData *ceremony = Pattern(16, 0x51);
+  NSData *baseDigest = Pattern(32, 0x61);
+  NSData *previousHead = Pattern(32, 0x21);
+  NSData *successor = Pattern(32, 0x91);
+  NSData *preparationDigest = Pattern(32, 0x71);
+  AncPrivateVaultPreparedRotationCustodyCheckpoint *checkpoint = nil;
+  AncPrivateVaultCustodyRepositoryStatus status =
+      [repository stagePreparedRotationVaultId:@"vault"
+                              targetEndpointId:target
+                                    ceremonyId:ceremony
+                            expectedGeneration:base->custody_generation
+                        expectedSnapshotDigest:baseDigest
+                                  pendingEpoch:base->active_epoch + 1
+                          expectedNextSequence:base->anchored_sequence + 1
+                          expectedPreviousHead:previousHead
+                     successorMembershipDigest:successor
+                    preparationFenceGeneration:7
+                        preparationRecordDigest:preparationDigest
+                                pendingEpochKey:pendingKey
+                                     checkpoint:&checkpoint];
+  assert(status == expectedStatus);
+  if (expectedStatus == AncPrivateVaultCustodyRepositoryStatusOK) {
+    assert(checkpoint != nil && checkpoint.baseCustodyGeneration == 1 &&
+           checkpoint.targetCustodyGeneration == 2 &&
+           checkpoint.fenceGeneration > 0 &&
+           [checkpoint.targetEndpointId isEqualToData:target] &&
+           [checkpoint.ceremonyId isEqualToData:ceremony] &&
+           [checkpoint.successorMembershipDigest isEqualToData:successor] &&
+           [checkpoint.preparationRecordDigest
+               isEqualToData:preparationDigest]);
+  }
+  return checkpoint;
+}
+
+static void TestPreparedRotationSidecarAndAdoption(void) {
+  Reset();
+  AncPrivateVaultCustodyRepository *repository = Repository();
+  AncPrivateVaultCustodySnapshot base;
+  TestSecrets secrets;
+  MakeActive(&base, &secrets, 1, 0x11, @"vault");
+  AncPrivateVaultCustodySecretInputs inputs = Inputs(&secrets);
+  assert([repository storeSnapshot:&base secrets:&inputs vaultId:@"vault"] ==
+         AncPrivateVaultCustodyRepositoryStatusOK);
+  uint8_t pendingKey[32] = {0};
+  Fill(pendingKey, sizeof pendingKey, 0xd1);
+  AncPrivateVaultPreparedRotationCustodyCheckpoint *prepared =
+      StageRotation(repository, &base, pendingKey,
+                    AncPrivateVaultCustodyRepositoryStatusOK);
+
+  AncPrivateVaultPreparedRotationCustodyCheckpoint *reread = nil;
+  assert([repository readPreparedRotationVaultId:@"vault"
+                                      checkpoint:&reread] ==
+         AncPrivateVaultCustodyRepositoryStatusOK);
+  assert([reread.recordDigest isEqualToData:prepared.recordDigest] &&
+         reread.fenceGeneration == prepared.fenceGeneration);
+  AncPrivateVaultPreparedRotationCustodyCheckpoint *repeated =
+      StageRotation(repository, &base, pendingKey,
+                    AncPrivateVaultCustodyRepositoryStatusOK);
+  assert([repeated.recordDigest isEqualToData:prepared.recordDigest] &&
+         repeated.fenceGeneration == prepared.fenceGeneration);
+
+  AncPrivateVaultCustodySnapshot stillBase;
+  AncPrivateVaultCustodyHandle *baseHandle = nil;
+  assert([repository readVaultId:@"vault" snapshot:&stillBase
+                          handle:&baseHandle] ==
+         AncPrivateVaultCustodyRepositoryStatusOK);
+  assert(stillBase.custody_generation == 1 && stillBase.pending_epoch == 0);
+  __block BOOL baseSecretsExact = NO;
+  assert([baseHandle borrow:^BOOL(
+                         const AncPrivateVaultCustodySecretInputs *borrowed) {
+           baseSecretsExact =
+               anc_pv_memcmp(borrowed->active_epoch_key, secrets.activeKey, 32) ==
+                   ANC_PV_CRYPTO_OK &&
+               anc_pv_memcmp(borrowed->pending_epoch_key,
+                             (const uint8_t[32]){0}, 32) == ANC_PV_CRYPTO_OK;
+           return baseSecretsExact;
+         }] == AncPrivateVaultCustodyRepositoryStatusOK);
+  assert(baseSecretsExact &&
+         [baseHandle close] == AncPrivateVaultCustodyRepositoryStatusOK);
+
+  NSData *wrongTarget = Pattern(16, 0x32);
+  AncPrivateVaultPreparedRotationCustodyCheckpoint *substitution = nil;
+  assert([repository stagePreparedRotationVaultId:@"vault"
+                                  targetEndpointId:wrongTarget
+                                        ceremonyId:prepared.ceremonyId
+                                expectedGeneration:1
+                            expectedSnapshotDigest:prepared.baseSnapshotDigest
+                                      pendingEpoch:2
+                              expectedNextSequence:2
+                              expectedPreviousHead:prepared.expectedPreviousHead
+                         successorMembershipDigest:
+                             prepared.successorMembershipDigest
+                        preparationFenceGeneration:7
+                            preparationRecordDigest:
+                                prepared.preparationRecordDigest
+                                    pendingEpochKey:pendingKey
+                                         checkpoint:&substitution] ==
+         AncPrivateVaultCustodyRepositoryStatusConflict);
+  uint8_t equalActive[32];
+  memcpy(equalActive, secrets.activeKey, sizeof equalActive);
+  assert(StageRotation(repository, &base, equalActive,
+                       AncPrivateVaultCustodyRepositoryStatusConflict) == nil);
+
+  AncPrivateVaultCustodySnapshot next = RotationSuccessor(&base, prepared);
+  assert([repository
+             adoptPreparedRotationAuthorityAnchorVaultId:@"vault"
+                                     expectedGeneration:1
+                                 expectedSnapshotDigest:
+                                     prepared.baseSnapshotDigest
+                             preparedRotationCheckpoint:prepared
+                                      nextPublicSnapshot:&next] ==
+         AncPrivateVaultCustodyRepositoryStatusOK);
+  AncPrivateVaultCustodySnapshot official;
+  AncPrivateVaultCustodyHandle *officialHandle = nil;
+  assert([repository readVaultId:@"vault" snapshot:&official
+                          handle:&officialHandle] ==
+         AncPrivateVaultCustodyRepositoryStatusOK);
+  assert(official.custody_generation == 2 && official.active_epoch == 2 &&
+         official.pending_epoch == 0);
+  __block BOOL adoptedSecretsExact = NO;
+  const uint8_t *adoptedPendingKey = pendingKey;
+  assert([officialHandle borrow:^BOOL(
+                             const AncPrivateVaultCustodySecretInputs *borrowed) {
+           adoptedSecretsExact =
+               anc_pv_memcmp(borrowed->active_epoch_key, adoptedPendingKey, 32) ==
+                   ANC_PV_CRYPTO_OK &&
+               anc_pv_memcmp(borrowed->pending_epoch_key,
+                             (const uint8_t[32]){0}, 32) == ANC_PV_CRYPTO_OK;
+           return adoptedSecretsExact;
+         }] == AncPrivateVaultCustodyRepositoryStatusOK);
+  assert(adoptedSecretsExact &&
+         [officialHandle close] == AncPrivateVaultCustodyRepositoryStatusOK);
+  assert([repository readPreparedRotationVaultId:@"vault" checkpoint:nil] ==
+         AncPrivateVaultCustodyRepositoryStatusNotFound);
+  assert([repository
+             adoptPreparedRotationAuthorityAnchorVaultId:@"vault"
+                                       expectedGeneration:1
+                                   expectedSnapshotDigest:
+                                       prepared.baseSnapshotDigest
+                               preparedRotationCheckpoint:prepared
+                                        nextPublicSnapshot:&next] ==
+         AncPrivateVaultCustodyRepositoryStatusOK);
+  anc_pv_zeroize(pendingKey, sizeof pendingKey);
+  anc_pv_zeroize(equalActive, sizeof equalActive);
+
+  const AncPrivateVaultCustodyRotationFaultPoint stageFaults[] = {
+      AncPrivateVaultCustodyRotationFaultAfterFenceBegin,
+      AncPrivateVaultCustodyRotationFaultAfterLiveWrite,
+      AncPrivateVaultCustodyRotationFaultAfterFenceCommit,
+      AncPrivateVaultCustodyRotationFaultBeforeFinalReread,
+  };
+  for (size_t index = 0; index < sizeof stageFaults / sizeof stageFaults[0];
+       index += 1) {
+    Reset();
+    repository = Repository();
+    MakeActive(&base, &secrets, 1, (uint8_t)(0x21 + index), @"vault");
+    inputs = Inputs(&secrets);
+    assert([repository storeSnapshot:&base secrets:&inputs vaultId:@"vault"] ==
+           AncPrivateVaultCustodyRepositoryStatusOK);
+    Fill(pendingKey, sizeof pendingKey, (uint8_t)(0xc1 + index));
+    AncPrivateVaultCustodyRotationFaultPoint fault = stageFaults[index];
+    AncPrivateVaultCustodyRotationSetFaultHookForTesting(
+        ^BOOL(AncPrivateVaultCustodyRotationFaultPoint point) {
+          return point == fault;
+        });
+    assert(StageRotation(repository, &base, pendingKey,
+                         AncPrivateVaultCustodyRepositoryStatusFailed) == nil);
+    AncPrivateVaultCustodyRotationSetFaultHookForTesting(nil);
+    prepared = StageRotation(repository, &base, pendingKey,
+                             AncPrivateVaultCustodyRepositoryStatusOK);
+    assert([repository readPreparedRotationVaultId:@"vault" checkpoint:nil] ==
+           AncPrivateVaultCustodyRepositoryStatusOK);
+  }
+
+  const AncPrivateVaultCustodyRotationFaultPoint adoptionFaults[] = {
+      AncPrivateVaultCustodyRotationFaultAfterMainAdoption,
+      AncPrivateVaultCustodyRotationFaultBeforeSidecarDelete,
+  };
+  for (size_t index = 0;
+       index < sizeof adoptionFaults / sizeof adoptionFaults[0]; index += 1) {
+    Reset();
+    repository = Repository();
+    MakeActive(&base, &secrets, 1, (uint8_t)(0x41 + index), @"vault");
+    inputs = Inputs(&secrets);
+    assert([repository storeSnapshot:&base secrets:&inputs vaultId:@"vault"] ==
+           AncPrivateVaultCustodyRepositoryStatusOK);
+    Fill(pendingKey, sizeof pendingKey, (uint8_t)(0xe1 + index));
+    prepared = StageRotation(repository, &base, pendingKey,
+                             AncPrivateVaultCustodyRepositoryStatusOK);
+    next = RotationSuccessor(&base, prepared);
+    AncPrivateVaultCustodyRotationFaultPoint fault = adoptionFaults[index];
+    AncPrivateVaultCustodyRotationSetFaultHookForTesting(
+        ^BOOL(AncPrivateVaultCustodyRotationFaultPoint point) {
+          return point == fault;
+        });
+    assert([repository
+               adoptPreparedRotationAuthorityAnchorVaultId:@"vault"
+                                         expectedGeneration:1
+                                     expectedSnapshotDigest:
+                                         prepared.baseSnapshotDigest
+                                 preparedRotationCheckpoint:prepared
+                                          nextPublicSnapshot:&next] ==
+           AncPrivateVaultCustodyRepositoryStatusFailed);
+    AncPrivateVaultCustodyRotationSetFaultHookForTesting(nil);
+    assert([repository
+               adoptPreparedRotationAuthorityAnchorVaultId:@"vault"
+                                         expectedGeneration:1
+                                     expectedSnapshotDigest:
+                                         prepared.baseSnapshotDigest
+                                 preparedRotationCheckpoint:prepared
+                                          nextPublicSnapshot:&next] ==
+           AncPrivateVaultCustodyRepositoryStatusOK);
+    assert([repository readVaultId:@"vault" snapshot:&official
+                            handle:&officialHandle] ==
+           AncPrivateVaultCustodyRepositoryStatusOK);
+    assert(official.custody_generation == 2 &&
+           [officialHandle close] == AncPrivateVaultCustodyRepositoryStatusOK);
+  }
+  AncPrivateVaultCustodyRotationSetFaultHookForTesting(nil);
+  anc_pv_zeroize(pendingKey, sizeof pendingKey);
+}
+
 int main(void) {
   @autoreleasepool {
     assert(anc_pv_crypto_init() == ANC_PV_CRYPTO_OK);
@@ -2529,6 +2788,7 @@ int main(void) {
     TestPendingRecoveryPromotionCAS();
     TestEnrollmentAuthorizationAndPromotionCAS();
     TestEnrollmentCancellationCAS();
+    TestPreparedRotationSidecarAndAdoption();
     TestLegacyCodecMigrations();
     puts("private-vault custody repository tests passed");
   }

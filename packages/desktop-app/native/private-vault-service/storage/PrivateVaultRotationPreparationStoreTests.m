@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 
 #import "PrivateVaultRotationPreparationStore.h"
+#import "PrivateVaultRotationPreparationStoreInternal.h"
 
 #include <assert.h>
 

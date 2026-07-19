@@ -1,5 +1,6 @@
 #import "PrivateVaultCustodyRecord.h"
 #import "PrivateVaultRotationPreparationStore.h"
+#import "PrivateVaultRotationEvidenceStore.h"
 
 @class AncPrivateVaultAuthorityCheckpoint;
 @class AncPrivateVaultAuthorityStore;
@@ -31,6 +32,26 @@ typedef BOOL (^AncPrivateVaultConsumedHostedAppendConsumer)(
     NSData *signingPublicKey);
 
 @interface AncPrivateVaultRotationPreparationStore (CoordinatorInternal)
+- (AncPrivateVaultRotationPreparationStoreStatus)
+    markVerifiedRewrappedVaultId:(const uint8_t *_Nonnull)vaultId
+              expectedCheckpoint:
+                  (AncPrivateVaultRotationPreparationCheckpoint *)expected
+              evidenceCheckpoint:
+                  (AncPrivateVaultRotationEvidenceStoreCheckpoint *)evidence
+                       checkpoint:
+                           (AncPrivateVaultRotationPreparationCheckpoint
+                                *_Nullable *_Nullable)checkpoint;
+
+- (AncPrivateVaultRotationPreparationStoreStatus)
+    markVerifiedAcknowledgedVaultId:(const uint8_t *_Nonnull)vaultId
+                 expectedCheckpoint:
+                     (AncPrivateVaultRotationPreparationCheckpoint *)expected
+                 evidenceCheckpoint:
+                     (AncPrivateVaultRotationEvidenceStoreCheckpoint *)evidence
+                          checkpoint:
+                              (AncPrivateVaultRotationPreparationCheckpoint
+                                   *_Nullable *_Nullable)checkpoint;
+
 /* Starts the first ceremony or CASes a fully cleaned tombstone to the next
  * PREPARED generation. The coordinator must supply an authenticated fresh base
  * tuple; the record transition independently enforces a changed ceremony and
@@ -101,5 +122,22 @@ typedef BOOL (^AncPrivateVaultConsumedHostedAppendConsumer)(
                                  (AncPrivateVaultConsumedHostedAppendConsumer)
                                      consumer;
 @end
+
+#if ANC_PRIVATE_VAULT_TESTING
+@interface AncPrivateVaultRotationPreparationStore (LegacyTestSetup)
+- (AncPrivateVaultRotationPreparationStoreStatus)
+    markRewrappedVaultId:(const uint8_t *_Nonnull)vaultId
+      expectedCheckpoint:
+          (AncPrivateVaultRotationPreparationCheckpoint *)expected
+              checkpoint:(AncPrivateVaultRotationPreparationCheckpoint
+                              *_Nullable *_Nullable)checkpoint;
+- (AncPrivateVaultRotationPreparationStoreStatus)
+    markAcknowledgedVaultId:(const uint8_t *_Nonnull)vaultId
+         expectedCheckpoint:
+             (AncPrivateVaultRotationPreparationCheckpoint *)expected
+                 checkpoint:(AncPrivateVaultRotationPreparationCheckpoint
+                                 *_Nullable *_Nullable)checkpoint;
+@end
+#endif
 
 NS_ASSUME_NONNULL_END

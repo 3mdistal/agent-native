@@ -1,5 +1,6 @@
 #import "PrivateVaultAuthorityStore.h"
 #import "PrivateVaultAuthorityStoreInternal.h"
+#import "PrivateVaultAuthorityStoreRotationInternal.h"
 #import "PrivateVaultGenesisAuthorization.h"
 #import "PrivateVaultGenesisAuthorizationInternal.h"
 #import "PrivateVaultRecoveryBuilderInternal.h"
@@ -392,6 +393,24 @@ static void AuthorityRaiseImmutableMutation(void) {
 @property(nonatomic) BOOL enrollmentCandidateUnattended;
 @property(nonatomic, nullable) NSData *enrollmentCandidateSigningPublicKey;
 @property(nonatomic, nullable) NSData *enrollmentCandidateAgreementPublicKey;
+@property(nonatomic) BOOL preparedRotation;
+@property(nonatomic, nullable)
+    AncPrivateVaultPreparedRotationCustodyCheckpoint
+        *preparedRotationCheckpoint;
+@property(nonatomic, nullable) NSData *rotationTargetEndpointId;
+@property(nonatomic, nullable) NSData *rotationCeremonyId;
+@property(nonatomic) uint64_t rotationBaseGeneration;
+@property(nonatomic) uint64_t rotationTargetGeneration;
+@property(nonatomic, nullable) NSData *rotationBaseSnapshotDigest;
+@property(nonatomic) uint64_t rotationActiveEpoch;
+@property(nonatomic) uint64_t rotationPendingEpoch;
+@property(nonatomic) uint64_t rotationExpectedNextSequence;
+@property(nonatomic, nullable) NSData *rotationExpectedPreviousHead;
+@property(nonatomic, nullable) NSData *rotationSuccessorMembershipDigest;
+@property(nonatomic) uint64_t rotationPreparationFenceGeneration;
+@property(nonatomic, nullable) NSData *rotationPreparationRecordDigest;
+@property(nonatomic) uint64_t rotationFenceGeneration;
+@property(nonatomic, nullable) NSData *rotationRecordDigest;
 @end
 @implementation AncPrivateVaultVerifiedEvidence
 @end
@@ -980,7 +999,35 @@ AuthorityCopyVerifiedEvidence(AncPrivateVaultVerifiedReplayResult *result) {
                         result.expectedCheckpoint.snapshot, &status);
     NSData *presentedNext =
         AncPrivateVaultAuthoritySnapshotEncode(result.nextSnapshot, &status);
-    if (presentedNext == nil ||
+    AncPrivateVaultPreparedRotationCustodyCheckpoint *rotation =
+        registered.preparedRotationCheckpoint;
+    BOOL rotationPresentationMatches =
+        !registered.preparedRotation ||
+        (rotation != nil &&
+         [rotation.vaultId isEqualToString:registered.vaultId] &&
+         [rotation.targetEndpointId
+             isEqualToData:registered.rotationTargetEndpointId] &&
+         [rotation.ceremonyId isEqualToData:registered.rotationCeremonyId] &&
+         rotation.baseCustodyGeneration == registered.rotationBaseGeneration &&
+         rotation.targetCustodyGeneration ==
+             registered.rotationTargetGeneration &&
+         [rotation.baseSnapshotDigest
+             isEqualToData:registered.rotationBaseSnapshotDigest] &&
+         rotation.activeEpoch == registered.rotationActiveEpoch &&
+         rotation.pendingEpoch == registered.rotationPendingEpoch &&
+         rotation.expectedNextSequence ==
+             registered.rotationExpectedNextSequence &&
+         [rotation.expectedPreviousHead
+             isEqualToData:registered.rotationExpectedPreviousHead] &&
+         [rotation.successorMembershipDigest
+             isEqualToData:registered.rotationSuccessorMembershipDigest] &&
+         rotation.preparationFenceGeneration ==
+             registered.rotationPreparationFenceGeneration &&
+         [rotation.preparationRecordDigest
+             isEqualToData:registered.rotationPreparationRecordDigest] &&
+         rotation.fenceGeneration == registered.rotationFenceGeneration &&
+         [rotation.recordDigest isEqualToData:registered.rotationRecordDigest]);
+    if (presentedNext == nil || !rotationPresentationMatches ||
         (!bootstrap &&
          (presentedExpected == nil ||
           ![presentedExpected isEqualToData:registered.expectedCanonical])) ||
@@ -1046,6 +1093,29 @@ AuthorityCopyVerifiedEvidence(AncPrivateVaultVerifiedReplayResult *result) {
       [registered.enrollmentCandidateSigningPublicKey copy];
   copy.enrollmentCandidateAgreementPublicKey =
       [registered.enrollmentCandidateAgreementPublicKey copy];
+  copy.preparedRotation = registered.preparedRotation;
+  copy.preparedRotationCheckpoint = registered.preparedRotationCheckpoint;
+  copy.rotationTargetEndpointId =
+      [registered.rotationTargetEndpointId copy];
+  copy.rotationCeremonyId = [registered.rotationCeremonyId copy];
+  copy.rotationBaseGeneration = registered.rotationBaseGeneration;
+  copy.rotationTargetGeneration = registered.rotationTargetGeneration;
+  copy.rotationBaseSnapshotDigest =
+      [registered.rotationBaseSnapshotDigest copy];
+  copy.rotationActiveEpoch = registered.rotationActiveEpoch;
+  copy.rotationPendingEpoch = registered.rotationPendingEpoch;
+  copy.rotationExpectedNextSequence =
+      registered.rotationExpectedNextSequence;
+  copy.rotationExpectedPreviousHead =
+      [registered.rotationExpectedPreviousHead copy];
+  copy.rotationSuccessorMembershipDigest =
+      [registered.rotationSuccessorMembershipDigest copy];
+  copy.rotationPreparationFenceGeneration =
+      registered.rotationPreparationFenceGeneration;
+  copy.rotationPreparationRecordDigest =
+      [registered.rotationPreparationRecordDigest copy];
+  copy.rotationFenceGeneration = registered.rotationFenceGeneration;
+  copy.rotationRecordDigest = [registered.rotationRecordDigest copy];
   return copy;
 }
 
@@ -1617,9 +1687,99 @@ AncPrivateVaultVerifiedReplayResult *AncPrivateVaultVerifiedReplayResultCreate(
   if (epochTransition !=
       AncPrivateVaultCustodyEpochTransitionPromotePreparedEpoch)
     return nil;
+  /* This remains a useful pure proof constructor. AuthorityStore will not
+   * commit its promotion unless the rotation-only constructor below has also
+   * joined the result to exact staged-custody evidence. */
   return AuthorityVerifiedReplayResultCreate(
       replayResult, expectedCheckpoint, targetCustodyGeneration, verifiedAtMs,
       epochTransition);
+}
+
+AncPrivateVaultVerifiedReplayResult *
+AncPrivateVaultVerifiedRotationReplayResultCreate(
+    AncPrivateVaultControlLogReplayResult *replayResult,
+    AncPrivateVaultAuthorityCheckpoint *expectedCheckpoint,
+    AncPrivateVaultPreparedRotationCustodyCheckpoint *rotation,
+    uint64_t verifiedAtMs) {
+  if (rotation == nil || expectedCheckpoint == nil ||
+      rotation.targetEndpointId.length != 16 || rotation.ceremonyId.length != 16 ||
+      rotation.baseSnapshotDigest.length != ANC_PV_HASH_BYTES ||
+      rotation.expectedPreviousHead.length != ANC_PV_HASH_BYTES ||
+      rotation.successorMembershipDigest.length != ANC_PV_HASH_BYTES ||
+      rotation.preparationRecordDigest.length != ANC_PV_HASH_BYTES ||
+      rotation.recordDigest.length != ANC_PV_HASH_BYTES ||
+      rotation.baseCustodyGeneration == 0 ||
+      rotation.baseCustodyGeneration == kAuthorityMaximumSafeInteger ||
+      rotation.targetCustodyGeneration !=
+          rotation.baseCustodyGeneration + 1 ||
+      rotation.preparationFenceGeneration == 0 ||
+      rotation.preparationFenceGeneration > kAuthorityMaximumSafeInteger ||
+      rotation.fenceGeneration == 0 ||
+      rotation.fenceGeneration > kAuthorityMaximumSafeInteger ||
+      rotation.activeEpoch == 0 ||
+      rotation.activeEpoch == kAuthorityMaximumSafeInteger ||
+      rotation.pendingEpoch != rotation.activeEpoch + 1 ||
+      rotation.expectedNextSequence == 0 ||
+      rotation.expectedNextSequence > kAuthorityMaximumSafeInteger ||
+      ![rotation.vaultId isEqualToString:expectedCheckpoint.vaultId] ||
+      rotation.baseCustodyGeneration !=
+          expectedCheckpoint.custodyGeneration ||
+      ![rotation.baseSnapshotDigest
+          isEqualToData:expectedCheckpoint.frameDigest] ||
+      rotation.activeEpoch != expectedCheckpoint.snapshot.epoch ||
+      rotation.expectedNextSequence !=
+          expectedCheckpoint.snapshot.sequence + 1 ||
+      ![rotation.expectedPreviousHead
+          isEqualToData:expectedCheckpoint.snapshot.headHash])
+    return nil;
+  AncPrivateVaultVerifiedReplayResult *verified =
+      AuthorityVerifiedReplayResultCreate(
+          replayResult, expectedCheckpoint, rotation.targetCustodyGeneration,
+          verifiedAtMs,
+          AncPrivateVaultCustodyEpochTransitionPromotePreparedEpoch);
+  NSString *targetEndpointId = AuthorityHexId(rotation.targetEndpointId);
+  if (verified == nil ||
+      targetEndpointId == nil ||
+      AuthorityMemberWithId(expectedCheckpoint.snapshot.activeMembers,
+                            targetEndpointId) == nil ||
+      AuthorityMemberWithId(verified.nextSnapshot.activeMembers,
+                            targetEndpointId) != nil ||
+      verified.nextSnapshot.epoch != rotation.pendingEpoch ||
+      verified.nextSnapshot.sequence != rotation.expectedNextSequence ||
+      ![verified.nextSnapshot.membershipHash
+          isEqualToData:rotation.successorMembershipDigest])
+    return nil;
+  NSLock *lock = AuthorityVerifiedRegistryLock();
+  [lock lock];
+  @try {
+    AncPrivateVaultVerifiedEvidence *e =
+        [AuthorityVerifiedRegistry() objectForKey:verified];
+    if (e == nil || e.testOnly || e.genesis || e.recoveryBootstrap ||
+        e.enrollmentBootstrap || e.preparedRotation)
+      return nil;
+    e.preparedRotation = YES;
+    e.preparedRotationCheckpoint = rotation;
+    e.rotationTargetEndpointId = [rotation.targetEndpointId copy];
+    e.rotationCeremonyId = [rotation.ceremonyId copy];
+    e.rotationBaseGeneration = rotation.baseCustodyGeneration;
+    e.rotationTargetGeneration = rotation.targetCustodyGeneration;
+    e.rotationBaseSnapshotDigest = [rotation.baseSnapshotDigest copy];
+    e.rotationActiveEpoch = rotation.activeEpoch;
+    e.rotationPendingEpoch = rotation.pendingEpoch;
+    e.rotationExpectedNextSequence = rotation.expectedNextSequence;
+    e.rotationExpectedPreviousHead = [rotation.expectedPreviousHead copy];
+    e.rotationSuccessorMembershipDigest =
+        [rotation.successorMembershipDigest copy];
+    e.rotationPreparationFenceGeneration =
+        rotation.preparationFenceGeneration;
+    e.rotationPreparationRecordDigest =
+        [rotation.preparationRecordDigest copy];
+    e.rotationFenceGeneration = rotation.fenceGeneration;
+    e.rotationRecordDigest = [rotation.recordDigest copy];
+  } @finally {
+    [lock unlock];
+  }
+  return verified;
 }
 
 AncPrivateVaultVerifiedReplayResult *
@@ -2245,6 +2405,14 @@ static NSRecursiveLock *AuthorityNamedLock(NSString *key) {
       ((unsigned)evidence.genesis + (unsigned)evidence.recoveryBootstrap +
            (unsigned)evidence.enrollmentBootstrap >
        1) ||
+      (evidence.preparedRotation &&
+       (bootstrap || evidence.testOnly ||
+        evidence.transition !=
+            AncPrivateVaultCustodyEpochTransitionPromotePreparedEpoch)) ||
+      (!bootstrap &&
+       evidence.transition ==
+           AncPrivateVaultCustodyEpochTransitionPromotePreparedEpoch &&
+       !evidence.preparedRotation) ||
       (!bootstrap && expectedSnapshot == nil) || nextSnapshot == nil ||
       vaultId.length == 0 || evidence.verifiedAtMs != verifiedAtMs ||
       nextSnapshot.verifiedAtMs != verifiedAtMs ||
@@ -2321,6 +2489,54 @@ static NSRecursiveLock *AuthorityNamedLock(NSString *key) {
       return AncPrivateVaultAuthorityStoreStatusConflict;
     }
   }
+  if (evidence.preparedRotation) {
+    AncPrivateVaultAuthorityCheckpoint *official = nil;
+    AncPrivateVaultAuthorityStoreStatus officialStatus =
+        [self loadVaultId:vaultId checkpoint:&official error:nil];
+    if (officialStatus == AncPrivateVaultAuthorityStoreStatusOK &&
+        official.custodyGeneration == evidence.rotationTargetGeneration) {
+      AncPrivateVaultAuthoritySnapshotStatus ss;
+      NSData *officialCanonical =
+          AncPrivateVaultAuthoritySnapshotEncode(official.snapshot, &ss);
+      NSData *wantedCanonical =
+          AncPrivateVaultAuthoritySnapshotEncode(nextSnapshot, &ss);
+      if (officialCanonical != nil &&
+          [officialCanonical isEqualToData:wantedCanonical]) {
+        AncPrivateVaultCustodySnapshot adopted;
+        AncPrivateVaultCustodyHandle *adoptedHandle = nil;
+        AncPrivateVaultCustodyRepositoryStatus readStatus =
+            [self.custodyRepository readVaultId:vaultId
+                                       snapshot:&adopted
+                                         handle:&adoptedHandle];
+        BOOL adoptedHandlePresent = adoptedHandle != nil;
+        BOOL adoptedClosed = CloseCustodyHandle(adoptedHandle);
+        if (readStatus != AncPrivateVaultCustodyRepositoryStatusOK ||
+            !adoptedHandlePresent || !adoptedClosed) {
+          anc_pv_custody_snapshot_zero(&adopted);
+          return AncPrivateVaultAuthorityStoreStatusProtectionFailed;
+        }
+        AncPrivateVaultCustodyRepositoryStatus cleanupStatus =
+            [self.custodyRepository
+                adoptPreparedRotationAuthorityAnchorVaultId:vaultId
+                                          expectedGeneration:
+                                              evidence.rotationBaseGeneration
+                                      expectedSnapshotDigest:
+                                          evidence.rotationBaseSnapshotDigest
+                                   preparedRotationCheckpoint:
+                                       evidence.preparedRotationCheckpoint
+                                         nextPublicSnapshot:&adopted];
+        anc_pv_custody_snapshot_zero(&adopted);
+        if (cleanupStatus != AncPrivateVaultCustodyRepositoryStatusOK)
+          return AuthorityStatusForCustodyFailure(cleanupStatus);
+        if (checkpoint)
+          *checkpoint = official;
+        return AncPrivateVaultAuthorityStoreStatusOK;
+      }
+      return AncPrivateVaultAuthorityStoreStatusConflict;
+    }
+    if (officialStatus != AncPrivateVaultAuthorityStoreStatusOK)
+      return officialStatus;
+  }
   AncPrivateVaultCustodyEpochTransition transition = evidence.transition;
   NSRecursiveLock *operationLock = [self operationLockForVaultId:vaultId];
   if (operationLock == nil)
@@ -2347,9 +2563,26 @@ static NSRecursiveLock *AuthorityNamedLock(NSString *key) {
       BOOL carries =
           transition == AncPrivateVaultCustodyEpochTransitionCarryCurrentEpoch;
       uint64_t nextEpoch =
-          promotes ? current.pending_epoch : current.active_epoch;
+          evidence.preparedRotation
+              ? evidence.rotationPendingEpoch
+              : promotes ? current.pending_epoch : current.active_epoch;
       if ((!bootstrap && expected == nil) || (!carries && !promotes) ||
-          (promotes && current.pending_epoch == 0) ||
+          (promotes && !evidence.preparedRotation &&
+           current.pending_epoch == 0) ||
+          (evidence.preparedRotation &&
+           (current.custody_generation != evidence.rotationBaseGeneration ||
+            current.lifecycle != ANC_PV_CUSTODY_LIFECYCLE_ACTIVE ||
+            current.pending_epoch != 0 ||
+            current.active_epoch != evidence.rotationActiveEpoch ||
+            evidence.rotationTargetGeneration !=
+                current.custody_generation + 1 ||
+            ![evidence.rotationBaseSnapshotDigest
+                isEqualToData:expected.frameDigest] ||
+            ![evidence.rotationExpectedPreviousHead
+                isEqualToData:expected.snapshot.headHash] ||
+            evidence.rotationExpectedNextSequence != nextSnapshot.sequence ||
+            ![evidence.rotationSuccessorMembershipDigest
+                isEqualToData:nextSnapshot.membershipHash])) ||
           (!bootstrap &&
            (expected.custodyGeneration != current.custody_generation ||
             anc_pv_memcmp(expected.frameDigest.bytes, current.snapshot_digest,
@@ -2453,7 +2686,7 @@ static NSRecursiveLock *AuthorityNamedLock(NSString *key) {
         memset(next.ceremony_id, 0, sizeof next.ceremony_id);
         next.ceremony_id_length = 0;
         if (promotes)
-          next.active_epoch = current.pending_epoch;
+          next.active_epoch = nextEpoch;
         next.pending_epoch = 0;
       }
       if (!AuthoritySnapshotMatchesCustody(nextSnapshot, vaultId, &next, digest,
@@ -2537,6 +2770,15 @@ static NSRecursiveLock *AuthorityNamedLock(NSString *key) {
         cs = [self.custodyRepository
             promoteEnrollmentAuthorityAnchorVaultId:vaultId
                                  nextPublicSnapshot:&next];
+      } else if (evidence.preparedRotation) {
+        cs = [self.custodyRepository
+            adoptPreparedRotationAuthorityAnchorVaultId:vaultId
+                                      expectedGeneration:
+                                          current.custody_generation
+                                  expectedSnapshotDigest:expected.frameDigest
+                               preparedRotationCheckpoint:
+                                   evidence.preparedRotationCheckpoint
+                                     nextPublicSnapshot:&next];
       } else {
         cs = [self.custodyRepository
             advanceAuthorityAnchorVaultId:vaultId
@@ -2546,7 +2788,9 @@ static NSRecursiveLock *AuthorityNamedLock(NSString *key) {
                           epochTransition:transition];
       }
       if (cs != AncPrivateVaultCustodyRepositoryStatusOK) {
-        final = cs == AncPrivateVaultCustodyRepositoryStatusConflict
+        final = evidence.preparedRotation
+                    ? AuthorityStatusForCustodyFailure(cs)
+                : cs == AncPrivateVaultCustodyRepositoryStatusConflict
                     ? AncPrivateVaultAuthorityStoreStatusConflict
                     : AncPrivateVaultAuthorityStoreStatusCorrupt;
         return;

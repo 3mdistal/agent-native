@@ -4,6 +4,8 @@
 #import "PrivateVaultControlLog.h"
 #import "PrivateVaultCustodyRepository.h"
 #import "PrivateVaultRotationPreparationStore.h"
+#import "PrivateVaultRotationEvidenceStore.h"
+#import "PrivateVaultRotationEvidence.h"
 
 @class AncPrivateVaultPreparedEndpointRemoval;
 @class AncPrivateVaultPreparedBrokerReplacement;
@@ -74,6 +76,8 @@ typedef NS_ENUM(NSInteger, AncPrivateVaultRotationCoordinatorStatus) {
                               (AncPrivateVaultAuthorityStore *)authorityStore
                        custodyRepository:
                            (AncPrivateVaultCustodyRepository *)custodyRepository
+                           evidenceStore:
+                               (AncPrivateVaultRotationEvidenceStore *)evidenceStore
                               controlLog:(AncPrivateVaultControlLog *)controlLog
     NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
@@ -101,6 +105,49 @@ typedef NS_ENUM(NSInteger, AncPrivateVaultRotationCoordinatorStatus) {
                       checkpoint:
                           (AncPrivateVaultRotationPreparationCheckpoint
                                *_Nullable *_Nullable)checkpoint;
+
+/* Verifies and durably freezes the exact signed checkpoint, survivor offers,
+ * EEK wraps, and live-revision mapping before advancing PREPARED -> REWRAPPED.
+ * The returned ledger is public evidence only and does not claim completion. */
+- (AncPrivateVaultRotationCoordinatorStatus)
+    verifyEndpointRemovalRewrapVaultId:(const uint8_t *_Nullable)vaultId
+                      targetEndpointId:(NSData *)targetEndpointId
+                    manifestObjectId:(NSData *)manifestObjectId
+                           revisionId:(NSData *)revisionId
+                            generation:(uint64_t)generation
+                        ciphertextHash:(NSData *)ciphertextHash
+                         liveRevisions:
+                             (NSArray<AncPrivateVaultRotationLiveRevision *> *)
+                                 liveRevisions
+                            checkpoint:
+                                (AncPrivateVaultRotationEvidenceStoreCheckpoint
+                                     *_Nullable *_Nullable)checkpoint;
+
+/* Verifies the complete canonical acknowledgement set against the frozen
+ * ledger and pending EEK, persists it, advances REWRAPPED -> ACKNOWLEDGED, and
+ * arms AWAITING_CONTROL_COMMIT. It neither commits the edge nor reports
+ * rotation completion. */
+- (AncPrivateVaultRotationCoordinatorStatus)
+    verifyEndpointRemovalAcknowledgementsVaultId:
+        (const uint8_t *_Nullable)vaultId
+                              targetEndpointId:(NSData *)targetEndpointId
+                              acknowledgements:
+                                  (NSArray<NSData *> *)acknowledgements
+                            checkpoint:
+                                (AncPrivateVaultRotationEvidenceStoreCheckpoint
+                                     *_Nullable *_Nullable)checkpoint;
+
+/* After local edge promotion and official reread, verifies and persists the
+ * exact destruction set. Only this step may make the evidence ledger Complete;
+ * it still does not report hosted rotation completion. */
+- (AncPrivateVaultRotationCoordinatorStatus)
+    verifyEndpointRemovalDestructionsVaultId:
+        (const uint8_t *_Nullable)vaultId
+                         targetEndpointId:(NSData *)targetEndpointId
+                              destructions:(NSArray<NSData *> *)destructions
+                                checkpoint:
+                                    (AncPrivateVaultRotationEvidenceStoreCheckpoint
+                                         *_Nullable *_Nullable)checkpoint;
 
 /* Starts a distinct attended broker-replacement ceremony. The drain envelope
  * must be signed by the live attended issuer and bind the exact old broker,
@@ -155,6 +202,8 @@ typedef NS_ENUM(NSInteger, AncPrivateVaultRotationCoordinatorFaultPoint) {
   AncPrivateVaultRotationCoordinatorFaultAfterAuthorityCommit = 2,
   AncPrivateVaultRotationCoordinatorFaultBeforeOfficialReread = 3,
   AncPrivateVaultRotationCoordinatorFaultBeforePreparationConsume = 4,
+  AncPrivateVaultRotationCoordinatorFaultAfterEvidenceLedger = 5,
+  AncPrivateVaultRotationCoordinatorFaultAfterEvidencePhase = 6,
 };
 
 #if ANC_PRIVATE_VAULT_TESTING

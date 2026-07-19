@@ -852,6 +852,19 @@ int main(void) {
                             nextSnapshot:descendant
                          epochTransition:
                              AncPrivateVaultCustodyEpochTransitionCarryCurrentEpoch];
+    AncPrivateVaultVerifiedReplayResult *unboundPromotion =
+        [AncPrivateVaultVerifiedReplayResult
+            testResultWithExpectedCheckpoint:initial
+                                nextSnapshot:descendant
+                             epochTransition:
+                                 AncPrivateVaultCustodyEpochTransitionPromotePreparedEpoch];
+    CHECK(unboundPromotion != nil);
+    CHECK([store commitVerifiedReplayResult:unboundPromotion
+                                    vaultId:genesis.vaultId
+                               verifiedAtMs:descendant.verifiedAtMs
+                                 checkpoint:nil
+                                      error:nil] ==
+          AncPrivateVaultAuthorityStoreStatusInvalid);
     Class privateVerifiedClass =
         NSClassFromString(@"AncPrivateVaultImmutableVerifiedReplayResult");
     CHECK(privateVerifiedClass != Nil);

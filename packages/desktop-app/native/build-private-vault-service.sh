@@ -44,6 +44,7 @@ SOURCES=(
   "$SOURCE_ROOT/storage/PrivateVaultKeychain.m"
   "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m"
   "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m"
+  "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m"
   "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m"
   "$SOURCE_ROOT/storage/PrivateVaultAuthorityStore.m"
   "$SOURCE_ROOT/storage/PrivateVaultGenesisArtifactStore.m"
@@ -532,6 +533,7 @@ case "${PRIVATE_VAULT_BUILD_CONTINUITY_COORDINATOR_TESTS:-}" in
       "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthorityStore.m" \
@@ -817,6 +819,7 @@ case "${PRIVATE_VAULT_BUILD_AUTHORITY_TESTS:-}" in
       "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRecoveryPreparationStore.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
@@ -961,6 +964,7 @@ case "${PRIVATE_VAULT_BUILD_ENROLLMENT_AUTHORIZATION_TESTS:-}" in
       "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRecoveryPreparationStore.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
@@ -1022,8 +1026,9 @@ case "${PRIVATE_VAULT_BUILD_BROKER_REPLACEMENT_APPROVAL_TESTS:-}" in
         "$SOURCE_ROOT/storage/PrivateVaultKeychain.m" \
         "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
         "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
-        "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
-        "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
         "$SOURCE_ROOT/storage/PrivateVaultRecoveryPreparationStore.m" \
         "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
         "$SOURCE_ROOT/storage/PrivateVaultAuthorityStore.m" \
@@ -1257,6 +1262,7 @@ case "${PRIVATE_VAULT_BUILD_ENROLLMENT_COORDINATOR_TESTS:-}" in
       "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRecoveryPreparationStore.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
@@ -1334,6 +1340,7 @@ case "${PRIVATE_VAULT_BUILD_AUTHENTICATED_REPLAY_BRIDGE_TESTS:-}" in
       "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthorityStore.m" \
@@ -1451,6 +1458,7 @@ case "${PRIVATE_VAULT_BUILD_GENESIS_AUTHORIZATION_TESTS:-}" in
       "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthorityStore.m" \
@@ -1560,6 +1568,7 @@ case "${PRIVATE_VAULT_BUILD_GENESIS_COORDINATOR_TESTS:-}" in
       "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthorityStore.m" \
@@ -1648,6 +1657,7 @@ case "${PRIVATE_VAULT_BUILD_REPOSITORY_TESTS:-}" in
       "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepositoryTests.m" \
       "$sodium_root/lib/libsodium.a" \
@@ -1716,6 +1726,7 @@ case "${PRIVATE_VAULT_BUILD_GENESIS_PREPARATION_STORAGE_TESTS:-}" in
       "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthorityStore.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRecoveryPreparationStore.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGenesisPreparationRecord.m" \
@@ -1789,6 +1800,12 @@ case "${PRIVATE_VAULT_BUILD_ROTATION_PREPARATION_TESTS:-}" in
       -o "$ROTATION_TEST_OUTPUT/private-vault-rotation-record-tests-$architecture"
     xcrun clang "${common[@]}" \
       "$SOURCE_ROOT/crypto/PrivateVaultCrypto.c" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecordTests.m" \
+      "$sodium_root/lib/libsodium.a" \
+      -o "$ROTATION_TEST_OUTPUT/private-vault-rotation-custody-record-tests-$architecture"
+    xcrun clang "${common[@]}" \
+      "$SOURCE_ROOT/crypto/PrivateVaultCrypto.c" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationPreparationSpool.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationPreparationSpoolTests.m" \
@@ -1804,12 +1821,14 @@ case "${PRIVATE_VAULT_BUILD_ROTATION_PREPARATION_TESTS:-}" in
       "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthorityStore.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationPreparationRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationPreparationSpool.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationPreparationStore.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationEvidenceStore.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationTestLinkStubs.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationPreparationStoreTests.m" \
       "$sodium_root/lib/libsodium.a" \
@@ -1825,16 +1844,19 @@ case "${PRIVATE_VAULT_BUILD_ROTATION_PREPARATION_TESTS:-}" in
       "$SOURCE_ROOT/control/PrivateVaultEekWrap.m" \
       "$SOURCE_ROOT/control/PrivateVaultEndpointRequest.m" \
       "$SOURCE_ROOT/control/PrivateVaultRecoveryWrap.m" \
+      "$SOURCE_ROOT/control/PrivateVaultRotationEvidence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultKeychain.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthoritySnapshot.m" \
       "$SOURCE_ROOT/storage/PrivateVaultAuthorityStore.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationPreparationRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationPreparationSpool.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationPreparationStore.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationEvidenceStore.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationTestLinkStubs.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationCoordinator.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRotationCoordinatorTests.m" \
@@ -1933,6 +1955,7 @@ case "${PRIVATE_VAULT_BUILD_BOOTSTRAP_REPLAY_TESTS:-}" in
       "$SOURCE_ROOT/storage/PrivateVaultGenerationFence.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultGuardedMemory.m" \
+      "$SOURCE_ROOT/storage/PrivateVaultRotationCustodyRecord.m" \
       "$SOURCE_ROOT/storage/PrivateVaultCustodyRepository.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRecoveryPreparationStore.m" \
       "$SOURCE_ROOT/storage/PrivateVaultRecoveryCoordinator.m" \

@@ -70,20 +70,6 @@ typedef BOOL (^AncPrivateVaultRotationPreparationKeyBorrowBlock)(
                checkpoint:(AncPrivateVaultRotationPreparationCheckpoint
                                *_Nullable *_Nullable)checkpoint;
 
-- (AncPrivateVaultRotationPreparationStoreStatus)
-    markRewrappedVaultId:(const uint8_t *)vaultId
-      expectedCheckpoint:
-          (AncPrivateVaultRotationPreparationCheckpoint *)expectedCheckpoint
-              checkpoint:(AncPrivateVaultRotationPreparationCheckpoint
-                              *_Nullable *_Nullable)checkpoint;
-
-- (AncPrivateVaultRotationPreparationStoreStatus)
-    markAcknowledgedVaultId:(const uint8_t *)vaultId
-         expectedCheckpoint:
-             (AncPrivateVaultRotationPreparationCheckpoint *)expectedCheckpoint
-                 checkpoint:(AncPrivateVaultRotationPreparationCheckpoint
-                                 *_Nullable *_Nullable)checkpoint;
-
 /*
  * This is the only API that creates a disk artifact. It encrypts first, writes
  * and fsyncs the stage spool, CASes the Keychain record to

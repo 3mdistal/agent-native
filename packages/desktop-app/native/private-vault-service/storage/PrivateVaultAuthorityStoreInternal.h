@@ -8,7 +8,9 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/* The sole production constructor for a commit-capable replay result. */
+/* Pure authenticated replay bridge. A PromotePreparedEpoch result from this
+ * generic constructor is never commit-capable: rotation commits must use the
+ * sidecar-bound constructor in PrivateVaultAuthorityStoreRotationInternal.h. */
 FOUNDATION_EXPORT AncPrivateVaultVerifiedReplayResult
     *_Nullable AncPrivateVaultVerifiedReplayResultCreate(
         AncPrivateVaultControlLogReplayResult *replayResult,

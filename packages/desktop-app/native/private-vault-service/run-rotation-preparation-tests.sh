@@ -15,6 +15,7 @@ for architecture in arm64 x86_64; do
     "$DIRECTORY/private-vault-broker-replacement-builder-tests-$architecture"
     "$DIRECTORY/private-vault-endpoint-removal-builder-tests-$architecture"
     "$DIRECTORY/private-vault-rotation-record-tests-$architecture" "$FIXTURE"
+    "$DIRECTORY/private-vault-rotation-custody-record-tests-$architecture"
     pnpm --dir "$ROOT/.." --filter @agent-native/core exec tsx \
       scripts/materialize-native-rotation-preparation-vectors.ts \
       --ephemeral-material-stdout --fixture "$FIXTURE" | \
@@ -28,6 +29,7 @@ for architecture in arm64 x86_64; do
     arch -x86_64 "$DIRECTORY/private-vault-broker-replacement-builder-tests-$architecture"
     arch -x86_64 "$DIRECTORY/private-vault-endpoint-removal-builder-tests-$architecture"
     arch -x86_64 "$DIRECTORY/private-vault-rotation-record-tests-$architecture" "$FIXTURE"
+    arch -x86_64 "$DIRECTORY/private-vault-rotation-custody-record-tests-$architecture"
     pnpm --dir "$ROOT/.." --filter @agent-native/core exec tsx \
       scripts/materialize-native-rotation-preparation-vectors.ts \
       --ephemeral-material-stdout --fixture "$FIXTURE" | \

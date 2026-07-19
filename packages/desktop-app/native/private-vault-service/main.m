@@ -4553,6 +4553,9 @@ int main(void) {
             initWithPreparationStore:preparation
                       authorityStore:authority
                    custodyRepository:gCustodyRepository
+                       evidenceStore:
+                           [[AncPrivateVaultRotationEvidenceStore alloc]
+                               initWithStateRootURL:stateRoot]
                           controlLog:controlLog];
         gHostedAppendTransport =
             [[AncPrivateVaultHostedAppendTransport alloc] init];

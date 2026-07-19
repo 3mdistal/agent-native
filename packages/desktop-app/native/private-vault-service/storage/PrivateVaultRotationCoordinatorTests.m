@@ -7,6 +7,7 @@
 #import "PrivateVaultControlLogInternal.h"
 #import "PrivateVaultCrypto.h"
 #import "PrivateVaultCustodyRepository.h"
+#import "PrivateVaultCustodyRepositoryRotationInternal.h"
 #import "PrivateVaultRecoveryWrapInternal.h"
 #import "PrivateVaultRotationCoordinator.h"
 #import "PrivateVaultRotationCoordinatorInternal.h"
@@ -87,6 +88,7 @@ typedef NS_ENUM(NSUInteger, RotationMutation) {
   RotationMutationWrongRecoveryWrap,
   RotationMutationTranscript,
   RotationMutationCrossCeremony,
+  RotationMutationStagedEvidence,
 };
 
 static NSMutableDictionary<NSString *, NSData *> *gKeychain;
@@ -341,6 +343,12 @@ static NSData *Bytes(uint8_t value, size_t length) {
   NSMutableData *data = [NSMutableData dataWithLength:length];
   memset(data.mutableBytes, value, length);
   return [data copy];
+}
+
+static NSData *CanonicalBytes(uint8_t value) {
+  AncPrivateVaultCanonicalStatus status;
+  return AncPrivateVaultCanonicalEncode(
+      [AncPrivateVaultCanonicalValue bytes:Bytes(value, 1)], &status);
 }
 
 static NSString *KeychainKey(NSDictionary *query) {
@@ -606,6 +614,7 @@ static NSString *SpoolFileName(const uint8_t vaultId[16],
 @property(nonatomic) AncPrivateVaultCustodyRepository *custody;
 @property(nonatomic) AncPrivateVaultAuthorityStore *authority;
 @property(nonatomic) AncPrivateVaultRotationPreparationStore *preparation;
+@property(nonatomic) AncPrivateVaultRotationEvidenceStore *evidence;
 @property(nonatomic) AncPrivateVaultRotationCoordinator *coordinator;
 @property(nonatomic) CoordinatorClock *clock;
 @property(nonatomic) AncPrivateVaultControlLogState *baseState;
@@ -634,6 +643,11 @@ static NSString *SpoolFileName(const uint8_t vaultId[16],
 @interface CoordinatorControlLogSubclass : AncPrivateVaultControlLog
 @end
 @implementation CoordinatorControlLogSubclass
+@end
+@interface CoordinatorEvidenceStoreSubclass
+    : AncPrivateVaultRotationEvidenceStore
+@end
+@implementation CoordinatorEvidenceStoreSubclass
 @end
 
 static BOOL ApplyByteMutation(uint8_t *bytes, size_t length,
@@ -678,6 +692,8 @@ static CoordinatorEnvironment *CreateEnvironmentAtRoot(
   environment.preparation = [[AncPrivateVaultRotationPreparationStore alloc]
       initWithKeychain:environment.keychain
                  spool:spool];
+  environment.evidence = [[AncPrivateVaultRotationEvidenceStore alloc]
+      initWithStateRootURL:environment.rootURL];
 
   environment.baseState = BaseState(material, keys);
   uint8_t ceremonyId[16];
@@ -706,9 +722,11 @@ static CoordinatorEnvironment *CreateEnvironmentAtRoot(
   environment.successorState = replay.state;
 
   const uint64_t verifiedAt = UINT64_C(1721296801000);
+  const uint64_t baseCustodyGeneration = 2;
   AncPrivateVaultAuthoritySnapshot *baseSnapshot =
       AncPrivateVaultAuthoritySnapshotCreateFromVerifiedControlState(
-          environment.baseState, 2, 1, @18, Bytes(0x54, 32), verifiedAt);
+          environment.baseState, baseCustodyGeneration, 1, @18,
+          Bytes(0x54, 32), verifiedAt);
   AncPrivateVaultAuthoritySnapshotStatus snapshotStatus;
   NSData *canonical = AncPrivateVaultAuthoritySnapshotEncode(baseSnapshot,
                                                               &snapshotStatus);
@@ -729,7 +747,7 @@ static CoordinatorEnvironment *CreateEnvironmentAtRoot(
   NSData *nonce = Bytes(0x5e, 24);
   NSData *frameDigest = nil;
   NSData *frame = AncPrivateVaultAuthorityFrameEncodeForTesting(
-      canonical, environment.vaultId, 2,
+      canonical, environment.vaultId, baseCustodyGeneration,
       [NSData dataWithBytes:localKey length:sizeof localKey], nonce,
       &frameDigest);
   if (frame == nil || frameDigest.length != 32) {
@@ -796,17 +814,24 @@ static CoordinatorEnvironment *CreateEnvironmentAtRoot(
                                  vaultId:environment.vaultId];
   anc_pv_custody_snapshot_zero(&genesis);
 
-  uint8_t custodyPendingKey[32];
-  memcpy(custodyPendingKey, material->pendingKey, sizeof custodyPendingKey);
-  if (mutation == RotationMutationActiveKey)
-    custodyPendingKey[0] ^= 0x80;
-
+  custody.expected_edge_present = 0;
+  custody.lifecycle = ANC_PV_CUSTODY_LIFECYCLE_ACTIVE;
+  custody.pending_kind = ANC_PV_CUSTODY_PENDING_NONE;
+  custody.rotation_phase = ANC_PV_CUSTODY_ROTATION_NONE;
+  custody.ceremony_id_length = 0;
+  memset(custody.ceremony_id, 0, sizeof custody.ceremony_id);
+  custody.pending_epoch = 0;
+  custody.expected_next_sequence = 0;
+  memset(custody.expected_previous_head, 0,
+         sizeof custody.expected_previous_head);
+  memset(custody.pending_transcript_digest, 0,
+         sizeof custody.pending_transcript_digest);
   AncPrivateVaultCustodySecretInputs secrets = {
       .signing_seed = keys->issuerSigningSeed,
       .box_seed = keys->issuerAgreementSeed,
       .local_state_key = localKey,
-      .active_epoch_key = zeroKey,
-      .pending_epoch_key = custodyPendingKey,
+      .active_epoch_key = activeKey,
+      .pending_epoch_key = zeroKey,
   };
   AncPrivateVaultCustodyRepositoryStatus custodyStatus =
       [environment.custody storeSnapshot:&custody
@@ -815,7 +840,6 @@ static CoordinatorEnvironment *CreateEnvironmentAtRoot(
   anc_pv_zeroize(localKey, sizeof localKey);
   anc_pv_zeroize(activeKey, sizeof activeKey);
   anc_pv_zeroize(zeroKey, sizeof zeroKey);
-  anc_pv_zeroize(custodyPendingKey, sizeof custodyPendingKey);
   anc_pv_custody_snapshot_zero(&custody);
   if (genesisStatus != AncPrivateVaultCustodyRepositoryStatusOK ||
       custodyStatus != AncPrivateVaultCustodyRepositoryStatusOK)
@@ -843,7 +867,7 @@ static CoordinatorEnvironment *CreateEnvironmentAtRoot(
                               checkpoint:&baseCheckpoint
                                    error:nil] !=
           AncPrivateVaultAuthorityStoreStatusOK ||
-      baseCheckpoint.custodyGeneration != 2)
+      baseCheckpoint.custodyGeneration != baseCustodyGeneration)
     { fprintf(stderr, "environment: authority load\n"); return nil; }
 
   AncPrivateVaultRotationPreparationSnapshot preparation = {0};
@@ -891,11 +915,94 @@ static CoordinatorEnvironment *CreateEnvironmentAtRoot(
                     RotationMutationEnrollment);
 
   AncPrivateVaultRotationPreparationCheckpoint *checkpoint = nil;
+  if (mutation == RotationMutationStagedEvidence) {
+    environment.clock = [[CoordinatorClock alloc] init];
+    environment.clock.milliseconds = UINT64_C(1721296803000);
+    environment.coordinator = [[AncPrivateVaultRotationCoordinator alloc]
+        initWithPreparationStore:environment.preparation
+                  authorityStore:environment.authority
+               custodyRepository:environment.custody
+                    evidenceStore:environment.evidence
+                       controlLog:[[AncPrivateVaultControlLog alloc] init]
+                     trustedClock:environment.clock];
+    AncPrivateVaultPreparedEndpointRemoval *prepared = nil;
+    AncPrivateVaultRotationCoordinatorStatus started =
+        [environment.coordinator startEndpointRemovalVaultId:material->vaultId
+                                             targetEndpointId:Bytes(0x47, 16)
+                                                      prepared:&prepared
+                                                    checkpoint:&checkpoint];
+    anc_pv_rotation_preparation_snapshot_zero(&preparation);
+    anc_pv_zeroize(ceremonyId, sizeof ceremonyId);
+    return started == AncPrivateVaultRotationCoordinatorStatusOK &&
+                   prepared != nil && checkpoint != nil
+               ? environment
+               : nil;
+  }
   if ([environment.preparation createGenesisPrepared:&preparation
                                       pendingEpochKey:material->pendingKey
                                            checkpoint:&checkpoint] !=
       AncPrivateVaultRotationPreparationStoreStatusOK)
     { fprintf(stderr, "environment: preparation create\n"); return nil; }
+  AncPrivateVaultRotationEvidenceStoreRecipient *evidenceRecipient =
+      [[AncPrivateVaultRotationEvidenceStoreRecipient alloc]
+          initWithEndpointId:[NSData dataWithBytes:material->endpointId length:16]
+             signingPublicKey:[NSData dataWithBytes:keys->issuerSigningPublic length:32]
+        keyAgreementPublicKey:[NSData dataWithBytes:keys->issuerAgreementPublic length:32]
+                 encodedOffer:CanonicalBytes(0xa1)
+               encodedEEKWrap:CanonicalBytes(0xa2)];
+  AncPrivateVaultRotationEvidenceStoreCheckpoint *evidenceCheckpoint = nil;
+  NSData *vaultData = [NSData dataWithBytes:material->vaultId length:16];
+  if ([environment.evidence
+          createVaultId:vaultData
+             ceremonyId:[NSData dataWithBytes:ceremonyId length:16]
+        targetEndpointId:Bytes(0x47, 16)
+        preparationFenceGeneration:checkpoint.fenceGeneration
+        preparationRecordDigest:checkpoint.recordDigest
+        encodedCheckpoint:CanonicalBytes(0xa3)
+               recipients:@[ evidenceRecipient ]
+            liveRevisions:@[]
+               checkpoint:&evidenceCheckpoint] !=
+          AncPrivateVaultRotationEvidenceStoreStatusOK ||
+      [environment.evidence storeAcknowledgement:CanonicalBytes(0xa4)
+                                           endpointId:evidenceRecipient.endpointId
+                                              vaultId:vaultData
+                                    expectedCheckpoint:evidenceCheckpoint
+                                            checkpoint:&evidenceCheckpoint] !=
+          AncPrivateVaultRotationEvidenceStoreStatusOK ||
+      [environment.evidence storeDestruction:CanonicalBytes(0xa5)
+                                    endpointId:evidenceRecipient.endpointId
+                                       vaultId:vaultData
+                             expectedCheckpoint:evidenceCheckpoint
+                                     checkpoint:&evidenceCheckpoint] !=
+          AncPrivateVaultRotationEvidenceStoreStatusOK)
+    return nil;
+  uint8_t stagedPendingKey[32];
+  memcpy(stagedPendingKey, material->pendingKey, sizeof stagedPendingKey);
+  if (mutation == RotationMutationActiveKey)
+    stagedPendingKey[0] ^= 0x80;
+  AncPrivateVaultPreparedRotationCustodyCheckpoint *stagedCustody = nil;
+  AncPrivateVaultCustodyRepositoryStatus stagedCustodyStatus =
+      [environment.custody
+          stagePreparedRotationVaultId:environment.vaultId
+                      targetEndpointId:Bytes(0x47, 16)
+                            ceremonyId:[NSData dataWithBytes:ceremonyId length:16]
+                    expectedGeneration:preparation.base_custody_generation
+                expectedSnapshotDigest:
+                    [NSData dataWithBytes:preparation.base_frame_digest length:32]
+                          pendingEpoch:preparation.pending_epoch
+                  expectedNextSequence:preparation.base_sequence + 1
+                  expectedPreviousHead:
+                      [NSData dataWithBytes:preparation.base_head length:32]
+             successorMembershipDigest:environment.successorState.membershipHash
+            preparationFenceGeneration:checkpoint.fenceGeneration
+                preparationRecordDigest:checkpoint.recordDigest
+                        pendingEpochKey:stagedPendingKey
+                             checkpoint:&stagedCustody];
+  anc_pv_zeroize(stagedPendingKey, sizeof stagedPendingKey);
+  if (mutation == RotationMutationNone &&
+      (stagedCustodyStatus != AncPrivateVaultCustodyRepositoryStatusOK ||
+       stagedCustody == nil))
+    return nil;
   if ([environment.preparation markRewrappedVaultId:material->vaultId
                                  expectedCheckpoint:checkpoint
                                          checkpoint:&checkpoint] !=
@@ -948,6 +1055,7 @@ static CoordinatorEnvironment *CreateEnvironmentAtRoot(
       initWithPreparationStore:environment.preparation
                 authorityStore:environment.authority
              custodyRepository:environment.custody
+                    evidenceStore:environment.evidence
                     controlLog:[[AncPrivateVaultControlLog alloc] init]
                   trustedClock:environment.clock];
   environment.spoolPath = [[[root stringByAppendingPathComponent:@"state"]
@@ -982,6 +1090,8 @@ static CoordinatorEnvironment *OpenExistingEnvironment(
   environment.preparation = [[AncPrivateVaultRotationPreparationStore alloc]
       initWithKeychain:environment.keychain
                  spool:spool];
+  environment.evidence = [[AncPrivateVaultRotationEvidenceStore alloc]
+      initWithStateRootURL:environment.rootURL];
   environment.authority = [[AncPrivateVaultAuthorityStore alloc]
       initWithStateRootURL:environment.rootURL
          custodyRepository:environment.custody];
@@ -1007,6 +1117,7 @@ static CoordinatorEnvironment *OpenExistingEnvironment(
       initWithPreparationStore:environment.preparation
                 authorityStore:environment.authority
              custodyRepository:environment.custody
+                    evidenceStore:environment.evidence
                     controlLog:[[AncPrivateVaultControlLog alloc] init]
                   trustedClock:environment.clock];
   environment.spoolPath = [[[root stringByAppendingPathComponent:@"state"]
@@ -1093,6 +1204,201 @@ ResumeSuccessfully(const RotationMaterial *material,
          AncPrivateVaultRotationCoordinatorStatusOK);
   assert(result != nil);
   return result;
+}
+
+static void AssertHostedAppendRequest(
+    const RotationMaterial *material, CoordinatorEnvironment *environment);
+
+static NSData *EvidenceWrapHash(NSData *encodedWrap) {
+  static const uint8_t domain[] = "anc/v1/eek-wrap";
+  uint8_t digest[32] = {0};
+  assert(anc_pv_blake2b_256_two_part(
+             digest, domain, sizeof domain, encodedWrap.bytes,
+             encodedWrap.length) == ANC_PV_CRYPTO_OK);
+  NSData *result = [NSData dataWithBytes:digest length:sizeof digest];
+  anc_pv_zeroize(digest, sizeof digest);
+  return result;
+}
+
+static AncPrivateVaultRotationEvidenceStoreCheckpoint *
+VerifyStagedRewrap(const RotationMaterial *material,
+                   CoordinatorEnvironment *environment) {
+  NSData *target = Bytes(0x47, 16);
+  AncPrivateVaultRotationEvidenceStoreCheckpoint *ledger = nil;
+  assert([environment.coordinator
+             verifyEndpointRemovalRewrapVaultId:material->vaultId
+                               targetEndpointId:Bytes(0x48, 16)
+                                manifestObjectId:Bytes(0x71, 16)
+                                       revisionId:Bytes(0x72, 32)
+                                        generation:1
+                                    ciphertextHash:Bytes(0x73, 32)
+                                     liveRevisions:@[]
+                                        checkpoint:nil] ==
+         AncPrivateVaultRotationCoordinatorStatusConflict);
+  assert([environment.coordinator
+             verifyEndpointRemovalRewrapVaultId:material->vaultId
+                               targetEndpointId:target
+                                manifestObjectId:Bytes(0x71, 16)
+                                       revisionId:Bytes(0x72, 32)
+                                        generation:1
+                                    ciphertextHash:Bytes(0x73, 32)
+                                     liveRevisions:@[]
+                                        checkpoint:&ledger] ==
+         AncPrivateVaultRotationCoordinatorStatusOK);
+  assert(ledger.phase ==
+         AncPrivateVaultRotationEvidenceStorePhaseAcknowledgements);
+  return ledger;
+}
+
+static void RunStagedEvidence(const RotationMaterial *material,
+                              const RotationKeyMaterial *keys) {
+  CoordinatorEnvironment *crash = CreateEnvironment(
+      material, keys, RotationMutationStagedEvidence);
+  assert(crash != nil);
+  AncPrivateVaultRotationCoordinatorSetFaultHookForTesting(
+      ^BOOL(AncPrivateVaultRotationCoordinatorFaultPoint point) {
+        return point ==
+            AncPrivateVaultRotationCoordinatorFaultAfterEvidenceLedger;
+      });
+  assert([crash.coordinator
+             verifyEndpointRemovalRewrapVaultId:material->vaultId
+                               targetEndpointId:Bytes(0x47, 16)
+                                manifestObjectId:Bytes(0x71, 16)
+                                       revisionId:Bytes(0x72, 32)
+                                        generation:1
+                                    ciphertextHash:Bytes(0x73, 32)
+                                     liveRevisions:@[]
+                                        checkpoint:nil] ==
+         AncPrivateVaultRotationCoordinatorStatusStorageFailed);
+  AncPrivateVaultRotationCoordinatorSetFaultHookForTesting(nil);
+  AncPrivateVaultRotationEvidenceStoreCheckpoint *crashLedger = nil;
+  assert([crash.evidence readVaultId:[NSData dataWithBytes:material->vaultId
+                                                        length:16]
+                            checkpoint:&crashLedger] ==
+         AncPrivateVaultRotationEvidenceStoreStatusOK);
+  assert(VerifyStagedRewrap(material, crash) != nil);
+  DestroyEnvironment(crash);
+
+  CoordinatorEnvironment *environment = CreateEnvironment(
+      material, keys, RotationMutationStagedEvidence);
+  assert(environment != nil);
+  AncPrivateVaultRotationEvidenceStoreCheckpoint *ledger =
+      VerifyStagedRewrap(material, environment);
+  NSData *vault = [NSData dataWithBytes:material->vaultId length:16];
+  NSData *checkpointHash =
+      AncPrivateVaultRotationEvidenceHashCheckpoint(ledger.encodedCheckpoint,
+                                                    vault);
+  __block NSMutableArray<NSData *> *acknowledgements = [NSMutableArray array];
+  AncPrivateVaultRotationPreparationCheckpoint *preparation = nil;
+  AncPrivateVaultRotationPreparationKeyHandle *keyHandle = nil;
+  assert([environment.preparation readVaultId:material->vaultId
+                                   checkpoint:&preparation
+                                       handle:&keyHandle] ==
+         AncPrivateVaultRotationPreparationStoreStatusOK);
+  assert([keyHandle borrow:^BOOL(const uint8_t *pendingKey) {
+    for (NSUInteger index = 0; index < ledger.recipients.count; index += 1) {
+      AncPrivateVaultRotationEvidenceStoreRecipient *recipient =
+          ledger.recipients[index];
+      const uint8_t *seed =
+          [recipient.endpointId
+              isEqualToData:[NSData dataWithBytes:material->endpointId length:16]]
+              ? keys->issuerSigningSeed
+              : keys->brokerSigningSeed;
+      AncPrivateVaultRotationEvidenceStatus status;
+      NSData *ack = AncPrivateVaultRotationEvidenceBuildAcknowledgement(
+          vault, UINT64_C(1721296802), Bytes((uint8_t)(0x81 + index), 16),
+          ledger.ceremonyId, checkpointHash,
+          EvidenceWrapHash(recipient.encodedEEKWrap),
+          AncPrivateVaultRotationEvidenceHashOffer(recipient.encodedOffer, vault),
+          recipient.endpointId, 5, seed, pendingKey, &status);
+      if (ack == nil || status != AncPrivateVaultRotationEvidenceStatusOK)
+        return NO;
+      [acknowledgements addObject:ack];
+    }
+    return YES;
+  }] == AncPrivateVaultRotationPreparationStoreStatusOK);
+  assert([keyHandle close] ==
+         AncPrivateVaultRotationPreparationStoreStatusOK);
+  assert([environment.coordinator
+             verifyEndpointRemovalAcknowledgementsVaultId:material->vaultId
+                                           targetEndpointId:Bytes(0x47, 16)
+                                           acknowledgements:@[
+                                             acknowledgements.firstObject
+                                           ]
+                                                   checkpoint:nil] !=
+         AncPrivateVaultRotationCoordinatorStatusOK);
+  NSMutableData *tampered = [acknowledgements.firstObject mutableCopy];
+  ((uint8_t *)tampered.mutableBytes)[tampered.length - 1] ^= 1;
+  NSMutableArray *tamperedSet = [acknowledgements mutableCopy];
+  tamperedSet[0] = tampered;
+  assert([environment.coordinator
+             verifyEndpointRemovalAcknowledgementsVaultId:material->vaultId
+                                           targetEndpointId:Bytes(0x47, 16)
+                                           acknowledgements:tamperedSet
+                                                   checkpoint:nil] !=
+         AncPrivateVaultRotationCoordinatorStatusOK);
+  assert([environment.coordinator
+             verifyEndpointRemovalAcknowledgementsVaultId:material->vaultId
+                                           targetEndpointId:Bytes(0x47, 16)
+                                           acknowledgements:acknowledgements
+                                                   checkpoint:&ledger] ==
+         AncPrivateVaultRotationCoordinatorStatusOK);
+  assert(ledger.phase == AncPrivateVaultRotationEvidenceStorePhaseDestructions);
+  AncPrivateVaultRotationCoordinatorResult *stagedResult = nil;
+  assert([environment.coordinator resumeVaultId:material->vaultId
+                                         result:&stagedResult] ==
+             AncPrivateVaultRotationCoordinatorStatusOK &&
+         stagedResult != nil);
+  assert([environment.coordinator
+             prepareHostedAppendVaultId:material->vaultId
+                                  request:nil] ==
+         AncPrivateVaultRotationCoordinatorStatusConflict);
+
+  NSMutableArray<NSData *> *destructions = [NSMutableArray array];
+  AncPrivateVaultCanonicalStatus checkpointStatus;
+  AncPrivateVaultCanonicalValue *checkpointValue = AncPrivateVaultCanonicalDecode(
+      ledger.encodedCheckpoint, 1024, &checkpointStatus);
+  NSData *controlEntryHash = checkpointValue.mapValue[@26].bytesValue;
+  assert(checkpointStatus == AncPrivateVaultCanonicalStatusOK &&
+         controlEntryHash.length == 32);
+  for (NSUInteger index = 0; index < ledger.recipients.count; index += 1) {
+    AncPrivateVaultRotationEvidenceStoreRecipient *recipient =
+        ledger.recipients[index];
+    const uint8_t *seed =
+        [recipient.endpointId
+            isEqualToData:[NSData dataWithBytes:material->endpointId length:16]]
+            ? keys->issuerSigningSeed
+            : keys->brokerSigningSeed;
+    AncPrivateVaultRotationEvidenceStatus status;
+    NSData *destruction = AncPrivateVaultRotationEvidenceBuildDestruction(
+        vault, UINT64_C(1721296803), Bytes((uint8_t)(0x91 + index), 16),
+        ledger.ceremonyId, checkpointHash, controlEntryHash,
+        recipient.endpointId, 4, 5, 3, seed, &status);
+    assert(destruction != nil &&
+           status == AncPrivateVaultRotationEvidenceStatusOK);
+    [destructions addObject:destruction];
+  }
+  assert([environment.coordinator
+             verifyEndpointRemovalDestructionsVaultId:material->vaultId
+                                      targetEndpointId:Bytes(0x47, 16)
+                                           destructions:@[
+                                             destructions.firstObject
+                                           ]
+                                             checkpoint:nil] !=
+         AncPrivateVaultRotationCoordinatorStatusOK);
+  assert([environment.coordinator
+             verifyEndpointRemovalDestructionsVaultId:material->vaultId
+                                      targetEndpointId:Bytes(0x47, 16)
+                                           destructions:destructions
+                                             checkpoint:&ledger] ==
+         AncPrivateVaultRotationCoordinatorStatusOK);
+  assert(ledger.phase == AncPrivateVaultRotationEvidenceStorePhaseComplete);
+  AncPrivateVaultHostedAppendRequest *request = nil;
+  assert([environment.coordinator
+             prepareHostedAppendVaultId:material->vaultId request:&request] ==
+         AncPrivateVaultRotationCoordinatorStatusOK);
+  assert(request != nil);
+  DestroyEnvironment(environment);
 }
 
 static NSDictionary *DecodeProofHeader(NSString *header) {
@@ -1551,6 +1857,7 @@ static void RunCoordinatorCrashRetries(const RotationMaterial *material,
             initWithPreparationStore:environment.preparation
                       authorityStore:environment.authority
                    custodyRepository:environment.custody
+                          evidenceStore:environment.evidence
                           controlLog:[[AncPrivateVaultControlLog alloc] init]
                         trustedClock:environment.clock];
     environment.coordinator = restarted;
@@ -1616,10 +1923,63 @@ static void RunAuthorityCrashRetries(const RotationMaterial *material,
         initWithPreparationStore:environment.preparation
                   authorityStore:environment.authority
                custodyRepository:environment.custody
+                      evidenceStore:environment.evidence
                       controlLog:[[AncPrivateVaultControlLog alloc] init]
                     trustedClock:environment.clock];
     AncPrivateVaultRotationCoordinatorResult *result =
         ResumeSuccessfully(material, environment);
+    AssertConsumed(material, environment, result, spool);
+    DestroyEnvironment(environment);
+  }
+}
+
+static void RunCustodyRotationCrashRetries(
+    const RotationMaterial *material, const RotationKeyMaterial *keys) {
+  const AncPrivateVaultCustodyRotationFaultPoint points[] = {
+      AncPrivateVaultCustodyRotationFaultAfterMainAdoption,
+      AncPrivateVaultCustodyRotationFaultBeforeSidecarDelete,
+  };
+  for (size_t index = 0; index < sizeof points / sizeof points[0]; index++) {
+    CoordinatorEnvironment *environment =
+        CreateEnvironment(material, keys, RotationMutationNone);
+    assert(environment != nil);
+    NSData *spool = [NSData dataWithContentsOfFile:environment.spoolPath];
+    AncPrivateVaultCustodyRotationFaultPoint target = points[index];
+    AncPrivateVaultCustodyRotationSetFaultHookForTesting(
+        ^BOOL(AncPrivateVaultCustodyRotationFaultPoint point) {
+          return point == target;
+        });
+    assert([environment.coordinator resumeVaultId:material->vaultId
+                                           result:nil] ==
+           AncPrivateVaultRotationCoordinatorStatusProtectionFailed);
+    AncPrivateVaultCustodyRotationSetFaultHookForTesting(nil);
+    AncPrivateVaultPreparedRotationCustodyCheckpoint *surviving = nil;
+    assert([environment.custody
+               readPreparedRotationVaultId:environment.vaultId
+                                 checkpoint:&surviving] ==
+               AncPrivateVaultCustodyRepositoryStatusOK &&
+           surviving != nil);
+
+    environment.custody = [[AncPrivateVaultCustodyRepository alloc]
+        initWithKeychain:environment.keychain];
+    environment.authority = [[AncPrivateVaultAuthorityStore alloc]
+        initWithStateRootURL:environment.rootURL
+           custodyRepository:environment.custody];
+    environment.coordinator = [[AncPrivateVaultRotationCoordinator alloc]
+        initWithPreparationStore:environment.preparation
+                  authorityStore:environment.authority
+               custodyRepository:environment.custody
+                    evidenceStore:environment.evidence
+                       controlLog:[[AncPrivateVaultControlLog alloc] init]
+                     trustedClock:environment.clock];
+    AncPrivateVaultRotationCoordinatorResult *result =
+        ResumeSuccessfully(material, environment);
+    AncPrivateVaultPreparedRotationCustodyCheckpoint *absent = nil;
+    assert([environment.custody
+               readPreparedRotationVaultId:environment.vaultId
+                                 checkpoint:&absent] ==
+               AncPrivateVaultCustodyRepositoryStatusNotFound &&
+           absent == nil);
     AssertConsumed(material, environment, result, spool);
     DestroyEnvironment(environment);
   }
@@ -1733,29 +2093,43 @@ static void RunCollaboratorSubclassRejection(
           initWithKeychain:environment.keychain];
   CoordinatorControlLogSubclass *control =
       [[CoordinatorControlLogSubclass alloc] init];
+  CoordinatorEvidenceStoreSubclass *evidence =
+      [[CoordinatorEvidenceStoreSubclass alloc]
+          initWithStateRootURL:environment.rootURL];
   assert([[AncPrivateVaultRotationCoordinator alloc]
              initWithPreparationStore:preparation
                        authorityStore:environment.authority
                     custodyRepository:environment.custody
+                           evidenceStore:environment.evidence
                            controlLog:[[AncPrivateVaultControlLog alloc] init]] ==
          nil);
   assert([[AncPrivateVaultRotationCoordinator alloc]
              initWithPreparationStore:environment.preparation
                        authorityStore:authority
                     custodyRepository:environment.custody
+                           evidenceStore:environment.evidence
                            controlLog:[[AncPrivateVaultControlLog alloc] init]] ==
          nil);
   assert([[AncPrivateVaultRotationCoordinator alloc]
              initWithPreparationStore:environment.preparation
                        authorityStore:environment.authority
                     custodyRepository:custody
+                           evidenceStore:environment.evidence
                            controlLog:[[AncPrivateVaultControlLog alloc] init]] ==
          nil);
   assert([[AncPrivateVaultRotationCoordinator alloc]
              initWithPreparationStore:environment.preparation
                        authorityStore:environment.authority
                     custodyRepository:environment.custody
+                           evidenceStore:environment.evidence
                            controlLog:control] == nil);
+  assert([[AncPrivateVaultRotationCoordinator alloc]
+             initWithPreparationStore:environment.preparation
+                       authorityStore:environment.authority
+                    custodyRepository:environment.custody
+                           evidenceStore:evidence
+                              controlLog:[[AncPrivateVaultControlLog alloc] init]] ==
+         nil);
   DestroyEnvironment(environment);
 }
 
@@ -2022,9 +2396,11 @@ int main(int argc, const char *argv[]) {
       anc_pv_rotation_preparation_snapshot_zero(&prepared);
     }
     RunHappyPath(&material, &keys);
+    RunStagedEvidence(&material, &keys);
     RunHostedAppendCleanup(&material, &keys);
     RunCoordinatorCrashRetries(&material, &keys);
     RunAuthorityCrashRetries(&material, &keys);
+    RunCustodyRotationCrashRetries(&material, &keys);
     RunRejectedInputs(&material, &keys);
     RunTamperedSpool(&material, &keys);
     RunMissingSpool(&material, &keys);
