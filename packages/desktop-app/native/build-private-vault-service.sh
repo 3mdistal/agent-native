@@ -11,6 +11,7 @@ SOURCES=(
   "$SOURCE_ROOT/control/PrivateVaultControlLog.m"
   "$SOURCE_ROOT/control/PrivateVaultControlLogInternal.m"
   "$SOURCE_ROOT/control/PrivateVaultContinuityBuilder.m"
+  "$SOURCE_ROOT/control/PrivateVaultBrokerReplacementBuilder.m"
   "$SOURCE_ROOT/control/PrivateVaultEndpointRequest.m"
   "$SOURCE_ROOT/control/PrivateVaultEndpointRemovalBuilder.m"
   "$SOURCE_ROOT/control/PrivateVaultEnrollmentOffer.m"
@@ -1700,6 +1701,15 @@ case "${PRIVATE_VAULT_BUILD_ROTATION_PREPARATION_TESTS:-}" in
       "$SOURCE_ROOT/control/PrivateVaultAncCanonical.m" \
       "$SOURCE_ROOT/control/PrivateVaultControlLog.m" \
       "$SOURCE_ROOT/control/PrivateVaultRecoveryWrap.m" \
+      "$SOURCE_ROOT/control/PrivateVaultBrokerReplacementBuilder.m" \
+      "$SOURCE_ROOT/control/PrivateVaultBrokerReplacementBuilderTests.m" \
+      "$sodium_root/lib/libsodium.a" \
+      -o "$ROTATION_TEST_OUTPUT/private-vault-broker-replacement-builder-tests-$architecture"
+    xcrun clang "${common[@]}" \
+      "$SOURCE_ROOT/crypto/PrivateVaultCrypto.c" \
+      "$SOURCE_ROOT/control/PrivateVaultAncCanonical.m" \
+      "$SOURCE_ROOT/control/PrivateVaultControlLog.m" \
+      "$SOURCE_ROOT/control/PrivateVaultRecoveryWrap.m" \
       "$SOURCE_ROOT/control/PrivateVaultEndpointRemovalBuilder.m" \
       "$SOURCE_ROOT/control/PrivateVaultEndpointRemovalBuilderTests.m" \
       "$sodium_root/lib/libsodium.a" \
@@ -1743,6 +1753,7 @@ case "${PRIVATE_VAULT_BUILD_ROTATION_PREPARATION_TESTS:-}" in
       "$SOURCE_ROOT/control/PrivateVaultAncCanonical.m" \
       "$SOURCE_ROOT/control/PrivateVaultControlLog.m" \
       "$SOURCE_ROOT/control/PrivateVaultControlLogInternal.m" \
+      "$SOURCE_ROOT/control/PrivateVaultBrokerReplacementBuilder.m" \
       "$SOURCE_ROOT/control/PrivateVaultEndpointRemovalBuilder.m" \
       "$SOURCE_ROOT/control/PrivateVaultEndpointRequest.m" \
       "$SOURCE_ROOT/control/PrivateVaultRecoveryWrap.m" \
@@ -1764,6 +1775,8 @@ case "${PRIVATE_VAULT_BUILD_ROTATION_PREPARATION_TESTS:-}" in
     lipo "$ROTATION_TEST_OUTPUT/private-vault-rotation-record-tests-$architecture" \
       -verify_arch "$architecture"
     lipo "$ROTATION_TEST_OUTPUT/private-vault-endpoint-removal-builder-tests-$architecture" \
+      -verify_arch "$architecture"
+    lipo "$ROTATION_TEST_OUTPUT/private-vault-broker-replacement-builder-tests-$architecture" \
       -verify_arch "$architecture"
     lipo "$ROTATION_TEST_OUTPUT/private-vault-rotation-spool-tests-$architecture" \
       -verify_arch "$architecture"

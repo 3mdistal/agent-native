@@ -4,6 +4,7 @@
 #import "PrivateVaultRotationPreparationStoreInternal.h"
 #import "PrivateVaultAuthorityStoreInternal.h"
 #import "PrivateVaultControlLogInternal.h"
+#import "PrivateVaultBrokerReplacementBuilder.h"
 #import "PrivateVaultEndpointRequest.h"
 #import "PrivateVaultEndpointRemovalBuilder.h"
 #import "PrivateVaultRecoveryWrapInternal.h"
@@ -863,6 +864,282 @@ static NSString *AncRotationCoordinatorTimestamp(uint64_t milliseconds) {
     anc_pv_custody_snapshot_zero(&custody);
     if (preparationStatus !=
             AncPrivateVaultRotationPreparationStoreStatusOK ||
+        result == nil)
+      return AncRotationCoordinatorStatusForPreparation(preparationStatus);
+    if (prepared != NULL)
+      *prepared = built;
+    if (checkpoint != NULL)
+      *checkpoint = result;
+    return AncPrivateVaultRotationCoordinatorStatusOK;
+  } @finally {
+    [operationLock unlock];
+  }
+}
+
+- (AncPrivateVaultRotationCoordinatorStatus)
+    startBrokerReplacementVaultId:(const uint8_t[16])vaultId
+               oldBrokerEndpointId:(NSData *)oldBrokerEndpointId
+         candidateBrokerEndpointId:(NSData *)candidateBrokerEndpointId
+         candidateSigningPublicKey:(NSData *)candidateSigningPublicKey
+    candidateKeyAgreementPublicKey:(NSData *)candidateKeyAgreementPublicKey
+           candidateEnrollmentRef:(NSData *)candidateEnrollmentRef
+                  drainAttestation:(NSData *)drainAttestation
+                          prepared:
+                              (AncPrivateVaultPreparedBrokerReplacement **)prepared
+                        checkpoint:
+                            (AncPrivateVaultRotationPreparationCheckpoint **)
+                                checkpoint {
+  if (prepared != NULL)
+    *prepared = nil;
+  if (checkpoint != NULL)
+    *checkpoint = nil;
+  if (vaultId == NULL || oldBrokerEndpointId.length != 16 ||
+      candidateBrokerEndpointId.length != 16 ||
+      candidateSigningPublicKey.length != 32 ||
+      candidateKeyAgreementPublicKey.length != 32 ||
+      candidateEnrollmentRef.length != 16 || drainAttestation.length == 0 ||
+      drainAttestation.length > 1024)
+    return AncPrivateVaultRotationCoordinatorStatusInvalid;
+  NSString *vaultHex = AncRotationCoordinatorHex(vaultId, 16);
+  if (vaultHex.length != 32)
+    return AncPrivateVaultRotationCoordinatorStatusInvalid;
+  NSRecursiveLock *operationLock = AncRotationCoordinatorLockForVault(vaultHex);
+  [operationLock lock];
+  @try {
+    NSError *authorityError = nil;
+    AncPrivateVaultAuthorityCheckpoint *authority = nil;
+    AncPrivateVaultAuthorityStoreStatus authorityStatus =
+        [self.authorityStore loadVaultId:vaultHex
+                              checkpoint:&authority
+                                   error:&authorityError];
+    AncPrivateVaultCustodySnapshot custody;
+    AncPrivateVaultCustodyHandle *custodyHandle = nil;
+    AncPrivateVaultCustodyRepositoryStatus custodyStatus =
+        [self.custodyRepository readVaultId:vaultHex
+                                   snapshot:&custody
+                                     handle:&custodyHandle];
+    AncPrivateVaultControlLogState *state =
+        authority == nil ? nil
+                         : AncPrivateVaultControlLogStateCreateFromAuthenticatedCheckpoint(
+                               authority);
+    NSString *currentEndpoint =
+        custodyStatus == AncPrivateVaultCustodyRepositoryStatusOK
+            ? [[NSString alloc]
+                  initWithBytes:custody.endpoint_id
+                         length:custody.endpoint_id_length
+                       encoding:NSUTF8StringEncoding]
+            : nil;
+    BOOL live = authorityStatus == AncPrivateVaultAuthorityStoreStatusOK &&
+        authorityError == nil && authority != nil && state != nil &&
+        custodyStatus == AncPrivateVaultCustodyRepositoryStatusOK &&
+        custodyHandle != nil && custody.record_version == ANC_PV_CUSTODY_VERSION &&
+        custody.authority_anchor_present == 1 &&
+        custody.lifecycle == ANC_PV_CUSTODY_LIFECYCLE_ACTIVE &&
+        custody.role == ANC_PV_CUSTODY_ROLE_ENDPOINT &&
+        custody.rotation_phase == ANC_PV_CUSTODY_ROTATION_NONE &&
+        custody.expected_edge_present == 0 &&
+        custody.custody_generation == authority.custodyGeneration &&
+        custody.anchored_sequence == state.sequence &&
+        custody.active_epoch == state.epoch &&
+        custody.recovery_generation == state.recoveryGeneration &&
+        currentEndpoint.length == 32 &&
+        AncRotationCoordinatorBytesEqualData(custody.snapshot_digest,
+                                              authority.frameDigest, 32) &&
+        AncRotationCoordinatorBytesEqualData(custody.anchored_head,
+                                              state.headHash, 32) &&
+        AncRotationCoordinatorBytesEqualData(custody.membership_digest,
+                                              state.membershipHash, 32);
+    if (!live) {
+      AncPrivateVaultCustodyRepositoryStatus closed =
+          custodyHandle == nil ? AncPrivateVaultCustodyRepositoryStatusOK
+                               : [custodyHandle close];
+      anc_pv_custody_snapshot_zero(&custody);
+      if (closed != AncPrivateVaultCustodyRepositoryStatusOK)
+        return AncPrivateVaultRotationCoordinatorStatusProtectionFailed;
+      return authorityStatus != AncPrivateVaultAuthorityStoreStatusOK
+                 ? AncRotationCoordinatorStatusForAuthority(authorityStatus)
+             : custodyStatus != AncPrivateVaultCustodyRepositoryStatusOK
+                 ? AncRotationCoordinatorStatusForCustody(custodyStatus)
+                 : AncPrivateVaultRotationCoordinatorStatusConflict;
+    }
+
+    AncPrivateVaultRotationPreparationCheckpoint *existing = nil;
+    AncPrivateVaultRotationPreparationKeyHandle *preparationHandle = nil;
+    AncPrivateVaultRotationPreparationStoreStatus preparationStatus =
+        [self.preparationStore readVaultId:vaultId
+                                checkpoint:&existing
+                                    handle:&preparationHandle];
+    BOOL first = preparationStatus ==
+        AncPrivateVaultRotationPreparationStoreStatusNotFound;
+    BOOL restart = preparationStatus ==
+                       AncPrivateVaultRotationPreparationStoreStatusOK &&
+        existing.snapshot.phase == ANC_PV_ROTATION_PREPARATION_PHASE_PREPARED;
+    BOOL next = preparationStatus ==
+                    AncPrivateVaultRotationPreparationStoreStatusOK &&
+        existing.snapshot.phase == ANC_PV_ROTATION_PREPARATION_PHASE_CLEANED;
+    if (!first && !restart && !next) {
+      [preparationHandle close];
+      [custodyHandle close];
+      anc_pv_custody_snapshot_zero(&custody);
+      return preparationStatus ==
+                     AncPrivateVaultRotationPreparationStoreStatusOK
+                 ? AncPrivateVaultRotationCoordinatorStatusConflict
+                 : AncRotationCoordinatorStatusForPreparation(preparationStatus);
+    }
+
+    uint64_t nowMilliseconds = 0;
+    if (![self.trustedClock readNowMilliseconds:&nowMilliseconds] ||
+        nowMilliseconds < 1000) {
+      [preparationHandle close];
+      [custodyHandle close];
+      anc_pv_custody_snapshot_zero(&custody);
+      return AncPrivateVaultRotationCoordinatorStatusClockFailed;
+    }
+    uint64_t trustedNowSeconds = nowMilliseconds / 1000;
+    if (trustedNowSeconds == 0 ||
+        trustedNowSeconds > kAncRotationCoordinatorMaximumSafeInteger) {
+      [preparationHandle close];
+      [custodyHandle close];
+      anc_pv_custody_snapshot_zero(&custody);
+      return AncPrivateVaultRotationCoordinatorStatusClockFailed;
+    }
+    NSData *ceremony =
+        AncPrivateVaultBrokerReplacementCeremonyId(drainAttestation);
+    if (ceremony.length != 16 ||
+        (restart &&
+         !AncRotationCoordinatorBytesEqualData(existing.snapshot.ceremony_id,
+                                                ceremony, 16))) {
+      [preparationHandle close];
+      [custodyHandle close];
+      anc_pv_custody_snapshot_zero(&custody);
+      return AncPrivateVaultRotationCoordinatorStatusConflict;
+    }
+    __block AncPrivateVaultPreparedBrokerReplacement *built = nil;
+    __block AncPrivateVaultBrokerReplacementBuilderStatus builderStatus =
+        AncPrivateVaultBrokerReplacementBuilderStatusInvalidArgument;
+    __block uint8_t pendingKey[32] = {0};
+    if (first || next) {
+      if (SecRandomCopyBytes(kSecRandomDefault, sizeof pendingKey, pendingKey) !=
+              errSecSuccess ||
+          anc_pv_memcmp(pendingKey, (uint8_t[32]){0}, 32) ==
+              ANC_PV_CRYPTO_OK) {
+        [preparationHandle close];
+        [custodyHandle close];
+        anc_pv_zeroize(pendingKey, sizeof pendingKey);
+        anc_pv_custody_snapshot_zero(&custody);
+        return AncPrivateVaultRotationCoordinatorStatusProtectionFailed;
+      }
+    }
+    NSMutableData *binding = [NSMutableData dataWithData:authority.frameDigest];
+    [binding appendData:oldBrokerEndpointId];
+    [binding appendData:candidateBrokerEndpointId];
+    [binding appendData:drainAttestation];
+    uint8_t wrapEnvelope[16] = {0}, entryEnvelope[16] = {0}, nonce[24] = {0};
+    uint8_t *wrapEnvelopeBytes = wrapEnvelope;
+    uint8_t *entryEnvelopeBytes = entryEnvelope;
+    uint8_t *nonceBytes = nonce;
+    __block BOOL derived = YES;
+    void (^build)(const uint8_t *) = ^(const uint8_t *key) {
+      derived = AncRotationCoordinatorDeriveBytes(
+                    wrapEnvelopeBytes, 16,
+                    "broker-replacement/wrap-envelope", key, binding) &&
+          AncRotationCoordinatorDeriveBytes(
+                    entryEnvelopeBytes, 16,
+                    "broker-replacement/entry-envelope", key, binding) &&
+          AncRotationCoordinatorDeriveBytes(
+                    nonceBytes, 24, "broker-replacement/wrap-nonce", key,
+                    binding);
+      if (!derived)
+        return;
+      [custodyHandle borrow:^BOOL(
+          const AncPrivateVaultCustodySecretInputs *secrets) {
+        built = AncPrivateVaultBuildBrokerReplacement(
+            state, oldBrokerEndpointId, candidateBrokerEndpointId,
+            candidateSigningPublicKey, candidateKeyAgreementPublicKey,
+            candidateEnrollmentRef, drainAttestation,
+            [NSData dataWithBytes:wrapEnvelopeBytes length:16],
+            [NSData dataWithBytes:entryEnvelopeBytes length:16],
+            [NSData dataWithBytes:nonceBytes length:24], trustedNowSeconds, key,
+            secrets->signing_seed, secrets->box_seed, &builderStatus);
+        return built != nil;
+      }];
+    };
+    if (restart)
+      [preparationHandle borrow:^BOOL(const uint8_t *key) {
+        build(key);
+        return built != nil;
+      }];
+    else
+      build(pendingKey);
+    AncPrivateVaultRotationPreparationStoreStatus preparationClosed =
+        preparationHandle == nil
+            ? AncPrivateVaultRotationPreparationStoreStatusOK
+            : [preparationHandle close];
+    AncPrivateVaultCustodyRepositoryStatus custodyClosed = [custodyHandle close];
+    if (built == nil || !derived ||
+        preparationClosed != AncPrivateVaultRotationPreparationStoreStatusOK ||
+        custodyClosed != AncPrivateVaultCustodyRepositoryStatusOK) {
+      anc_pv_zeroize(pendingKey, sizeof pendingKey);
+      anc_pv_zeroize(wrapEnvelope, sizeof wrapEnvelope);
+      anc_pv_zeroize(entryEnvelope, sizeof entryEnvelope);
+      anc_pv_zeroize(nonce, sizeof nonce);
+      anc_pv_custody_snapshot_zero(&custody);
+      return preparationClosed !=
+                     AncPrivateVaultRotationPreparationStoreStatusOK ||
+                     custodyClosed != AncPrivateVaultCustodyRepositoryStatusOK
+                 ? AncPrivateVaultRotationCoordinatorStatusProtectionFailed
+             : builderStatus ==
+                       AncPrivateVaultBrokerReplacementBuilderStatusDrainRejected ||
+                       builderStatus ==
+                           AncPrivateVaultBrokerReplacementBuilderStatusBrokerRejected ||
+                       builderStatus ==
+                           AncPrivateVaultBrokerReplacementBuilderStatusIssuerRejected
+                 ? AncPrivateVaultRotationCoordinatorStatusControlRejected
+                 : AncPrivateVaultRotationCoordinatorStatusConflict;
+    }
+    AncPrivateVaultRotationPreparationCheckpoint *result = existing;
+    if (!restart) {
+      AncPrivateVaultRotationPreparationSnapshot snapshot = {0};
+      snapshot.phase = ANC_PV_ROTATION_PREPARATION_PHASE_PREPARED;
+      snapshot.role = ANC_PV_ROTATION_PREPARATION_ROLE_ENDPOINT;
+      snapshot.preparation_generation =
+          first ? 1 : existing.snapshot.preparation_generation + 1;
+      memcpy(snapshot.vault_id, vaultId, 16);
+      NSData *currentEndpointData =
+          AncRotationCoordinatorDataFromHex(currentEndpoint, 16);
+      memcpy(snapshot.endpoint_id, currentEndpointData.bytes, 16);
+      memcpy(snapshot.ceremony_id, ceremony.bytes, 16);
+      snapshot.base_custody_generation = authority.custodyGeneration;
+      memcpy(snapshot.base_frame_digest, authority.frameDigest.bytes, 32);
+      snapshot.base_sequence = state.sequence;
+      memcpy(snapshot.base_head, state.headHash.bytes, 32);
+      memcpy(snapshot.base_membership, state.membershipHash.bytes, 32);
+      snapshot.base_epoch = state.epoch;
+      snapshot.base_recovery_generation = state.recoveryGeneration;
+      memcpy(snapshot.signing_public_key, custody.signing_public_key, 32);
+      memcpy(snapshot.agreement_public_key, custody.box_public_key, 32);
+      AncPrivateVaultAuthorityMember *currentMember =
+          AncRotationCoordinatorMember(authority.snapshot, currentEndpoint);
+      NSData *enrollment = currentMember == nil
+          ? nil
+          : AncRotationCoordinatorDataFromHex(currentMember.enrollmentRef, 16);
+      if (enrollment.length == 16)
+        memcpy(snapshot.enrollment_ref, enrollment.bytes, 16);
+      snapshot.pending_epoch = state.epoch + 1;
+      preparationStatus = enrollment.length != 16
+          ? AncPrivateVaultRotationPreparationStoreStatusInvalid
+          : [self.preparationStore createPrepared:&snapshot
+                                  pendingEpochKey:pendingKey
+                               expectedCheckpoint:next ? existing : nil
+                                       checkpoint:&result];
+      anc_pv_rotation_preparation_snapshot_zero(&snapshot);
+    }
+    anc_pv_zeroize(pendingKey, sizeof pendingKey);
+    anc_pv_zeroize(wrapEnvelope, sizeof wrapEnvelope);
+    anc_pv_zeroize(entryEnvelope, sizeof entryEnvelope);
+    anc_pv_zeroize(nonce, sizeof nonce);
+    anc_pv_custody_snapshot_zero(&custody);
+    if (preparationStatus != AncPrivateVaultRotationPreparationStoreStatusOK ||
         result == nil)
       return AncRotationCoordinatorStatusForPreparation(preparationStatus);
     if (prepared != NULL)

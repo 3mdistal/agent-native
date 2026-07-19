@@ -6,6 +6,7 @@
 #import "PrivateVaultRotationPreparationStore.h"
 
 @class AncPrivateVaultPreparedEndpointRemoval;
+@class AncPrivateVaultPreparedBrokerReplacement;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -100,6 +101,25 @@ typedef NS_ENUM(NSInteger, AncPrivateVaultRotationCoordinatorStatus) {
                       checkpoint:
                           (AncPrivateVaultRotationPreparationCheckpoint
                                *_Nullable *_Nullable)checkpoint;
+
+/* Starts a distinct attended broker-replacement ceremony. The drain envelope
+ * must be signed by the live attended issuer and bind the exact old broker,
+ * candidate identity, queue generation/digest, empty outstanding set, and
+ * current authenticated control edge. */
+- (AncPrivateVaultRotationCoordinatorStatus)
+    startBrokerReplacementVaultId:(const uint8_t *_Nullable)vaultId
+               oldBrokerEndpointId:(NSData *)oldBrokerEndpointId
+         candidateBrokerEndpointId:(NSData *)candidateBrokerEndpointId
+         candidateSigningPublicKey:(NSData *)candidateSigningPublicKey
+    candidateKeyAgreementPublicKey:(NSData *)candidateKeyAgreementPublicKey
+           candidateEnrollmentRef:(NSData *)candidateEnrollmentRef
+                  drainAttestation:(NSData *)drainAttestation
+                          prepared:
+                              (AncPrivateVaultPreparedBrokerReplacement
+                                   *_Nullable *_Nullable)prepared
+                        checkpoint:
+                            (AncPrivateVaultRotationPreparationCheckpoint
+                                 *_Nullable *_Nullable)checkpoint;
 
 /* Trusted Desktop main calls this only after an exact hosted append receipt.
  * The receipt is bound to the final official sequence/head and durably reread
