@@ -15,3 +15,14 @@ registerShareableResource({
   getResourcePath: (bookingLink) => `/booking-links/${bookingLink.id}`,
   getDb,
 });
+
+registerShareableResource({
+  type: "published-calendar",
+  resourceTable: schema.publishedCalendars,
+  sharesTable: schema.publishedCalendarShares,
+  displayName: "Published calendar",
+  titleColumn: "title",
+  allowPublic: false,
+  getResourcePath: () => "/published-calendars",
+  getDb,
+});

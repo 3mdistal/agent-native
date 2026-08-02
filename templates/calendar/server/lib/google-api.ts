@@ -347,6 +347,7 @@ export function calendarListEvents(
     timeMax?: string;
     q?: string;
     singleEvents?: boolean;
+    showDeleted?: boolean;
     orderBy?: string;
     maxResults?: number;
     pageToken?: string;
@@ -355,6 +356,29 @@ export function calendarListEvents(
 ) {
   return googleFetch(
     `${CALENDAR_BASE}/calendars/${encodeURIComponent(calendarId)}/events${qs({ ...params, supportsAttachments: true })}`,
+    accessToken,
+  );
+}
+
+/** List calendars available to the connected Google account. */
+export function calendarListCalendars(
+  accessToken: string,
+  params: {
+    maxResults?: number;
+    pageToken?: string;
+    showHidden?: boolean;
+  } = {},
+) {
+  return googleFetch(
+    `${CALENDAR_BASE}/users/me/calendarList${qs(params)}`,
+    accessToken,
+  );
+}
+
+/** Read the default ACL rule used to determine Workspace external sharing. */
+export function calendarGetDefaultAcl(accessToken: string, calendarId: string) {
+  return googleFetch(
+    `${CALENDAR_BASE}/calendars/${encodeURIComponent(calendarId)}/acl/default`,
     accessToken,
   );
 }

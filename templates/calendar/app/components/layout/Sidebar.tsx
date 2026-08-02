@@ -1,10 +1,12 @@
 import { appPath } from "@agent-native/core/client/api-path";
 import { DevDatabaseLink } from "@agent-native/core/client/db-admin";
+import { useFeatureFlag } from "@agent-native/core/client/feature-flags";
 import { LanguagePicker, useT } from "@agent-native/core/client/i18n";
 import { openCommandMenu } from "@agent-native/core/client/navigation";
 import { OrgSwitcher } from "@agent-native/core/client/org";
 import { FeedbackButton } from "@agent-native/core/client/ui";
 import { SidebarFooterActions } from "@agent-native/toolkit/app-shell";
+import { PUBLISHED_CALENDAR_FEEDS_FLAG } from "@shared/feature-flags";
 import {
   IconCalendar,
   IconSettings,
@@ -23,6 +25,7 @@ import {
   IconLayoutSidebarLeftCollapse,
   IconLayoutSidebarLeftExpand,
   IconSearch,
+  IconBroadcast,
 } from "@tabler/icons-react";
 import {
   startOfMonth,
@@ -94,6 +97,12 @@ const navItems = [
     path: "/booking-links",
     labelKey: "navigation.bookingLinks",
     icon: IconLink,
+  },
+  {
+    path: "/published-calendars",
+    labelKey: "navigation.publishedCalendars",
+    icon: IconBroadcast,
+    publishedFeedsOnly: true,
   },
 ];
 
@@ -655,6 +664,12 @@ export function Sidebar({
   const location = useLocation();
   const navigate = useNavigate();
   const t = useT();
+  const publishedFeedsEnabled = useFeatureFlag(
+    PUBLISHED_CALENDAR_FEEDS_FLAG.key,
+  );
+  const visibleNavItems = navItems.filter(
+    (item) => !item.publishedFeedsOnly || publishedFeedsEnabled,
+  );
   const {
     selectedDate,
     setSelectedDate,
@@ -808,7 +823,7 @@ export function Sidebar({
         <div className="min-h-0 flex-1 overflow-y-auto">
           {collapsed ? (
             <nav className="flex flex-col items-center gap-1 px-1 py-2">
-              {navItems.map((item) => {
+              {visibleNavItems.map((item) => {
                 const isActive =
                   item.path === "/"
                     ? location.pathname === "/"
@@ -845,7 +860,7 @@ export function Sidebar({
 
               {/* Nav */}
               <nav className="space-y-0.5 p-2.5">
-                {navItems.map((item) => {
+                {visibleNavItems.map((item) => {
                   const isActive =
                     item.path === "/"
                       ? location.pathname === "/"

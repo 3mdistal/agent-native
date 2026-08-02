@@ -4,6 +4,7 @@ import {
   integer,
   ownableColumns,
   createSharesTable,
+  uniqueIndex,
 } from "@agent-native/core/db/schema";
 
 export const bookings = table("bookings", {
@@ -76,3 +77,59 @@ export const bookingUsernameChanges = table("booking_username_changes", {
 });
 
 export const bookingLinkShares = createSharesTable("booking_link_shares");
+
+export const publishedCalendars = table("published_calendars", {
+  id: text("id").primaryKey(),
+  title: text("title").notNull(),
+  disclosure: text("disclosure", { enum: ["busy", "titles"] })
+    .notNull()
+    .default("busy"),
+  isActive: integer("is_active", { mode: "boolean" }).notNull().default(true),
+  /** SHA-256 of the bearer token. The raw token is never persisted. */
+  tokenHash: text("token_hash").unique(),
+  lastGeneratedAt: text("last_generated_at"),
+  lastSuccessfulAt: text("last_successful_at"),
+  lastHealthStatus: text("last_health_status", {
+    enum: ["unknown", "healthy", "unhealthy"],
+  })
+    .notNull()
+    .default("unknown"),
+  lastHealthError: text("last_health_error"),
+  lastHealthCheckedAt: text("last_health_checked_at"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  ...ownableColumns(),
+});
+
+export const publishedCalendarSources = table(
+  "published_calendar_sources",
+  {
+    id: text("id").primaryKey(),
+    publishedCalendarId: text("published_calendar_id").notNull(),
+    provider: text("provider", { enum: ["google"] })
+      .notNull()
+      .default("google"),
+    accountEmail: text("account_email").notNull(),
+    calendarId: text("calendar_id").notNull(),
+    label: text("label").notNull(),
+    /** Durable evidence used to validate this source at selection time. */
+    ownershipSnapshot: text("ownership_snapshot").notNull(),
+    /** Eligibility outcome and reason from the source inventory. */
+    eligibilitySnapshot: text("eligibility_snapshot").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    ownerEmail: text("owner_email").notNull(),
+    orgId: text("org_id"),
+  },
+  (table) => [
+    uniqueIndex("published_calendar_sources_account_calendar_unique").on(
+      table.publishedCalendarId,
+      table.accountEmail,
+      table.calendarId,
+    ),
+  ],
+);
+
+export const publishedCalendarShares = createSharesTable(
+  "published_calendar_shares",
+);

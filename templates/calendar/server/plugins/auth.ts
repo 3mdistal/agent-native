@@ -33,6 +33,7 @@ export default createAuthPlugin({
     "/book",
     "/booking",
     "/meet",
+    "/calendar-subscriptions",
     "/api/bookings/available-slots",
     "/api/bookings/create",
     "/api/public",

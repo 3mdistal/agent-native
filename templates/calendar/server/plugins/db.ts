@@ -58,7 +58,7 @@ const runCalendarMigrations = runMigrations(
     description TEXT,
     duration INTEGER NOT NULL DEFAULT 30,
     color TEXT,
-    is_active INTEGER NOT NULL DEFAULT 1,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
@@ -210,6 +210,79 @@ CREATE INDEX IF NOT EXISTS idx_bookings_slug_start ON bookings (slug, "start");`
       version: 21,
       name: "bookings-calendar-account-id",
       sql: `ALTER TABLE bookings ADD COLUMN IF NOT EXISTS calendar_account_id TEXT`,
+    },
+    {
+      version: 22,
+      name: "published-calendars-resource",
+      sql: `CREATE TABLE IF NOT EXISTS published_calendars (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    disclosure TEXT NOT NULL DEFAULT 'busy' CHECK(disclosure IN ('busy', 'titles')),
+    is_active INTEGER NOT NULL DEFAULT 1,
+    token_hash TEXT UNIQUE,
+    last_generated_at TEXT,
+    last_successful_at TEXT,
+    last_health_status TEXT NOT NULL DEFAULT 'unknown' CHECK(last_health_status IN ('unknown', 'healthy', 'unhealthy')),
+    last_health_error TEXT,
+    last_health_checked_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    owner_email TEXT NOT NULL,
+    org_id TEXT,
+    visibility TEXT NOT NULL DEFAULT 'private'
+  );
+CREATE TABLE IF NOT EXISTS published_calendar_sources (
+    id TEXT PRIMARY KEY,
+    published_calendar_id TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'google' CHECK(provider IN ('google')),
+    account_email TEXT NOT NULL,
+    calendar_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    ownership_snapshot TEXT NOT NULL,
+    eligibility_snapshot TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    owner_email TEXT NOT NULL,
+    org_id TEXT,
+    UNIQUE(published_calendar_id, account_email, calendar_id)
+  );
+CREATE TABLE IF NOT EXISTS published_calendar_shares (
+    id TEXT PRIMARY KEY,
+    resource_id TEXT NOT NULL,
+    principal_type TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'viewer',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+CREATE INDEX IF NOT EXISTS idx_published_calendars_token_hash ON published_calendars (token_hash);
+CREATE INDEX IF NOT EXISTS idx_published_calendars_owner ON published_calendars (owner_email, org_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_published_calendar_shares_lookup ON published_calendar_shares (resource_id, principal_type, principal_id);
+CREATE INDEX IF NOT EXISTS idx_published_calendar_sources_parent ON published_calendar_sources (published_calendar_id);
+CREATE INDEX IF NOT EXISTS idx_published_calendar_sources_owner ON published_calendar_sources (owner_email, org_id, published_calendar_id);`,
+    },
+    {
+      version: 23,
+      name: "published-calendars-postgres-boolean",
+      sql: {
+        postgres: `
+        ALTER TABLE published_calendars ALTER COLUMN is_active DROP DEFAULT;
+        ALTER TABLE published_calendars ALTER COLUMN is_active TYPE boolean USING (is_active::int != 0);
+        ALTER TABLE published_calendars ALTER COLUMN is_active SET DEFAULT true;
+      `,
+      },
+    },
+    {
+      version: 25,
+      name: "published-calendar-feed-atomic-limits",
+      sql: `CREATE TABLE IF NOT EXISTS published_calendar_feed_limits (
+    token_hash TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (token_hash, window_start)
+  );
+CREATE INDEX IF NOT EXISTS idx_published_calendar_feed_limits_updated ON published_calendar_feed_limits (updated_at);`,
     },
   ],
   { table: "calendar_migrations" },

@@ -13,6 +13,8 @@ import {
 } from "../shared/calendar-view-preferences.js";
 import { extractVideoLink } from "./event-action-helpers.js";
 import { listCalendarEvents } from "./list-events.js";
+import { listPublishedCalendarRows } from "./published-calendar-actions.js";
+import { requirePublishedCalendarFeedsEnabled } from "../server/lib/published-calendar-feature.js";
 
 function safeDraftId(id: unknown): string | null {
   return typeof id === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(id) ? id : null;
@@ -157,6 +159,22 @@ export default defineAction({
           (link) => link.id === nav.bookingLinkId,
         );
       }
+    } else if (nav?.view === "published-calendars") {
+      screen.page = "published-calendars";
+      await requirePublishedCalendarFeedsEnabled({
+        userEmail: getRequestUserEmail() ?? undefined,
+      });
+      screen.publishedCalendars = (await listPublishedCalendarRows())
+        .slice(0, 50)
+        .map((calendar) => ({
+          id: calendar.id,
+          title: calendar.title,
+          disclosure: calendar.disclosure,
+          isActive: calendar.isActive,
+          sourceCount: calendar.sources.length,
+          lastHealthStatus: calendar.lastHealthStatus,
+          lastSuccessfulAt: calendar.lastSuccessfulAt,
+        }));
     } else if (nav?.view === "bookings") {
       screen.page = "bookings";
     } else if (nav?.view === "settings") {

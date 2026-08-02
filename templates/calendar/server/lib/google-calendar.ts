@@ -23,6 +23,8 @@ import {
   createOAuth2Client,
   oauth2GetUserInfo,
   calendarListEvents,
+  calendarListCalendars,
+  calendarGetDefaultAcl,
   calendarFreeBusy,
   calendarGetEvent,
   calendarInsertEvent,
@@ -946,6 +948,180 @@ export async function listEvents(
   );
 
   return { events: allResults.flat(), errors };
+}
+
+export type PublishedCalendarSource = {
+  accountEmail: string;
+  calendarId: string;
+  summary: string;
+  primary: boolean;
+  dataOwner?: string;
+  accessRole?: string;
+  eligible: boolean;
+  ineligibleReason?: "not-data-owner" | "workspace-external-sharing-unverified";
+  maximumDisclosure?: "busy" | "titles";
+};
+
+function sameEmail(left: string | undefined, right: string): boolean {
+  return left?.trim().toLowerCase() === right.trim().toLowerCase();
+}
+
+function isPersonalGoogleAccount(email: string): boolean {
+  return email.trim().toLowerCase().endsWith("@gmail.com");
+}
+
+export function workspaceDefaultAclDisclosure(
+  acl: unknown,
+): "busy" | "titles" | undefined {
+  if (!acl || typeof acl !== "object") return undefined;
+  const entry = acl as Record<string, unknown>;
+  const scope =
+    entry.scope && typeof entry.scope === "object"
+      ? (entry.scope as Record<string, unknown>)
+      : undefined;
+  if (entry.id !== "default" || scope?.type !== "default") return undefined;
+  const role = optionalString(entry.role);
+  if (role === "reader" || role === "writer" || role === "owner") {
+    return "titles";
+  }
+  if (role === "freeBusyReader") return "busy";
+  return undefined;
+}
+
+/**
+ * Returns only calendars whose data ownership can be proven for an explicitly
+ * connected account. Workspace calendars remain unavailable unless their
+ * default ACL provides an observable public sharing ceiling.
+ */
+export async function listPublishedCalendarSources(
+  ownerEmail: string,
+): Promise<{
+  sources: PublishedCalendarSource[];
+  errors: Array<{ email: string; error: string }>;
+}> {
+  const { clients, errors } = await getClientsWithErrors(ownerEmail);
+  const sources: PublishedCalendarSource[] = [];
+
+  await Promise.all(
+    clients.map(async (client) => {
+      try {
+        const calendars: any[] = [];
+        let pageToken: string | undefined;
+        do {
+          const page = await calendarListCalendars(client.accessToken, {
+            pageToken,
+            showHidden: true,
+            maxResults: 250,
+          });
+          calendars.push(...(page.items ?? []));
+          pageToken =
+            typeof page.nextPageToken === "string"
+              ? page.nextPageToken
+              : undefined;
+        } while (pageToken);
+
+        for (const calendar of calendars) {
+          const calendarId = optionalString(calendar.id);
+          if (!calendarId) continue;
+          const owned =
+            calendar.primary === true ||
+            sameEmail(calendar.dataOwner, client.email);
+          const source: PublishedCalendarSource = {
+            accountEmail: client.email,
+            calendarId,
+            summary:
+              optionalString(calendar.summaryOverride) ??
+              optionalString(calendar.summary) ??
+              calendarId,
+            primary: calendar.primary === true,
+            dataOwner: optionalString(calendar.dataOwner),
+            accessRole: optionalString(calendar.accessRole),
+            eligible: false,
+          };
+          if (!owned) {
+            source.ineligibleReason = "not-data-owner";
+          } else if (isPersonalGoogleAccount(client.email)) {
+            source.eligible = true;
+            source.maximumDisclosure = "titles";
+          } else {
+            try {
+              const acl = await calendarGetDefaultAcl(
+                client.accessToken,
+                calendarId,
+              );
+              const maximumDisclosure = workspaceDefaultAclDisclosure(acl);
+              if (maximumDisclosure) {
+                source.eligible = true;
+                source.maximumDisclosure = maximumDisclosure;
+              } else {
+                source.ineligibleReason =
+                  "workspace-external-sharing-unverified";
+              }
+            } catch {
+              source.ineligibleReason = "workspace-external-sharing-unverified";
+            }
+          }
+          sources.push(source);
+        }
+      } catch (error) {
+        errors.push({
+          email: client.email,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to list Google calendars",
+        });
+      }
+    }),
+  );
+  return {
+    sources: sources.sort((a, b) => a.summary.localeCompare(b.summary)),
+    errors,
+  };
+}
+
+export async function listSelectedCalendarEvents(
+  ownerEmail: string,
+  source: Pick<PublishedCalendarSource, "accountEmail" | "calendarId">,
+  timeMin: string,
+  timeMax: string,
+): Promise<any[]> {
+  const { clients, errors } = await getClientsForAccountsWithErrors(
+    ownerEmail,
+    [source.accountEmail],
+  );
+  const client = clients[0];
+  if (!client) {
+    throw new Error(
+      errors[0]?.error ?? "Selected Google account is unavailable",
+    );
+  }
+  const events: any[] = [];
+  let pageToken: string | undefined;
+  do {
+    const page = await calendarListEvents(
+      client.accessToken,
+      source.calendarId,
+      {
+        timeMin,
+        timeMax,
+        singleEvents: true,
+        showDeleted: true,
+        orderBy: "startTime",
+        maxResults: 2500,
+        pageToken,
+      },
+    );
+    events.push(...(page.items ?? []));
+    if (events.length > 5_000) {
+      throw new Error(
+        "Selected calendar exceeds the published feed event limit",
+      );
+    }
+    pageToken =
+      typeof page.nextPageToken === "string" ? page.nextPageToken : undefined;
+  } while (pageToken);
+  return events;
 }
 
 export async function getFreeBusy(

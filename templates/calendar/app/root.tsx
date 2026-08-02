@@ -152,6 +152,7 @@ function DbSyncSetup() {
       "events",
       "bookings",
       "booking-links",
+      "published-calendars",
       "availability",
       "settings",
       "google-status",

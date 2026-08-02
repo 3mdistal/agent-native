@@ -10,7 +10,7 @@ export default defineAction({
       .string()
       .optional()
       .describe(
-        "View to navigate to (calendar, availability, booking-links, bookings, settings, extensions)",
+        "View to navigate to (calendar, availability, booking-links, published-calendars, bookings, settings, extensions)",
       ),
     calendarViewMode: z
       .enum(["day", "week", "month"])

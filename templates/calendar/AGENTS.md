@@ -61,6 +61,11 @@ ladder.
   limitation.
 - Use framework sharing actions for calendars/events/booking resources when
   applicable.
+- Published calendars use explicit eligible owned Google sources, never the
+  browser's hidden-calendar state. Manage them with the `*-published-calendar`
+  actions and `list-published-calendar-sources`.
+- Subscription tokens are bearer secrets returned only by create or rotate.
+  They cannot be recovered later; never log them.
 - Booking-link sharing controls who can manage the link. Public booking access
   is still controlled by the `/book/{username}/{slug}` URL and `isActive`.
 - `create-booking-link` and `update-booking-link` accept `hosts` for required
@@ -85,7 +90,7 @@ ladder.
 - `navigation` exposes the current view, date, selected event, calendar account,
   booking link, and settings context.
 - `navigate` moves the UI to calendar, event, availability, booking, and settings
-  views.
+  views, including `published-calendars` when the feature is enabled.
 - Use actions for full event details and availability calculations.
 - Preserve `accountEmail` on every Google event write. When more than one
   Google account is connected, pass the chosen account to `create-event`, and

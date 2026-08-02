@@ -111,6 +111,8 @@ export function useNavigationState() {
         state.view = "booking-links";
         const match = pathname.match(/\/booking-links\/(.+)/);
         if (match) state.bookingLinkId = match[1];
+      } else if (pathname.startsWith("/published-calendars")) {
+        state.view = "published-calendars";
       } else if (pathname.startsWith("/bookings")) {
         state.view = "bookings";
       } else if (pathname.startsWith("/settings")) {
@@ -147,6 +149,8 @@ export function useNavigationState() {
       } else if (cmd.view === "booking-links") {
         path = "/booking-links";
         if (cmd.bookingLinkId) path += `/${cmd.bookingLinkId}`;
+      } else if (cmd.view === "published-calendars") {
+        path = "/published-calendars";
       } else if (cmd.view === "bookings") {
         path = "/bookings";
       } else if (cmd.view === "settings") {
