@@ -2244,15 +2244,18 @@ export const editorChromeBridgeScript: string = `"use strict";
       });
       return siblings.length > 0 ? siblings : [el];
     }
+    function unwrapTextOverlay(hit) {
+      if (hit.hasAttribute && hit.hasAttribute("data-an-text")) {
+        var textOwner = hit.parentElement;
+        if (textOwner && !isDocumentRootElement(textOwner)) return textOwner;
+      }
+      return hit;
+    }
     function selectionTargetForHit(hit, descendIntoGroup = false) {
       if (!hit || isDocumentRootElement(hit)) return hit;
       var svgRoot = outermostSvgAncestor(hit);
       if (svgRoot) return svgRoot;
-      var target = hit;
-      if (hit.hasAttribute && hit.hasAttribute("data-an-text")) {
-        var textOwner = hit.parentElement;
-        if (textOwner && !isDocumentRootElement(textOwner)) target = textOwner;
-      }
+      var target = unwrapTextOverlay(hit);
       if (!descendIntoGroup) {
         var group = target;
         while (group && !isDocumentRootElement(group)) {
@@ -2267,6 +2270,37 @@ export const editorChromeBridgeScript: string = `"use strict";
         }
       }
       return target;
+    }
+    function containerScopeAncestor(el, scope) {
+      var node = el;
+      while (node !== scope && node.parentElement && node.parentElement !== scope && node.parentElement !== document.body && node.parentElement !== document.documentElement) {
+        node = node.parentElement;
+      }
+      return node;
+    }
+    function containerFirstSelectionTarget(hit, descendIntoGroup) {
+      var resolved = selectionTargetForHit(hit, descendIntoGroup);
+      if (!resolved || isDocumentRootElement(resolved)) return resolved;
+      var scope = selectionContainerScope;
+      if (!scope || !document.documentElement.contains(scope) || !scope.contains(resolved)) {
+        selectionContainerScope = null;
+        scope = document.body;
+      }
+      return containerScopeAncestor(resolved, scope);
+    }
+    function clickThroughSelectionTarget(hit, ev) {
+      if (ev.detail > 1) return null;
+      if (!selectedEl || !document.documentElement.contains(selectedEl)) {
+        return null;
+      }
+      if (collectMoveGroupMembers(selectedEl).length > 1) return null;
+      if (!hit || isDocumentRootElement(hit)) return null;
+      var raw = outermostSvgAncestor(hit) || unwrapTextOverlay(hit);
+      if (!raw || raw === selectedEl || !selectedEl.contains(raw)) {
+        return null;
+      }
+      selectionContainerScope = selectedEl;
+      return containerScopeAncestor(raw, selectedEl);
     }
     function freshRuntimeNodeId(prefix) {
       var random = "";
@@ -2888,10 +2922,17 @@ export const editorChromeBridgeScript: string = `"use strict";
         });
       }
     }
-    function collectSelectableElements() {
+    function collectSelectableElements(deep) {
       var nodes = Array.prototype.slice.call(
         document.body ? document.body.querySelectorAll("*") : []
       );
+      var scope = null;
+      if (!deep) {
+        scope = selectionContainerScope;
+        if (!scope || !document.documentElement.contains(scope)) {
+          scope = document.body;
+        }
+      }
       var seen = /* @__PURE__ */ new Set();
       var elements = [];
       nodes.forEach(function(node) {
@@ -2899,6 +2940,9 @@ export const editorChromeBridgeScript: string = `"use strict";
           return;
         }
         var target = selectionTargetForHit(node);
+        if (target && scope && scope.contains(target)) {
+          target = containerScopeAncestor(target, scope);
+        }
         if (!target || isDocumentRootElement(target) || isBoardRootMarqueeSurface(target) || isOverlayElement(target) || isLayerInteractionBlocked(target) || isTemplateCloneElement(target) || seen.has(target) || isPaddedAwayFromView(target)) {
           return;
         }
@@ -2915,8 +2959,8 @@ export const editorChromeBridgeScript: string = `"use strict";
       var cs = window.getComputedStyle(el);
       return cs.display === "none" || cs.visibility === "hidden";
     }
-    function collectSelectableElementInfos() {
-      return collectSelectableElements().map(function(target) {
+    function collectSelectableElementInfos(deep) {
+      return collectSelectableElements(deep).map(function(target) {
         return getElementInfo(target);
       });
     }
@@ -3253,6 +3297,7 @@ export const editorChromeBridgeScript: string = `"use strict";
       removeRepeatInstanceOverlays();
     }
     var selectedEl = null;
+    var selectionContainerScope = null;
     var selectionGeneration = 0;
     var selectionChromeHidden = false;
     var hoveredEl = null;
@@ -3322,6 +3367,7 @@ export const editorChromeBridgeScript: string = `"use strict";
     var spacingHatchNodesByKey = {};
     var spacingOverlayRenderKey = "";
     var activeDragCancel = null;
+    var activeDragStartedAt = null;
     var bridgeSpaceKeyPressed = false;
     var bridgeSpaceKeyConsumedByDrag = false;
     var activeCrossScreenStyleSnapshot = void 0;
@@ -3332,6 +3378,7 @@ export const editorChromeBridgeScript: string = `"use strict";
     function clearRuntimeSelection() {
       window.getSelection?.()?.removeAllRanges();
       selectedEl = null;
+      selectionContainerScope = null;
       clearHoverGate();
       setPassiveSelectionElements([]);
       clearSpacingHoverTimer();
@@ -3351,14 +3398,16 @@ export const editorChromeBridgeScript: string = `"use strict";
         "*"
       );
     }
-    function setActiveDragCancel(cancel) {
+    function setActiveDragCancel(cancel, startedAt) {
       activeDragCancel = cancel;
+      activeDragStartedAt = typeof startedAt === "number" ? startedAt : Date.now();
       postEditorDragState(true);
     }
     function clearActiveDragCancel(cancel) {
       if (cancel && activeDragCancel !== cancel) return;
       if (!activeDragCancel) return;
       activeDragCancel = null;
+      activeDragStartedAt = null;
       postEditorDragState(false);
     }
     function cancelActiveBridgeDrag() {
@@ -3367,6 +3416,35 @@ export const editorChromeBridgeScript: string = `"use strict";
       activeDragCancel = null;
       postEditorDragState(false);
       return cancel();
+    }
+    var MOVE_CANCEL_RACE_GRACE_MS = 200;
+    var dragGestureSequence = 0;
+    var pendingMoveCommitRevert = null;
+    function armPostCommitCancelGrace(gestureId, releasedAt, revert) {
+      pendingMoveCommitRevert = {
+        gestureId,
+        releasedAt,
+        revert
+      };
+      window.setTimeout(function() {
+        if (pendingMoveCommitRevert && pendingMoveCommitRevert.gestureId === gestureId) {
+          pendingMoveCommitRevert = null;
+        }
+      }, MOVE_CANCEL_RACE_GRACE_MS);
+    }
+    function cancelActiveBridgeDragOrPendingCommit(pressedAt) {
+      if (activeDragCancel && (typeof pressedAt !== "number" || activeDragStartedAt === null || activeDragStartedAt <= pressedAt)) {
+        if (cancelActiveBridgeDrag()) return true;
+      }
+      if (pendingMoveCommitRevert && typeof pressedAt === "number" && // Strict: a tie (same-tick release and Escape) is not "Escape predates
+      // the release" and must not revert an already-committed drag.
+      pressedAt < pendingMoveCommitRevert.releasedAt) {
+        var pending = pendingMoveCommitRevert;
+        pendingMoveCommitRevert = null;
+        pending.revert();
+        return true;
+      }
+      return false;
     }
     function removePassiveSelectionOverlays() {
       passiveSelectionOverlays.forEach(function(overlay) {
@@ -3475,6 +3553,37 @@ export const editorChromeBridgeScript: string = `"use strict";
         return;
       }
       setPassiveSelectionElements([previous].concat(passiveSelectionEls));
+    }
+    function resolveShiftClickToggleOff(target, e) {
+      if (!e?.shiftKey || !target) return void 0;
+      if (target === selectedEl) {
+        var promoted = passiveSelectionEls[0] || null;
+        setPassiveSelectionElements(passiveSelectionEls.slice(1));
+        selectedEl = promoted;
+        return promoted;
+      }
+      if (passiveSelectionEls.indexOf(target) !== -1) {
+        setPassiveSelectionElements(
+          passiveSelectionEls.filter(function(el) {
+            return el !== target;
+          })
+        );
+        return selectedEl;
+      }
+      return void 0;
+    }
+    function postToggledSelection(toggledPrimary) {
+      var survivors = (toggledPrimary ? [toggledPrimary] : []).concat(passiveSelectionEls);
+      if (toggledPrimary) {
+        positionOverlay(selectionOverlay, toggledPrimary);
+      } else {
+        hideSelectionOverlay();
+      }
+      if (survivors.length > 0) {
+        postElementMarqueeSelect(survivors, false, void 0);
+      } else {
+        window.parent.postMessage({ type: "clear-selection" }, "*");
+      }
     }
     function matchesSelectorList(el, selectors) {
       if (!el || !selectors || selectors.length === 0) return false;
@@ -3660,12 +3769,21 @@ export const editorChromeBridgeScript: string = `"use strict";
       styleDeclarations(previousSource).forEach(function(entry) {
         previousOwned[entry[0]] = entry[1];
       });
+      var nextDeclarations = styleDeclarations(nextSource);
       var nextOwned = {};
-      styleDeclarations(nextSource).forEach(function(entry) {
+      nextDeclarations.forEach(function(entry) {
         nextOwned[entry[0]] = true;
       });
       var target = document.createElement("div");
-      target.style.cssText = nextSource || "";
+      target.style.cssText = live.getAttribute("style") ?? "";
+      nextDeclarations.forEach(function(entry) {
+        var wasSource = Object.prototype.hasOwnProperty.call(
+          previousOwned,
+          entry[0]
+        );
+        if (wasSource && previousOwned[entry[0]] === entry[1]) return;
+        target.style.setProperty(entry[0], entry[1], entry[2]);
+      });
       styleDeclarations(live.getAttribute("style") ?? "").forEach(
         function(entry) {
           if (nextOwned[entry[0]]) return;
@@ -3673,8 +3791,9 @@ export const editorChromeBridgeScript: string = `"use strict";
             previousOwned,
             entry[0]
           );
-          if (wasSource && previousOwned[entry[0]] === entry[1]) return;
-          target.style.setProperty(entry[0], entry[1], entry[2]);
+          if (wasSource && previousOwned[entry[0]] === entry[1]) {
+            target.style.removeProperty(entry[0]);
+          }
         }
       );
       var value = target.style.cssText;
@@ -3968,7 +4087,17 @@ export const editorChromeBridgeScript: string = `"use strict";
         }
         if (!nextInTemplate && currentMatch && currentMatch !== document.body && currentMatch !== document.documentElement && !isOverlayElement(currentMatch)) {
           if (nextMatch) {
-            currentMatch.replaceWith(document.importNode(nextMatch, true));
+            if (isSourceOwned(currentMatch) && currentMatch.nodeName === nextMatch.nodeName && currentMatch.namespaceURI === nextMatch.namespaceURI && !scopeDirectiveChanged(currentMatch, nextMatch)) {
+              morphElement(
+                currentMatch,
+                nextMatch,
+                scopedMorphContext(currentMatch, nextMatch)
+              );
+            } else {
+              var replacement = document.importNode(nextMatch, true);
+              currentMatch.replaceWith(replacement);
+              recordSourceSubtree(replacement);
+            }
           } else if (currentMatch !== document.body && currentMatch !== document.documentElement) {
             if (currentMatch.parentNode && currentMatch.parentNode.contains(currentMatch)) {
               currentMatch.remove();
@@ -5023,6 +5152,11 @@ export const editorChromeBridgeScript: string = `"use strict";
     function selectFrameFromLabel(frame, e) {
       if (isLayerInteractionBlocked(frame)) return;
       blurActiveTextEditor();
+      var toggled = resolveShiftClickToggleOff(frame, e);
+      if (toggled !== void 0) {
+        postToggledSelection(toggled);
+        return;
+      }
       var previousSelectedEl = selectedEl;
       selectedEl = frame;
       positionOverlay(selectionOverlay, selectedEl);
@@ -5786,8 +5920,14 @@ export const editorChromeBridgeScript: string = `"use strict";
         return;
       }
       hoveredSpacingHandleKey = "";
+      var resolvedClickTarget = e.metaKey || e.ctrlKey ? selectionTargetForHit(target) : containerFirstSelectionTarget(target);
+      var toggled = resolveShiftClickToggleOff(resolvedClickTarget, e);
+      if (toggled !== void 0) {
+        postToggledSelection(toggled);
+        return;
+      }
       var previousSelectedEl = selectedEl;
-      selectedEl = selectionTargetForHit(target);
+      selectedEl = resolvedClickTarget;
       if (!selectedEl || isLayerInteractionBlocked(selectedEl)) {
         selectedEl = null;
         hideSelectionOverlay();
@@ -5848,7 +5988,7 @@ export const editorChromeBridgeScript: string = `"use strict";
     function rectsIntersect(a, b) {
       return a.left <= b.right && a.right >= b.left && a.top <= b.bottom && a.bottom >= b.top;
     }
-    function postElementMarqueeSelect(elements, additive, e) {
+    function postElementMarqueeSelect(elements, additive, e, final) {
       window.parent.postMessage(
         {
           type: "agent-native:layer-marquee-selection",
@@ -5862,13 +6002,18 @@ export const editorChromeBridgeScript: string = `"use strict";
             source: "marquee",
             shiftKey: Boolean(e && e.shiftKey),
             metaKey: Boolean(e && e.metaKey),
-            ctrlKey: Boolean(e && e.ctrlKey)
+            ctrlKey: Boolean(e && e.ctrlKey),
+            // A live drag reports a changed hit-set on every mousemove tick;
+            // only the mouseup report (see beginMarqueeSelection's onUp) sets
+            // this, so the host records ONE selection-history entry per
+            // gesture instead of one per tick (coalesceMarqueeSelectionHistory).
+            final: final === true
           }
         },
         "*"
       );
     }
-    function updateMarqueeSelection(e) {
+    function updateMarqueeSelection(e, final) {
       if (!activeMarqueeSelection) return;
       var rect = marqueeRectFromPoints(
         activeMarqueeSelection.startX,
@@ -5882,7 +6027,9 @@ export const editorChromeBridgeScript: string = `"use strict";
       marqueeSelectionOverlay.style.width = rect.width + "px";
       marqueeSelectionOverlay.style.height = rect.height + "px";
       if (!activeMarqueeSelection.candidates) {
-        activeMarqueeSelection.candidates = collectSelectableElements();
+        activeMarqueeSelection.candidates = collectSelectableElements(
+          activeMarqueeSelection.deep
+        );
       }
       var hitElements = activeMarqueeSelection.candidates.filter(function(el) {
         var bounds = selectableBounds(el);
@@ -5905,7 +6052,12 @@ export const editorChromeBridgeScript: string = `"use strict";
         hideSelectionOverlay();
       }
       setPassiveSelectionElements(hitElements);
-      postElementMarqueeSelect(hitElements, activeMarqueeSelection.additive, e);
+      postElementMarqueeSelect(
+        hitElements,
+        activeMarqueeSelection.additive,
+        e,
+        final
+      );
     }
     function beginMarqueeSelection(e) {
       if (e.button !== 0) return;
@@ -5932,7 +6084,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         var didMove = Boolean(activeMarqueeSelection?.moved);
         if (didMove) {
           stopNativeInteraction(ev);
-          updateMarqueeSelection(ev);
+          updateMarqueeSelection(ev, true);
           suppressNextShieldClickBriefly();
         }
         marqueeSelectionOverlay.style.display = "none";
@@ -5942,6 +6094,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         startX: e.clientX,
         startY: e.clientY,
         additive,
+        deep: Boolean(e && (e.metaKey || e.ctrlKey)),
         moved: false,
         pointerId: e.pointerId,
         move: events.move,
@@ -5957,6 +6110,91 @@ export const editorChromeBridgeScript: string = `"use strict";
       }
       document.addEventListener(events.move, onMove, true);
       document.addEventListener(events.up, onUp, true);
+    }
+    var LAYER_LABEL_SEMANTIC_ATTRIBUTES = [
+      "aria-label",
+      "title",
+      "data-code-layer-id",
+      "data-layer-id",
+      "data-name",
+      "data-component",
+      "data-screen",
+      "data-testid",
+      "data-test-id"
+    ];
+    function fallbackTagLayerLabel(tag) {
+      switch (tag) {
+        case "article":
+          return "Article";
+        case "aside":
+          return "Aside";
+        case "body":
+          return "Body";
+        case "button":
+          return "Button";
+        case "div":
+          return "Frame";
+        case "footer":
+          return "Footer";
+        case "form":
+          return "Form";
+        case "header":
+          return "Header";
+        case "a":
+          return "Link";
+        case "img":
+        case "picture":
+          return "Image";
+        case "input":
+          return "Input";
+        case "label":
+          return "Label";
+        case "main":
+          return "Main";
+        case "select":
+          return "Select";
+        case "textarea":
+          return "Text area";
+        case "nav":
+          return "Navigation";
+        case "section":
+          return "Section";
+        case "svg":
+          return "Vector";
+        case "ul":
+        case "ol":
+          return "List";
+        case "li":
+          return "List item";
+        case "em":
+        case "h1":
+        case "h2":
+        case "h3":
+        case "h4":
+        case "h5":
+        case "h6":
+        case "p":
+        case "span":
+        case "strong":
+          return "Text";
+        default:
+          return tag.toUpperCase();
+      }
+    }
+    function layerCandidateLabelFor(candidate, candidateInfo) {
+      var explicitLabel = layerNameForElement(candidate);
+      if (explicitLabel) return explicitLabel;
+      if (candidateInfo.componentName) return candidateInfo.componentName;
+      for (var i = 0; i < LAYER_LABEL_SEMANTIC_ATTRIBUTES.length; i += 1) {
+        var semanticValue = candidate.getAttribute && candidate.getAttribute(LAYER_LABEL_SEMANTIC_ATTRIBUTES[i]);
+        if (semanticValue) return semanticValue;
+      }
+      if (candidate.id) return candidate.id;
+      if (candidate.children.length === 0) {
+        var textLabel = (candidate.textContent || "").trim().replace(/\\s+/g, " ");
+        if (textLabel && textLabel.length <= 48) return textLabel;
+      }
+      return fallbackTagLayerLabel(candidate.tagName.toLowerCase());
     }
     function collectLayerHitCandidates(clientX, clientY) {
       var shieldPointerEvents = shieldOverlay.style.pointerEvents;
@@ -5980,9 +6218,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         }
         elements.push(candidate);
         var candidateInfo = getElementInfo(candidate);
-        var explicitLabel = layerNameForElement(candidate);
-        var textLabel = (candidate.textContent || "").trim().replace(/\\s+/g, " ");
-        var label = explicitLabel || candidateInfo.componentName || candidate.id || (textLabel && textLabel.length <= 48 ? textLabel : "") || candidate.tagName.toLowerCase();
+        var label = layerCandidateLabelFor(candidate, candidateInfo);
         var identity = candidateInfo.sourceId || candidateInfo.selector || String(layerCandidates.length);
         layerCandidates.push({
           key: String(identity) + ":" + String(layerCandidates.length),
@@ -9006,6 +9242,8 @@ export const editorChromeBridgeScript: string = `"use strict";
       e.preventDefault();
       e.stopPropagation();
       if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+      var moveGestureId = ++dragGestureSequence;
+      var gestureStartedAt = performance.timeOrigin + e.timeStamp;
       var events = dragEventNames(e);
       var originalSelectedEl = selectedEl;
       var duplicatedForDrag = false;
@@ -9017,7 +9255,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         duplicatedForDrag = true;
         gestureEl = clone;
         positionOverlay(selectionOverlay, selectedEl);
-        postElementSelect(selectedEl, e);
+        postElementSelect(selectedEl);
       }
       var groupEls = duplicatedForDrag || e.altKey ? [gestureEl] : collectMoveGroupMembers(gestureEl);
       if (groupEls.indexOf(gestureEl) === -1) groupEls = [gestureEl];
@@ -9309,7 +9547,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           var dx = cx - reorderPointerStart.clientX;
           var dy = cy - reorderPointerStart.clientY;
           var outside = cx < 0 || cy < 0 || cx > vw || cy > vh;
-          if (!isGroupDrag) {
+          if (!isGroupDrag && !reorderIgnoresAutoLayout) {
             postCrossScreenDrag(
               "move",
               reorderEl,
@@ -9328,7 +9566,6 @@ export const editorChromeBridgeScript: string = `"use strict";
             clearReorderReflow2();
             showTransformBadge("Move layer", cx, cy);
           } else {
-            crossScreenClaimedByHost = false;
             var rawTarget = resolveReorderOrFreeTarget2(
               cx,
               cy,
@@ -9366,6 +9603,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           clearActiveDragCancel(onReorderEscape2);
           clearReorderLift2();
           clearReorderReflow2();
+          suppressNextShieldClickBriefly();
         }, onReorderVisibilityChange2 = function() {
           if (document.visibilityState === "hidden") onReorderEscape2();
         }, onReorderEscape2 = function() {
@@ -9408,10 +9646,18 @@ export const editorChromeBridgeScript: string = `"use strict";
           var vh = window.innerHeight;
           var cx = ev.clientX;
           var cy = ev.clientY;
-          var outsideOnDrop = cx < 0 || cy < 0 || cx > vw || cy > vh || // Claimed by the host: committing here too would write the node
-          // twice, from two different ideas of where it landed.
-          crossScreenClaimedByHost;
-          if (!isGroupDrag) {
+          var outsideOnDrop = (
+            // A ctrl/cmd auto-layout-override drag never arms the host (see
+            // onReorderMove/reorderIgnoresAutoLayout above), so the numeric
+            // outside-the-iframe check below — which exists only to defer to
+            // the host's cross-screen drop — must not apply to it either, or
+            // the in-iframe commit below is skipped with nothing to take its
+            // place.
+            !reorderIgnoresAutoLayout && (cx < 0 || cy < 0 || cx > vw || cy > vh) || // Claimed by the host: committing here too would write the node
+            // twice, from two different ideas of where it landed.
+            crossScreenClaimedByHost
+          );
+          if (!isGroupDrag && !reorderIgnoresAutoLayout) {
             postCrossScreenDrag(
               "end",
               reorderEl,
@@ -9527,19 +9773,20 @@ export const editorChromeBridgeScript: string = `"use strict";
         var reorderGestureStartRect = reorderEl.getBoundingClientRect();
         var reorderLastTargetKey = null;
         var keepCurrentFlowParent = bridgeSpaceKeyPressed;
+        var reorderIgnoresAutoLayout = Boolean(e.ctrlKey || e.metaKey);
         var currentTarget = flowMoveTargetForPoint(
           reorderEl,
           e.clientX,
           e.clientY,
           groupOthers,
           keepCurrentFlowParent,
-          Boolean(e.ctrlKey)
+          reorderIgnoresAutoLayout
         );
         showInsertionGuideFor(currentTarget);
         dndLog("start:reorder", {
           el: getSelector(reorderEl),
           isGroup: isGroupDrag,
-          ctrl: Boolean(e.ctrlKey),
+          ctrl: reorderIgnoresAutoLayout,
           target: dndTarget(currentTarget)
         });
         crossScreenClaimedByHost = false;
@@ -9550,7 +9797,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           x: reorderPointerStart.clientX - reorderRect.left,
           y: reorderPointerStart.clientY - reorderRect.top
         };
-        if (!isGroupDrag) {
+        if (!isGroupDrag && !reorderIgnoresAutoLayout) {
           postCrossScreenDrag("start", reorderEl, reorderPointerStart, {
             duplicate: duplicatedForDrag,
             elementRect: {
@@ -9746,7 +9993,6 @@ export const editorChromeBridgeScript: string = `"use strict";
           currentAutoLayoutTarget = null;
           hideInsertionGuide();
         } else {
-          crossScreenClaimedByHost = false;
           currentAutoLayoutTarget = !duplicatedForDrag && !bridgeSpaceKeyPressed ? autoLayoutInsertionTargetForPoint(
             dragEl,
             ev.clientX,
@@ -9803,6 +10049,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         restoreOverflowOnAncestors(liftedClippingAncestors);
         crossScreenDragMoveScheduled = false;
         crossScreenDragMovePendingEv = null;
+        suppressNextShieldClickBriefly();
       }
       function cancelMoveDrag() {
         bridgeMoveController.cancel();
@@ -9957,14 +10204,51 @@ export const editorChromeBridgeScript: string = `"use strict";
               },
               "*"
             );
+            recordSourceOwnership(state.el);
           });
+          armPostCommitCancelGrace(
+            moveGestureId,
+            // Real creation time of the mouseup, not of this handler running —
+            // any synchronous work above (auto-layout resolution, DOM writes)
+            // would otherwise inflate the apparent release time.
+            performance.timeOrigin + (ev ? ev.timeStamp : performance.now()),
+            function() {
+              memberStates.forEach(function(state) {
+                state.el.style.position = state.originalPosition;
+                state.el.style.left = state.originalLeft;
+                state.el.style.top = state.originalTop;
+                var revertStyles = {
+                  position: state.originalPosition,
+                  left: state.originalLeft,
+                  top: state.originalTop
+                };
+                window.parent.postMessage(
+                  {
+                    type: "visual-style-change",
+                    selector: getSelector(state.el),
+                    styles: revertStyles,
+                    originalStyles: originalInlineStylesForPatch(
+                      state.el,
+                      revertStyles
+                    ),
+                    payload: getElementInfo(state.el)
+                  },
+                  "*"
+                );
+                recordSourceOwnership(state.el);
+              });
+              selectedEl = originalSelectedEl;
+              positionOverlay(selectionOverlay, selectedEl);
+              refreshOverlays();
+            }
+          );
           if (!isGroupDrag) postCrossScreenDrag("cancel");
         }
       }
       document.addEventListener(events.move, onMove, true);
       document.addEventListener(events.up, onUp, true);
       document.addEventListener("keydown", onMoveKeyDown, true);
-      setActiveDragCancel(cancelMoveDrag);
+      setActiveDragCancel(cancelMoveDrag, gestureStartedAt);
     }
     function collectScaleFontTargets(root) {
       var targets = [];
@@ -10721,11 +11005,16 @@ export const editorChromeBridgeScript: string = `"use strict";
       if (rawHit && rawHit !== el) return false;
       if (isDocumentRootElement(el)) return false;
       if (outermostSvgAncestor(el) === el) return false;
-      return Boolean(el.firstElementChild);
+      var child = el.firstElementChild;
+      if (child && child === el.lastElementChild && child.hasAttribute && child.hasAttribute("data-an-text")) {
+        return false;
+      }
+      return Boolean(child);
     }
     var crossScreenClaimedByHost = false;
     function beginPotentialShieldDrag(e) {
       stopNativeInteraction(e);
+      pendingMoveCommitRevert = null;
       if (e.button !== 0) return;
       if (activeTextEditEl && !exitStaleTextEditSession()) return;
       var events = dragEventNames(e);
@@ -10746,7 +11035,6 @@ export const editorChromeBridgeScript: string = `"use strict";
         point: { x: e.clientX, y: e.clientY },
         preferSelected: selectedLayerDragPriorityEnabled
       });
-      var clickTarget = hitTarget;
       if (window.__DND_DEBUG)
         dndLog("shield:down", {
           hit: getSelector(hit),
@@ -10766,13 +11054,21 @@ export const editorChromeBridgeScript: string = `"use strict";
         } catch (_err) {
         }
       }
-      if (!readOnly && !e.altKey) {
+      var suppressCrossScreenStartForCtrlReorder = Boolean(e.ctrlKey || e.metaKey) && isFlowReorderCandidate(dragTarget);
+      if (!readOnly && !e.altKey && !suppressCrossScreenStartForCtrlReorder) {
         postCrossScreenDrag("start", dragTarget, e);
       }
       var startX = e.clientX;
       var startY = e.clientY;
       var didStartDrag = false;
-      function selectTarget(target, ev) {
+      function selectTarget(target, ev, isClick) {
+        if (isClick) {
+          var toggled = resolveShiftClickToggleOff(target, ev);
+          if (toggled !== void 0) {
+            postToggledSelection(toggled);
+            return;
+          }
+        }
         var previousSelectedEl = selectedEl;
         selectedEl = target;
         positionOverlay(selectionOverlay, selectedEl);
@@ -10814,10 +11110,11 @@ export const editorChromeBridgeScript: string = `"use strict";
         }
         if (ev) stopNativeInteraction(ev);
         var cycledEl = !readOnly && (e.metaKey || e.ctrlKey) && !e.shiftKey ? stackCycleTarget(e.clientX, e.clientY, selectedEl) : null;
+        var primaryClickTarget = !readOnly && (e.metaKey || e.ctrlKey) ? selectionTargetForHit(hit) : (!readOnly && !e.shiftKey ? clickThroughSelectionTarget(hit, ev) : null) || containerFirstSelectionTarget(hit);
         if (cycledEl) {
-          selectTarget(cycledEl);
+          selectTarget(cycledEl, void 0, true);
         } else {
-          selectTarget(clickTarget || dragTarget, ev);
+          selectTarget(primaryClickTarget || dragTarget, ev, true);
         }
         suppressNextShieldClickBriefly();
       }
@@ -11211,7 +11508,10 @@ export const editorChromeBridgeScript: string = `"use strict";
           var descendHit = elementFromEditorPoint(e.clientX, e.clientY);
           if (descendHit && descendHit !== document.body && descendHit !== document.documentElement && !isLayerInteractionBlocked(descendHit)) {
             var previousSelectedElForDescend = selectedEl;
-            var descendTarget = selectionTargetForHit(descendHit, true);
+            if (previousSelectedElForDescend && document.documentElement.contains(previousSelectedElForDescend) && previousSelectedElForDescend.contains(descendHit)) {
+              selectionContainerScope = previousSelectedElForDescend;
+            }
+            var descendTarget = containerFirstSelectionTarget(descendHit, true);
             if (descendTarget && !isLayerInteractionBlocked(descendTarget)) {
               selectedEl = descendTarget;
               positionOverlay(selectionOverlay, selectedEl);
@@ -11508,11 +11808,52 @@ export const editorChromeBridgeScript: string = `"use strict";
       },
       true
     );
+    var lastHoverClientPoint = null;
+    function resolveHoverTarget(clientX, clientY, deepSelect) {
+      var rawHit = elementFromEditorPoint(clientX, clientY);
+      return deepSelect ? selectionTargetForHit(rawHit) : containerFirstSelectionTarget(rawHit);
+    }
+    function reresolveHoverAtLastPoint(deepSelect) {
+      if (!lastHoverClientPoint) return;
+      hoveredEl = resolveHoverTarget(
+        lastHoverClientPoint.x,
+        lastHoverClientPoint.y,
+        deepSelect
+      );
+      if (!hoveredEl || hoveredEl === selectedEl) {
+        highlightOverlay.style.display = "none";
+      } else {
+        positionOverlay(highlightOverlay, hoveredEl);
+      }
+    }
+    document.addEventListener(
+      "keydown",
+      function(e) {
+        if (e.key === "Meta" || e.key === "Control") {
+          reresolveHoverAtLastPoint(true);
+        }
+      },
+      true
+    );
+    document.addEventListener(
+      "keyup",
+      function(e) {
+        if (e.key === "Meta" || e.key === "Control") {
+          reresolveHoverAtLastPoint(false);
+        }
+      },
+      true
+    );
     shieldOverlay.addEventListener(
       "pointermove",
       function(e) {
         stopNativeInteraction(e);
-        hoveredEl = elementFromEditorPoint(e.clientX, e.clientY);
+        lastHoverClientPoint = { x: e.clientX, y: e.clientY };
+        hoveredEl = resolveHoverTarget(
+          e.clientX,
+          e.clientY,
+          e.metaKey || e.ctrlKey
+        );
         if (!hoveredEl) {
           highlightOverlay.style.display = "none";
           if (!spacingDrag) {
@@ -11805,7 +12146,9 @@ export const editorChromeBridgeScript: string = `"use strict";
         return;
       }
       if (e.data.type === "agent-native:cancel-active-drag") {
-        cancelActiveBridgeDrag();
+        cancelActiveBridgeDragOrPendingCommit(
+          typeof e.data.pressedAt === "number" ? e.data.pressedAt : void 0
+        );
         return;
       }
       if (e.data.type === "agent-native:reset-live-visual-edit-baselines") {
@@ -11849,7 +12192,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           {
             type: "agent-native:selectable-rects-result",
             correlationId: typeof e.data.correlationId === "string" ? e.data.correlationId : "",
-            payload: collectSelectableElementInfos()
+            payload: collectSelectableElementInfos(Boolean(e.data.deep))
           },
           "*"
         );
