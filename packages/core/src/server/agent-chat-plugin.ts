@@ -5828,6 +5828,38 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
             return stream;
           }
 
+          // Route: GET /runs/latest?threadId=X
+          if (method === "GET" && url.includes("/runs/latest")) {
+            const query = getQuery(event);
+            const threadId = query.threadId ? String(query.threadId) : null;
+            if (!threadId) {
+              setResponseStatus(event, 400);
+              return { error: "threadId query parameter is required" };
+            }
+            if (!(await canViewThread(threadId))) {
+              setResponseStatus(event, 404);
+              return { error: "Run not found" };
+            }
+            const { getRunByThread } = await import("../agent/run-store.js");
+            const run = await getRunByThread(threadId, {
+              includeTerminal: true,
+            });
+            if (!run) {
+              return { threadId, status: "queued" };
+            }
+            return {
+              runId: run.id,
+              threadId: run.threadId,
+              turnId: run.turnId ?? null,
+              status: run.status,
+              heartbeatAt: run.heartbeatAt,
+              completedAt: run.completedAt,
+              lastProgressAt: run.lastProgressAt,
+              dispatchMode: run.dispatchMode,
+              terminalReason: run.terminalReason,
+            };
+          }
+
           // Route: GET /runs/active?threadId=X
           if (method === "GET") {
             const query = getQuery(event);

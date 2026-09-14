@@ -159,6 +159,8 @@ export interface AgentChatContextState {
 export interface AgentChatOpenThreadRequest {
   threadId: string;
   newThread?: boolean;
+  /** Draft to place in this exact thread after it becomes active. */
+  prefill?: string;
   /**
    * Open only while this thread is still active (or no thread is active).
    * This lets transient surfaces restore their own chat without stealing a
@@ -900,6 +902,7 @@ export function requestAgentChatThreadOpen(
     bufferOpenRequest("agent-chat:open-thread", {
       ...detail,
       threadId: detail.threadId.trim(),
+      ...(detail.prefill?.trim() ? { prefill: detail.prefill } : {}),
     }),
   );
 }
