@@ -110,9 +110,15 @@ export interface ResolveDocumentSyncConflictRequest {
   direction: "pull" | "push";
 }
 
+/** `create-document` also reports the workspace it resolved the page into. */
+export interface DocumentCreateResult extends Document {
+  spaceId: string;
+}
+
 export interface DocumentCreateRequest {
   id?: string;
   spaceId?: string;
+  spaceName?: string;
   title?: string;
   parentId?: string | null;
   content?: string;
