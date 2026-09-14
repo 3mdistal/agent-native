@@ -193,6 +193,7 @@ import {
   getRun,
   abortRun,
   abortRunDurably,
+  abortTurnByRefDurably,
   abortTurnDurably,
   tryClaimRunSlot,
   isHostedRuntime,
@@ -11894,6 +11895,7 @@ export {
   getRun,
   abortRun,
   abortRunDurably,
+  abortTurnByRefDurably,
   abortTurnDurably,
   subscribeToRun,
 };

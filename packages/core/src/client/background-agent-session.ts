@@ -1,6 +1,6 @@
 import type { AgentChatAttachment, AgentChatScope } from "../agent/types.js";
-import type { ReasoningEffort } from "../shared/reasoning-effort.js";
 import { appendAgentChatContextToMessage } from "../shared/agent-chat-context.js";
+import type { ReasoningEffort } from "../shared/reasoning-effort.js";
 import { requestAgentChatThreadOpen } from "./agent-chat.js";
 import { agentNativePath } from "./api-path.js";
 
@@ -8,6 +8,7 @@ export type BackgroundAgentSessionStatus =
   | "queued"
   | "running"
   | "completed"
+  | "truncated"
   | "errored"
   | "aborted"
   | "unavailable";
@@ -155,8 +156,10 @@ export function startBackgroundAgentSession(
     completion,
     status: () =>
       getBackgroundAgentSessionStatus({ operationId, threadId, turnId }),
-    cancel: (reason) =>
-      cancelBackgroundAgentSession({ threadId, turnId, reason }),
+    cancel: async (reason) => {
+      await accepted;
+      await cancelBackgroundAgentSession({ threadId, turnId, reason });
+    },
     open: (openOptions) =>
       requestAgentChatThreadOpen({
         threadId,
@@ -168,7 +171,10 @@ export function startBackgroundAgentSession(
 export async function getBackgroundAgentSessionStatus(
   receipt: BackgroundAgentSessionReceipt,
 ): Promise<BackgroundAgentSessionSnapshot> {
-  const params = new URLSearchParams({ threadId: receipt.threadId });
+  const params = new URLSearchParams({
+    threadId: receipt.threadId,
+    turnId: receipt.turnId,
+  });
   const response = await fetch(
     `${agentNativePath("/_agent-native/agent-chat/runs/latest")}?${params}`,
     { credentials: "same-origin", cache: "no-store" },
@@ -187,6 +193,7 @@ export async function getBackgroundAgentSessionStatus(
     "queued",
     "running",
     "completed",
+    "truncated",
     "errored",
     "aborted",
   ].includes(rawStatus)
@@ -219,28 +226,7 @@ export async function cancelBackgroundAgentSession(options: {
       body: JSON.stringify({ threadId: options.threadId, reason }),
     },
   );
-  if (!turnResponse.ok && turnResponse.status !== 404) {
+  if (!turnResponse.ok) {
     throw await responseError(turnResponse);
-  }
-
-  const status = await getBackgroundAgentSessionStatus({
-    operationId: options.turnId,
-    threadId: options.threadId,
-    turnId: options.turnId,
-  });
-  if (status.status !== "running" || !status.runId) return;
-  const runResponse = await fetch(
-    agentNativePath(
-      `/_agent-native/agent-chat/runs/${encodeURIComponent(status.runId)}/abort`,
-    ),
-    {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason }),
-    },
-  );
-  if (!runResponse.ok && runResponse.status !== 404) {
-    throw await responseError(runResponse);
   }
 }

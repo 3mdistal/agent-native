@@ -2732,7 +2732,7 @@ export function resolveErroredRunTerminalEvent(run: {
 
 export async function getRunByThread(
   threadId: string,
-  options?: { includeTerminal?: boolean },
+  options?: { includeTerminal?: boolean; turnId?: string },
 ): Promise<{
   id: string;
   threadId: string;
@@ -2759,10 +2759,13 @@ export async function getRunByThread(
 } | null> {
   await ensureRunTables();
   const client = getDbExec();
-  const sql = options?.includeTerminal
-    ? `SELECT id, thread_id, turn_id, status, started_at, heartbeat_at, completed_at, last_progress_at, dispatch_mode, terminal_reason, diag_stage, error_code, in_flight_since FROM agent_runs WHERE thread_id = ? ORDER BY started_at DESC LIMIT 1`
-    : `SELECT id, thread_id, turn_id, status, started_at, heartbeat_at, completed_at, last_progress_at, dispatch_mode, terminal_reason, diag_stage, error_code, in_flight_since FROM agent_runs WHERE thread_id = ? AND status = 'running' ORDER BY started_at DESC LIMIT 1`;
-  const { rows } = await client.execute({ sql, args: [threadId] });
+  const turnClause = options?.turnId ? ` AND COALESCE(turn_id, id) = ?` : "";
+  const statusClause = options?.includeTerminal
+    ? ""
+    : ` AND status = 'running'`;
+  const sql = `SELECT id, thread_id, turn_id, status, started_at, heartbeat_at, completed_at, last_progress_at, dispatch_mode, terminal_reason, diag_stage, error_code, in_flight_since FROM agent_runs WHERE thread_id = ?${turnClause}${statusClause} ORDER BY CASE WHEN dispatch_mode = 'turn-abort' THEN 1 ELSE 0 END, started_at DESC LIMIT 1`;
+  const args = options?.turnId ? [threadId, options.turnId] : [threadId];
+  const { rows } = await client.execute({ sql, args });
   if (rows.length === 0) return null;
   const r = rows[0] as {
     id: string;

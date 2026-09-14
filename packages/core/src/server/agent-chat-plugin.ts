@@ -84,6 +84,7 @@ import {
   toolCallCacheKey,
   getActiveRunForThreadAsync,
   abortRunDurably,
+  abortTurnByRefDurably,
   abortTurnDurably,
   subscribeToRun,
   type ActionEntry,
@@ -96,7 +97,7 @@ import {
   callerHasRunAccess,
   callerHasThreadAccess,
 } from "../agent/run-ownership.js";
-import { markTurnAborted, readBackgroundRunClaim } from "../agent/run-store.js";
+import { readBackgroundRunClaim } from "../agent/run-store.js";
 import {
   buildCurrentTimeUserContext,
   buildRuntimeContextPrompt,
@@ -5639,7 +5640,7 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
               setResponseStatus(event, 404);
               return { error: "Run not found" };
             }
-            await markTurnAborted(threadId, turnId, reason);
+            await abortTurnByRefDurably(threadId, turnId, reason);
             return { ok: true };
           }
 
@@ -5832,6 +5833,7 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
           if (method === "GET" && url.includes("/runs/latest")) {
             const query = getQuery(event);
             const threadId = query.threadId ? String(query.threadId) : null;
+            const turnId = query.turnId ? String(query.turnId) : undefined;
             if (!threadId) {
               setResponseStatus(event, 400);
               return { error: "threadId query parameter is required" };
@@ -5843,6 +5845,7 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
             const { getRunByThread } = await import("../agent/run-store.js");
             const run = await getRunByThread(threadId, {
               includeTerminal: true,
+              ...(turnId ? { turnId } : {}),
             });
             if (!run) {
               return { threadId, status: "queued" };

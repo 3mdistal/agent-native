@@ -102,7 +102,8 @@ describe("background agent sessions", () => {
   });
 
   it("reports terminal status and keeps inaccessible sessions indistinguishable from missing ones", async () => {
-    vi.mocked(fetch)
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
       .mockResolvedValueOnce(
         Response.json({
           status: "completed",
@@ -127,16 +128,15 @@ describe("background agent sessions", () => {
       ...receipt,
       status: "unavailable",
     });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/_agent-native/agent-chat/runs/latest?threadId=thread-3&turnId=operation-3",
+      "/_agent-native/agent-chat/runs/latest?threadId=thread-3&turnId=operation-3",
+    ]);
   });
 
-  it("marks the turn aborted before resolving and aborts an already claimed run", async () => {
+  it("atomically aborts the logical turn through the shared run manager", async () => {
     const fetchMock = vi.mocked(fetch);
-    fetchMock
-      .mockResolvedValueOnce(Response.json({ ok: true }))
-      .mockResolvedValueOnce(
-        Response.json({ status: "running", runId: "run-4" }),
-      )
-      .mockResolvedValueOnce(Response.json({ ok: true }));
+    fetchMock.mockResolvedValueOnce(Response.json({ ok: true }));
 
     await cancelBackgroundAgentSession({
       threadId: "thread-4",
@@ -146,8 +146,35 @@ describe("background agent sessions", () => {
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "/_agent-native/agent-chat/runs/turn/operation-4/abort",
-      "/_agent-native/agent-chat/runs/latest?threadId=thread-4",
-      "/_agent-native/agent-chat/runs/run-4/abort",
+    ]);
+  });
+
+  it("waits for route acceptance before cancelling a newly created thread", async () => {
+    let acceptStart!: (response: Response) => void;
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            acceptStart = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(Response.json({ ok: true }));
+
+    const handle = startBackgroundAgentSession({
+      message: "Start then stop",
+      operationId: "operation-5",
+      threadId: "thread-5",
+    });
+    const cancellation = handle.cancel("dismissed");
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    acceptStart(streamResponse());
+    await cancellation;
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/_agent-native/agent-chat",
+      "/_agent-native/agent-chat/runs/turn/operation-5/abort",
     ]);
   });
 });
