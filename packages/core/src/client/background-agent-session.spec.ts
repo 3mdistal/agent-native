@@ -284,8 +284,8 @@ describe("background agent sessions", () => {
         "Background agent session acknowledgement timed out",
       );
       await expect(handle.status()).resolves.toMatchObject({
-        status: "errored",
-        terminalReason: "Background agent session acknowledgement timed out",
+        status: "unavailable",
+        transportError: "Background agent session acknowledgement timed out",
       });
     } finally {
       vi.useRealTimers();
@@ -375,6 +375,10 @@ describe("background agent sessions", () => {
       name: "network rejection",
       response: () => Promise.reject(new Error("network unavailable")),
       message: "network unavailable",
+      expected: {
+        status: "unavailable",
+        transportError: "network unavailable",
+      },
     },
     {
       name: "non-OK response",
@@ -384,31 +388,39 @@ describe("background agent sessions", () => {
         ),
       message:
         "Background agent session was rejected (HTTP 503): dispatch unavailable",
+      expected: {
+        status: "errored",
+        terminalReason:
+          "Background agent session was rejected (HTTP 503): dispatch unavailable",
+      },
     },
-  ])("reports an errored status after $name", async ({ response, message }) => {
-    vi.mocked(fetch)
-      .mockImplementationOnce(response)
-      .mockResolvedValueOnce(Response.json({}, { status: 404 }));
-    const handle = startBackgroundAgentSession({
-      message: "Start and fail",
-      operationId: "operation-failed",
-      threadId: "thread-failed",
-    });
+  ])(
+    "reports an honest status after $name",
+    async ({ response, message, expected }) => {
+      vi.mocked(fetch)
+        .mockImplementationOnce(response)
+        .mockResolvedValueOnce(Response.json({}, { status: 404 }));
+      const handle = startBackgroundAgentSession({
+        message: "Start and fail",
+        operationId: "operation-failed",
+        threadId: "thread-failed",
+      });
 
-    await expect(handle.accepted).rejects.toThrow(message);
-    await expect(handle.status()).resolves.toEqual({
-      operationId: "operation-failed",
-      threadId: "thread-failed",
-      turnId: handle.turnId,
-      status: "errored",
-      terminalReason: message,
-    });
-  });
+      await expect(handle.accepted).rejects.toThrow(message);
+      await expect(handle.status()).resolves.toEqual({
+        operationId: "operation-failed",
+        threadId: "thread-failed",
+        turnId: handle.turnId,
+        ...expected,
+      });
+    },
+  );
 
-  it("reports durable status when the start acknowledgement is lost", async () => {
+  it("keeps transport loss indeterminate until durable state appears", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock
       .mockRejectedValueOnce(new Error("connection reset after dispatch"))
+      .mockResolvedValueOnce(Response.json({}, { status: 404 }))
       .mockResolvedValueOnce(
         Response.json({ status: "running", runId: "run-durable" }),
       );
@@ -421,6 +433,13 @@ describe("background agent sessions", () => {
     await expect(handle.accepted).rejects.toThrow(
       "connection reset after dispatch",
     );
+    await expect(handle.status()).resolves.toEqual({
+      operationId: "operation-lost-ack",
+      threadId: "thread-lost-ack",
+      turnId: handle.turnId,
+      status: "unavailable",
+      transportError: "connection reset after dispatch",
+    });
     await expect(handle.status()).resolves.toEqual({
       operationId: "operation-lost-ack",
       threadId: "thread-lost-ack",

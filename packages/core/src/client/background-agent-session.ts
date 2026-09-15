@@ -48,6 +48,8 @@ export interface BackgroundAgentSessionSnapshot extends BackgroundAgentSessionRe
   status: BackgroundAgentSessionStatus;
   runId?: string;
   terminalReason?: string | null;
+  /** Transport failure while durable run state is still unknown. */
+  transportError?: string;
 }
 
 export interface BackgroundAgentSessionHandle extends BackgroundAgentSessionReceipt {
@@ -235,13 +237,21 @@ export function startBackgroundAgentSession(
       });
       if (snapshot.status !== "unavailable") return snapshot;
       if (routeError) {
-        return {
-          operationId,
-          threadId,
-          turnId,
-          status: "errored",
-          terminalReason: routeError.message,
-        };
+        return routeError instanceof BackgroundAgentSessionHttpError
+          ? {
+              operationId,
+              threadId,
+              turnId,
+              status: "errored",
+              terminalReason: routeError.message,
+            }
+          : {
+              operationId,
+              threadId,
+              turnId,
+              status: "unavailable",
+              transportError: routeError.message,
+            };
       }
       return !routeAccepted
         ? { operationId, threadId, turnId, status: "queued" }
