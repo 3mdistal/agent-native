@@ -292,7 +292,7 @@ describe("background agent sessions", () => {
     }
   });
 
-  it("accepts a retry when the exact durable turn is already running", async () => {
+  it("accepts a retry without fabricating stream completion for the durable turn", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock
       .mockResolvedValueOnce(
@@ -303,6 +303,13 @@ describe("background agent sessions", () => {
       )
       .mockResolvedValueOnce(
         Response.json({ status: "running", runId: "run-existing" }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          status: "completed",
+          runId: "run-existing",
+          terminalReason: "done",
+        }),
       );
 
     const handle = startBackgroundAgentSession({
@@ -316,9 +323,17 @@ describe("background agent sessions", () => {
       threadId: "thread-retry",
       turnId: handle.turnId,
     });
-    await expect(handle.completion).resolves.toBeUndefined();
+    await expect(handle.completion).rejects.toThrow(
+      "reattached to a durable turn without a response stream",
+    );
+    await expect(handle.status()).resolves.toMatchObject({
+      status: "completed",
+      runId: "run-existing",
+      terminalReason: "done",
+    });
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "/_agent-native/agent-chat",
+      `/_agent-native/agent-chat/runs/latest?threadId=thread-retry&turnId=${handle.turnId}`,
       `/_agent-native/agent-chat/runs/latest?threadId=thread-retry&turnId=${handle.turnId}`,
     ]);
   });

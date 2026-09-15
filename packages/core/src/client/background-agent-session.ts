@@ -55,7 +55,7 @@ export interface BackgroundAgentSessionSnapshot extends BackgroundAgentSessionRe
 export interface BackgroundAgentSessionHandle extends BackgroundAgentSessionReceipt {
   /** Resolves once the shared agent-chat route accepts the run. */
   accepted: Promise<BackgroundAgentSessionReceipt>;
-  /** Resolves when the response stream closes. The durable run survives this browser surface. */
+  /** Resolves when this request's response stream closes. Reattached requests have no stream. */
   completion: Promise<void>;
   status(): Promise<BackgroundAgentSessionSnapshot>;
   cancel(reason?: string): Promise<void>;
@@ -187,7 +187,11 @@ export function startBackgroundAgentSession(
           });
           if (snapshot.status !== "unavailable") {
             routeAccepted = true;
-            resolveCompletion();
+            rejectCompletion(
+              new Error(
+                "Background agent session reattached to a durable turn without a response stream; use status() to follow it",
+              ),
+            );
             return { operationId, threadId, turnId };
           }
         }
