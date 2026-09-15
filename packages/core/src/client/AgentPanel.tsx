@@ -27,7 +27,7 @@ import {
   IconMessageDots,
   IconTerminal2,
   IconLayoutSidebarRightCollapse,
-  IconLayoutSidebarRightExpand,
+  IconLayoutSidebarRight,
   IconLayoutGrid,
   IconCheck,
   IconPlus,
@@ -1722,11 +1722,12 @@ function AgentPanelInner({
                         event,
                         closeHeaderMenuForOverlay,
                         () => setShareFromMenuOpen(true),
+                        "timeout",
                       )
                     }
                   >
                     <IconShare3 size={14} className="shrink-0" />
-                    Share
+                    {t("agentChat.share.share", { defaultValue: "Share" })}
                   </DropdownMenuItem>
                 );
               })()}
@@ -4650,12 +4651,7 @@ export function AgentToggleButton({
             className,
           )}
         >
-          {icon ??
-            (open ? (
-              <IconLayoutSidebarRightCollapse size={18} aria-hidden />
-            ) : (
-              <IconLayoutSidebarRightExpand size={18} aria-hidden />
-            ))}
+          {icon ?? <IconLayoutSidebarRight size={18} aria-hidden />}
         </button>
       }
       content={t("agentPanel.toggleAgent")}
