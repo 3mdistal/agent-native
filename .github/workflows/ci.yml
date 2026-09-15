@@ -242,8 +242,8 @@ jobs:
 
       - name: Install Playwright Chromium for browser-backed unit tests
         run: |
-          pnpm exec playwright install --only-shell chromium
-          pnpm --filter @agent-native/creative-context exec playwright install --only-shell chromium
+          pnpm exec playwright install --only-shell --force chromium
+          pnpm --filter @agent-native/creative-context exec playwright install --only-shell --force chromium
 
       - name: Run core fast-test shard
         if: matrix.coreShard != ''
@@ -321,8 +321,8 @@ jobs:
 
       - name: Install Playwright Chromium for browser-backed unit tests
         run: |
-          pnpm exec playwright install --only-shell chromium
-          pnpm --filter @agent-native/creative-context exec playwright install --only-shell chromium
+          pnpm exec playwright install --only-shell --force chromium
+          pnpm --filter @agent-native/creative-context exec playwright install --only-shell --force chromium
 
       - name: Run core fast-test shard
         if: matrix.coreShard != ''
@@ -605,8 +605,8 @@ jobs:
 
       - name: Install Playwright Chromium for browser-backed integration tests
         run: |
-          pnpm exec playwright install --only-shell chromium
-          pnpm --filter @agent-native/creative-context exec playwright install --only-shell chromium
+          pnpm exec playwright install --only-shell --force chromium
+          pnpm --filter @agent-native/creative-context exec playwright install --only-shell --force chromium
 
       - name: Run Core integration tests
         run: pnpm test:core-integration
