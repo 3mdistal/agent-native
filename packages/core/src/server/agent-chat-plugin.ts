@@ -5646,7 +5646,15 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
               setResponseStatus(event, 404);
               return { error: "Run not found" };
             }
-            await abortTurnByRefDurably(threadId, turnId, reason);
+            const outcome = await abortTurnByRefDurably(
+              threadId,
+              turnId,
+              reason,
+            );
+            if (outcome === "already_terminal") {
+              setResponseStatus(event, 409);
+              return { error: "Turn is already terminal" };
+            }
             return { ok: true };
           }
 

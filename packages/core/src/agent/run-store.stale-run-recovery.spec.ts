@@ -84,6 +84,7 @@ vi.mock("../server/self-dispatch.js", () => ({
 
 const {
   insertRun,
+  tryClaimRunSlot,
   claimBackgroundRun,
   getRunByThread,
   isTurnAborted,
@@ -240,7 +241,7 @@ describe("FIX 3 — stale-run reaper server-owned recovery (reapIfStale)", () =>
     expect((await readRow(runId))?.status).toBe("aborted");
   });
 
-  it("treats a turn-abort marker as authoritative only for an exact-turn lookup", async () => {
+  it("preserves a completed turn when cancellation arrives too late", async () => {
     currentClient = makeRawClient(true);
     const { runId, thread, turn } = ids();
     await insertRun(runId, thread, turn, { dispatchMode: "background" });
@@ -249,20 +250,49 @@ describe("FIX 3 — stale-run reaper server-owned recovery (reapIfStale)", () =>
         `UPDATE agent_runs SET status = 'completed', completed_at = ? WHERE id = ?`,
       )
       .run(Date.now(), runId);
-    await markTurnAborted(thread, turn);
+    expect(await markTurnAborted(thread, turn)).toBe("already_terminal");
 
     expect(
       await getRunByThread(thread, { includeTerminal: true, turnId: turn }),
-    ).toMatchObject({ status: "aborted", dispatchMode: "turn-abort" });
-    expect(
-      await getRunByThread(thread, { includeTerminal: true }),
     ).toMatchObject({ id: runId, status: "completed" });
+  });
 
-    const lateRunId = `${runId}-late`;
-    await insertRun(lateRunId, thread, turn, { dispatchMode: "background" });
-    expect(
-      await getRunByThread(thread, { includeTerminal: true, turnId: turn }),
-    ).toMatchObject({ status: "aborted", dispatchMode: "turn-abort" });
+  it("prevents a run claim after cancellation wins the thread lock", async () => {
+    currentClient = makeRawClient(true);
+    const { runId, thread, turn } = ids();
+    expect(await markTurnAborted(thread, turn)).toBe("aborted");
+
+    await expect(
+      tryClaimRunSlot(thread, runId, undefined, { turnId: turn }),
+    ).resolves.toMatchObject({
+      claimed: false,
+      activeRunId: null,
+      turnAborted: true,
+    });
+    expect(await readRow(runId)).toBeUndefined();
+  });
+
+  it("keeps an abort marker across a terminal continuation boundary", async () => {
+    currentClient = makeRawClient(true);
+    const { runId, thread, turn } = ids();
+    await insertRun(runId, thread, turn, { dispatchMode: "background" });
+    await pglite
+      .prepare(
+        `UPDATE agent_runs SET status = 'truncated', terminal_reason = 'loop_limit', completed_at = ? WHERE id = ?`,
+      )
+      .run(Date.now(), runId);
+    await pglite
+      .prepare(
+        `INSERT INTO agent_run_events (run_id, seq, event_at, event_data) VALUES (?, ?, ?, ?)`,
+      )
+      .run(runId, 1, Date.now(), JSON.stringify({ type: "loop_limit" }));
+
+    expect(await markTurnAborted(thread, turn)).toBe("aborted");
+    await expect(
+      tryClaimRunSlot(thread, `${runId}-successor`, undefined, {
+        turnId: turn,
+      }),
+    ).resolves.toMatchObject({ turnAborted: true, claimed: false });
   });
 
   it("escalates Stop on one chunk to every run of the same turn", async () => {

@@ -3221,13 +3221,13 @@ export async function abortTurnByRefDurably(
   threadId: string,
   turnId: string,
   reason: string = "user",
-): Promise<void> {
+): Promise<"aborted" | "already_terminal"> {
   for (const run of activeRuns.values()) {
     if (run.threadId === threadId && run.turnId === turnId) {
       abortInMemoryRun(run, reason);
     }
   }
-  await markTurnAborted(threadId, turnId, reason);
+  return markTurnAborted(threadId, turnId, reason);
 }
 
 /**

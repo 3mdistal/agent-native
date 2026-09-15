@@ -140,6 +140,7 @@ export function startBackgroundAgentSession(
       ? undefined
       : normalizeAgentActionScope(options.actionScope);
   let routeAccepted = false;
+  let routeResponded = false;
   let routeError: Error | undefined;
   let resolveCompletion!: () => void;
   let rejectCompletion!: (error: unknown) => void;
@@ -178,21 +179,27 @@ export function startBackgroundAgentSession(
     }),
   })
     .then(async (response) => {
+      routeResponded = true;
       if (!response.ok) {
         if (response.status === 409) {
-          const snapshot = await getBackgroundAgentSessionStatus({
-            operationId,
-            threadId,
-            turnId,
-          });
-          if (snapshot.status !== "unavailable") {
-            routeAccepted = true;
-            rejectCompletion(
-              new Error(
-                "Background agent session reattached to a durable turn without a response stream; use status() to follow it",
-              ),
-            );
-            return { operationId, threadId, turnId };
+          const deadline =
+            Date.now() + BACKGROUND_SESSION_ACCEPTANCE_TIMEOUT_MS;
+          while (Date.now() < deadline) {
+            const snapshot = await getBackgroundAgentSessionStatus({
+              operationId,
+              threadId,
+              turnId,
+            });
+            if (snapshot.status !== "unavailable") {
+              routeAccepted = true;
+              rejectCompletion(
+                new Error(
+                  "Background agent session reattached to a durable turn without a response stream; use status() to follow it",
+                ),
+              );
+              return { operationId, threadId, turnId };
+            }
+            await new Promise<void>((resolve) => setTimeout(resolve, 25));
           }
         }
         throw await responseError(response);
@@ -210,7 +217,7 @@ export function startBackgroundAgentSession(
   const acceptanceTimeout = new Promise<BackgroundAgentSessionReceipt>(
     (_resolve, reject) => {
       acceptanceTimer = setTimeout(() => {
-        if (routeAccepted || routeError) return;
+        if (routeAccepted || routeResponded || routeError) return;
         routeError = new Error(
           "Background agent session acknowledgement timed out",
         );
@@ -260,14 +267,9 @@ export function startBackgroundAgentSession(
           await cancelBackgroundAgentSession({ threadId, turnId, reason });
           return;
         } catch (error) {
-          if (
-            !(error instanceof BackgroundAgentSessionHttpError) ||
-            error.status !== 404 ||
-            routeAccepted ||
-            Date.now() >= deadline
-          ) {
-            throw routeError ?? error;
-          }
+          if (!(error instanceof BackgroundAgentSessionHttpError)) throw error;
+          if (error.status !== 404 || routeAccepted) throw error;
+          if (Date.now() >= deadline) throw routeError ?? error;
           if (routeError) {
             const snapshot = await getBackgroundAgentSessionStatus({
               operationId,

@@ -339,23 +339,57 @@ describe("background agent sessions", () => {
   });
 
   it("rejects a 409 when no matching durable turn exists", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(
-        Response.json(
-          { error: "Run already in progress for this thread" },
-          { status: 409 },
-        ),
-      )
-      .mockResolvedValueOnce(Response.json({}, { status: 404 }));
-    const handle = startBackgroundAgentSession({
-      message: "Conflicting delivery",
-      operationId: "operation-conflict",
-      threadId: "thread-conflict",
-    });
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(
+          Response.json(
+            { error: "Run already in progress for this thread" },
+            { status: 409 },
+          ),
+        )
+        .mockResolvedValue(Response.json({}, { status: 404 }));
+      const handle = startBackgroundAgentSession({
+        message: "Conflicting delivery",
+        operationId: "operation-conflict",
+        threadId: "thread-conflict",
+      });
 
-    await expect(handle.accepted).rejects.toThrow(
-      "Background agent session was rejected (HTTP 409)",
-    );
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(handle.accepted).rejects.toThrow(
+        "Background agent session was rejected (HTTP 409)",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for exact durable identity when a duplicate precedes thread visibility", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(Response.json({}, { status: 409 }))
+        .mockResolvedValueOnce(Response.json({}, { status: 404 }))
+        .mockResolvedValueOnce(Response.json({}, { status: 404 }))
+        .mockResolvedValueOnce(
+          Response.json({ status: "running", runId: "run-late-visible" }),
+        );
+      const handle = startBackgroundAgentSession({
+        message: "Retry during thread creation",
+        operationId: "operation-late-visible",
+        threadId: "thread-late-visible",
+      });
+
+      await vi.advanceTimersByTimeAsync(50);
+      await expect(handle.accepted).resolves.toMatchObject({
+        operationId: "operation-late-visible",
+      });
+      await expect(handle.completion).rejects.toThrow(
+        "reattached to a durable turn without a response stream",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("cancels a durable turn after its start acknowledgement is lost", async () => {
@@ -383,6 +417,26 @@ describe("background agent sessions", () => {
       `/_agent-native/agent-chat/runs/latest?threadId=thread-cancel-lost-ack&turnId=${handle.turnId}`,
       `/_agent-native/agent-chat/runs/turn/${handle.turnId}/abort`,
     ]);
+  });
+
+  it("reports an already-terminal cancel instead of an older start transport error", async () => {
+    vi.mocked(fetch)
+      .mockRejectedValueOnce(new Error("connection reset after dispatch"))
+      .mockResolvedValueOnce(
+        Response.json({ error: "Turn is already terminal" }, { status: 409 }),
+      );
+    const handle = startBackgroundAgentSession({
+      message: "Cancel after completion",
+      operationId: "operation-late-cancel",
+      threadId: "thread-late-cancel",
+    });
+    await expect(handle.accepted).rejects.toThrow(
+      "connection reset after dispatch",
+    );
+
+    await expect(handle.cancel("dismissed")).rejects.toThrow(
+      "Background agent session was rejected (HTTP 409): Turn is already terminal",
+    );
   });
 
   it("keeps immediate cancellation pending for the full acceptance lifecycle", async () => {

@@ -1177,6 +1177,7 @@ export async function tryClaimRunSlot(
   claimed: boolean;
   activeRunId: string | null;
   completedRunId?: string;
+  turnAborted?: boolean;
 }> {
   await ensureRunTables();
   const client = getDbExec();
@@ -1192,6 +1193,13 @@ export async function tryClaimRunSlot(
       sql: "SELECT pg_advisory_xact_lock(hashtextextended(?, 0::bigint))",
       args: [`agent-native:run-slot:${threadId}`],
     });
+    const abortMarker = await tx.execute({
+      sql: `SELECT id FROM agent_runs WHERE thread_id = ? AND turn_id = ? AND dispatch_mode = 'turn-abort' AND status = 'aborted' LIMIT 1`,
+      args: [threadId, turnId],
+    });
+    if (abortMarker.rows.length > 0) {
+      return { claimed: false, activeRunId: null, turnAborted: true };
+    }
     const explicitCutoff = typeof maxStaleMs === "number";
     const active = await tx.execute({
       sql: `SELECT id FROM agent_runs
@@ -2449,45 +2457,92 @@ export async function markTurnAborted(
   threadId: string,
   turnId: string,
   reason: string = "user",
-): Promise<void> {
+): Promise<"aborted" | "already_terminal"> {
   await ensureRunTables();
   const now = Date.now();
   const client = getDbExec();
-  await client.execute({
-    sql: `INSERT INTO agent_runs (id, thread_id, status, abort_reason, started_at, completed_at, heartbeat_at, last_progress_at, turn_id, terminal_reason, dispatch_mode) VALUES (?, ?, 'aborted', ?, ?, ?, ?, ?, ?, ?, 'turn-abort'), (?, ?, 'aborted', ?, ?, ?, ?, ?, ?, ?, 'turn-abort') ON CONFLICT (id) DO NOTHING`,
-    args: [
-      turnAbortMarkerRunId(threadId, turnId),
-      threadId,
-      reason,
-      now,
-      now,
-      now,
-      now,
-      turnId,
-      `aborted:${reason}`,
-      `turn-abort-${turnId}`,
-      threadId,
-      reason,
-      now,
-      now,
-      now,
-      now,
-      turnId,
-      `aborted:${reason}`,
-    ],
+  if (!client.transaction) {
+    throw new Error("Atomic turn cancellation requires transaction support");
+  }
+  const runIds: string[] = [];
+  const outcome = await client.transaction(async (tx) => {
+    await tx.execute({
+      sql: "SELECT pg_advisory_xact_lock(hashtextextended(?, 0::bigint))",
+      args: [`agent-native:run-slot:${threadId}`],
+    });
+    const running = await tx.execute({
+      sql: `SELECT id FROM agent_runs WHERE thread_id = ? AND turn_id = ? AND status = 'running' AND dispatch_mode IS DISTINCT FROM 'turn-abort' FOR UPDATE`,
+      args: [threadId, turnId],
+    });
+    runIds.push(
+      ...running.rows
+        .map((row) => String((row as { id?: unknown }).id ?? ""))
+        .filter(Boolean),
+    );
+    if (runIds.length === 0) {
+      const existing = await tx.execute({
+        sql: `SELECT id, terminal_reason,
+                     EXISTS (
+                       SELECT 1 FROM agent_run_events
+                       WHERE agent_run_events.run_id = agent_runs.id
+                         AND (
+                           event_data LIKE ?
+                           OR event_data LIKE ?
+                         )
+                     ) AS continuation_pending
+              FROM agent_runs
+              WHERE thread_id = ? AND turn_id = ?
+                AND dispatch_mode IS DISTINCT FROM 'turn-abort'
+              ORDER BY started_at DESC LIMIT 1 FOR UPDATE`,
+        args: [
+          '{"type":"loop_limit"%',
+          '{"type":"auto_continue"%',
+          threadId,
+          turnId,
+        ],
+      });
+      const latest = existing.rows[0] as
+        | { terminal_reason?: string | null; continuation_pending?: boolean }
+        | undefined;
+      if (
+        latest &&
+        latest.continuation_pending !== true &&
+        !isContinuationTerminalReason(latest.terminal_reason ?? "")
+      ) {
+        return "already_terminal" as const;
+      }
+    } else {
+      await tx.execute({
+        sql: `UPDATE agent_runs SET status = 'aborted', abort_reason = ?, completed_at = ?, terminal_reason = ? WHERE thread_id = ? AND turn_id = ? AND status = 'running'`,
+        args: [reason, now, `aborted:${reason}`, threadId, turnId],
+      });
+    }
+    await tx.execute({
+      sql: `INSERT INTO agent_runs (id, thread_id, status, abort_reason, started_at, completed_at, heartbeat_at, last_progress_at, turn_id, terminal_reason, dispatch_mode) VALUES (?, ?, 'aborted', ?, ?, ?, ?, ?, ?, ?, 'turn-abort'), (?, ?, 'aborted', ?, ?, ?, ?, ?, ?, ?, 'turn-abort') ON CONFLICT (id) DO NOTHING`,
+      args: [
+        turnAbortMarkerRunId(threadId, turnId),
+        threadId,
+        reason,
+        now,
+        now,
+        now,
+        now,
+        turnId,
+        `aborted:${reason}`,
+        `turn-abort-${turnId}`,
+        threadId,
+        reason,
+        now,
+        now,
+        now,
+        now,
+        turnId,
+        `aborted:${reason}`,
+      ],
+    });
+    return "aborted" as const;
   });
-  const { rows } = await client.execute({
-    sql: `SELECT id FROM agent_runs WHERE thread_id = ? AND turn_id = ? AND status = 'running'`,
-    args: [threadId, turnId],
-  });
-  const runIds = rows
-    .map((row) => String((row as { id?: unknown }).id ?? ""))
-    .filter(Boolean);
-  if (runIds.length === 0) return;
-  await client.execute({
-    sql: `UPDATE agent_runs SET status = 'aborted', abort_reason = ?, completed_at = ?, terminal_reason = ? WHERE thread_id = ? AND turn_id = ? AND status = 'running'`,
-    args: [reason, Date.now(), `aborted:${reason}`, threadId, turnId],
-  });
+  if (outcome === "already_terminal") return outcome;
   await Promise.all(
     runIds.map((runId) =>
       safeAppendTerminalRunEvent(
@@ -2500,6 +2555,7 @@ export async function markTurnAborted(
       ),
     ),
   );
+  return outcome;
 }
 
 /**

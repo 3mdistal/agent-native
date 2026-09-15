@@ -10616,6 +10616,9 @@ export function createProductionAgentHandler(
           ? { dispatchPayload: JSON.stringify(body) }
           : {}),
       });
+      if (slot.turnAborted) {
+        return { ok: true, stopped: true };
+      }
       if (slot.completedRunId) {
         const stream = await replayCompletedTurn(threadId, effectiveTurnId);
         if (!stream) {
