@@ -254,7 +254,7 @@ export function startBackgroundAgentSession(
         : snapshot;
     },
     cancel: async (reason) => {
-      const deadline = Date.now() + 5_000;
+      const deadline = Date.now() + BACKGROUND_SESSION_ACCEPTANCE_TIMEOUT_MS;
       for (;;) {
         try {
           await cancelBackgroundAgentSession({ threadId, turnId, reason });

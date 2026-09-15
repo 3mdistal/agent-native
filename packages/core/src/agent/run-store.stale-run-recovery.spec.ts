@@ -85,6 +85,7 @@ vi.mock("../server/self-dispatch.js", () => ({
 const {
   insertRun,
   claimBackgroundRun,
+  getRunByThread,
   isTurnAborted,
   markTurnAborted,
   reapIfStale,
@@ -237,6 +238,31 @@ describe("FIX 3 — stale-run reaper server-owned recovery (reapIfStale)", () =>
 
     expect(await isTurnAborted(thread, turn)).toBe(true);
     expect((await readRow(runId))?.status).toBe("aborted");
+  });
+
+  it("treats a turn-abort marker as authoritative only for an exact-turn lookup", async () => {
+    currentClient = makeRawClient(true);
+    const { runId, thread, turn } = ids();
+    await insertRun(runId, thread, turn, { dispatchMode: "background" });
+    await pglite
+      .prepare(
+        `UPDATE agent_runs SET status = 'completed', completed_at = ? WHERE id = ?`,
+      )
+      .run(Date.now(), runId);
+    await markTurnAborted(thread, turn);
+
+    expect(
+      await getRunByThread(thread, { includeTerminal: true, turnId: turn }),
+    ).toMatchObject({ status: "aborted", dispatchMode: "turn-abort" });
+    expect(
+      await getRunByThread(thread, { includeTerminal: true }),
+    ).toMatchObject({ id: runId, status: "completed" });
+
+    const lateRunId = `${runId}-late`;
+    await insertRun(lateRunId, thread, turn, { dispatchMode: "background" });
+    expect(
+      await getRunByThread(thread, { includeTerminal: true, turnId: turn }),
+    ).toMatchObject({ status: "aborted", dispatchMode: "turn-abort" });
   });
 
   it("escalates Stop on one chunk to every run of the same turn", async () => {

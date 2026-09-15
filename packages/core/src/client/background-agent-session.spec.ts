@@ -385,6 +385,52 @@ describe("background agent sessions", () => {
     ]);
   });
 
+  it("keeps immediate cancellation pending for the full acceptance lifecycle", async () => {
+    vi.useFakeTimers();
+    try {
+      let acknowledgeStart!: () => void;
+      let acknowledged = false;
+      const fetchMock = vi.mocked(fetch).mockImplementation((input) => {
+        const url = String(input);
+        if (url === "/_agent-native/agent-chat") {
+          return new Promise<Response>((resolve) => {
+            acknowledgeStart = () => {
+              acknowledged = true;
+              resolve(streamResponse());
+            };
+          });
+        }
+        if (url.includes("/runs/latest?")) {
+          return Promise.resolve(Response.json({}, { status: 404 }));
+        }
+        return Promise.resolve(
+          acknowledged
+            ? Response.json({ ok: true })
+            : Response.json({}, { status: 404 }),
+        );
+      });
+      const handle = startBackgroundAgentSession({
+        message: "Cancel before a delayed acknowledgement",
+        operationId: "operation-delayed-cancel",
+        threadId: "thread-delayed-cancel",
+      });
+
+      const cancellation = handle.cancel("dismissed");
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(
+        fetchMock.mock.calls.some(([url]) => String(url).includes("/abort")),
+      ).toBe(true);
+      acknowledgeStart();
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(cancellation).resolves.toBeUndefined();
+      await expect(handle.accepted).resolves.toMatchObject({
+        operationId: "operation-delayed-cancel",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     {
       name: "network rejection",
