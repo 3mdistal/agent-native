@@ -59,6 +59,11 @@ describe("background agent sessions", () => {
       operationId: "operation-1",
       threadId: "thread-1",
       scope: { type: "content-comment-ai", id: "comment-7" },
+      actionScope: {
+        kind: "content-comment-ai",
+        requestId: "request-7",
+        intent: "reply",
+      },
       mode: "act",
       model: "gpt-5.6-sol",
       engine: "openai",
@@ -79,12 +84,27 @@ describe("background agent sessions", () => {
       turnId: "operation-1",
       threadId: "thread-1",
       scope: { type: "content-comment-ai", id: "comment-7" },
+      actionScope: {
+        kind: "content-comment-ai",
+        requestId: "request-7",
+        intent: "reply",
+      },
       mode: "act",
       model: "gpt-5.6-sol",
       engine: "openai",
       effort: "medium",
       usageLabel: "content:comment-ai",
     });
+  });
+
+  it("rejects an invalid action scope before dispatch", () => {
+    expect(() =>
+      startBackgroundAgentSession({
+        message: "Reply to the comment",
+        actionScope: { invalid: undefined } as never,
+      }),
+    ).toThrow("actionScope must contain only JSON values");
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("atomically opens and prefills the exact background thread", () => {

@@ -1,4 +1,9 @@
-import type { AgentChatAttachment, AgentChatScope } from "../agent/types.js";
+import {
+  normalizeAgentActionScope,
+  type AgentActionScope,
+  type AgentChatAttachment,
+  type AgentChatScope,
+} from "../agent/types.js";
 import { appendAgentChatContextToMessage } from "../shared/agent-chat-context.js";
 import type { ReasoningEffort } from "../shared/reasoning-effort.js";
 import { requestAgentChatThreadOpen } from "./agent-chat.js";
@@ -22,6 +27,8 @@ export interface BackgroundAgentSessionStartOptions {
   threadId?: string;
   /** Explicit app/resource boundary persisted on the thread. */
   scope?: AgentChatScope | null;
+  /** App-defined boundary for the actions exposed to this turn. */
+  actionScope?: AgentActionScope;
   mode?: "act" | "plan";
   model?: string;
   engine?: string;
@@ -101,6 +108,10 @@ export function startBackgroundAgentSession(
   const operationId = requiredId(options.operationId, "background-operation");
   const threadId = requiredId(options.threadId, "background-thread");
   const turnId = operationId;
+  const actionScope =
+    options.actionScope === undefined
+      ? undefined
+      : normalizeAgentActionScope(options.actionScope);
   let resolveCompletion!: () => void;
   let rejectCompletion!: (error: unknown) => void;
   const completion = new Promise<void>((resolve, reject) => {
@@ -124,6 +135,7 @@ export function startBackgroundAgentSession(
       history: [],
       structuredHistory: [],
       ...(options.scope !== undefined ? { scope: options.scope } : {}),
+      ...(actionScope ? { actionScope } : {}),
       ...(options.mode ? { mode: options.mode } : {}),
       ...(options.model?.trim() ? { model: options.model.trim() } : {}),
       ...(options.engine?.trim() ? { engine: options.engine.trim() } : {}),
