@@ -237,21 +237,13 @@ export function startBackgroundAgentSession(
       });
       if (snapshot.status !== "unavailable") return snapshot;
       if (routeError) {
-        return routeError instanceof BackgroundAgentSessionHttpError
-          ? {
-              operationId,
-              threadId,
-              turnId,
-              status: "errored",
-              terminalReason: routeError.message,
-            }
-          : {
-              operationId,
-              threadId,
-              turnId,
-              status: "unavailable",
-              transportError: routeError.message,
-            };
+        return {
+          operationId,
+          threadId,
+          turnId,
+          status: "unavailable",
+          transportError: routeError.message,
+        };
       }
       return !routeAccepted
         ? { operationId, threadId, turnId, status: "queued" }

@@ -389,8 +389,8 @@ describe("background agent sessions", () => {
       message:
         "Background agent session was rejected (HTTP 503): dispatch unavailable",
       expected: {
-        status: "errored",
-        terminalReason:
+        status: "unavailable",
+        transportError:
           "Background agent session was rejected (HTTP 503): dispatch unavailable",
       },
     },
@@ -415,6 +415,40 @@ describe("background agent sessions", () => {
       });
     },
   );
+
+  it("prefers late durable completion over an HTTP acknowledgement failure", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        Response.json({ error: "gateway unavailable" }, { status: 503 }),
+      )
+      .mockResolvedValueOnce(Response.json({}, { status: 404 }))
+      .mockResolvedValueOnce(
+        Response.json({
+          status: "completed",
+          runId: "run-late-completion",
+          terminalReason: "done",
+        }),
+      );
+    const handle = startBackgroundAgentSession({
+      message: "Recover a late durable completion",
+      operationId: "operation-late-completion",
+      threadId: "thread-late-completion",
+    });
+    await expect(handle.accepted).rejects.toThrow(
+      "Background agent session was rejected (HTTP 503): gateway unavailable",
+    );
+
+    await expect(handle.status()).resolves.toMatchObject({
+      status: "unavailable",
+      transportError:
+        "Background agent session was rejected (HTTP 503): gateway unavailable",
+    });
+    await expect(handle.status()).resolves.toMatchObject({
+      status: "completed",
+      runId: "run-late-completion",
+      terminalReason: "done",
+    });
+  });
 
   it("keeps transport loss indeterminate until durable state appears", async () => {
     const fetchMock = vi.mocked(fetch);
