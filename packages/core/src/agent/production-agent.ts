@@ -921,6 +921,8 @@ export interface AgentActionSurfaceDetails {
   threadId?: string;
   mode: AgentExecutionMode;
   internalContinuation: boolean;
+  requestedTurnId?: string;
+  queuedMessageId?: string;
   actionScope?: Readonly<AgentActionScope>;
   availableActionNames: readonly string[];
 }
@@ -9774,6 +9776,12 @@ export function createProductionAgentHandler(
               threadId,
               mode: requestMode,
               internalContinuation: Boolean(internalContinuation),
+              ...(typeof requestTurnId === "string" && requestTurnId.trim()
+                ? { requestedTurnId: requestTurnId.trim() }
+                : {}),
+              ...(typeof queuedMessageId === "string" && queuedMessageId.trim()
+                ? { queuedMessageId: queuedMessageId.trim() }
+                : {}),
               ...(requestedActionScope
                 ? { actionScope: requestedActionScope }
                 : {}),

@@ -169,7 +169,7 @@ describe("background agent sessions", () => {
     ]);
   });
 
-  it("waits for route acceptance before cancelling a newly created thread", async () => {
+  it("cancels a newly created thread without waiting for route acceptance", async () => {
     let acceptStart!: (response: Response) => void;
     const fetchMock = vi.mocked(fetch);
     fetchMock
@@ -187,11 +187,11 @@ describe("background agent sessions", () => {
       threadId: "thread-5",
     });
     const cancellation = handle.cancel("dismissed");
-    await Promise.resolve();
-    expect(fetchMock).toHaveBeenCalledOnce();
+    await cancellation;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
 
     acceptStart(streamResponse());
-    await cancellation;
+    await handle.accepted;
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "/_agent-native/agent-chat",
       `/_agent-native/agent-chat/runs/turn/${handle.turnId}/abort`,
@@ -208,7 +208,7 @@ describe("background agent sessions", () => {
             acceptStart = resolve;
           }),
       )
-      .mockResolvedValueOnce(Response.json({}, { status: 404 }));
+      .mockResolvedValue(Response.json({}, { status: 404 }));
 
     const handle = startBackgroundAgentSession({
       message: "Start and inspect status",
@@ -221,7 +221,7 @@ describe("background agent sessions", () => {
       turnId: handle.turnId,
       status: "queued",
     });
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
 
     acceptStart(streamResponse());
     await handle.accepted;
@@ -231,6 +231,143 @@ describe("background agent sessions", () => {
       turnId: handle.turnId,
       status: "unavailable",
     });
+  });
+
+  it("reports a durable run before the start response acknowledges it", async () => {
+    let acceptStart!: (response: Response) => void;
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            acceptStart = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ status: "running", runId: "run-before-ack" }),
+      );
+    const handle = startBackgroundAgentSession({
+      message: "Inspect before acknowledgement",
+      operationId: "operation-before-ack",
+      threadId: "thread-before-ack",
+    });
+
+    await expect(handle.status()).resolves.toEqual({
+      operationId: "operation-before-ack",
+      threadId: "thread-before-ack",
+      turnId: handle.turnId,
+      status: "running",
+      runId: "run-before-ack",
+    });
+    acceptStart(streamResponse());
+    await handle.accepted;
+  });
+
+  it("stops reporting local queued state when acknowledgement times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.mocked(fetch);
+      fetchMock
+        .mockImplementationOnce(() => new Promise<Response>(() => {}))
+        .mockResolvedValue(Response.json({}, { status: 404 }));
+      const handle = startBackgroundAgentSession({
+        message: "Start without an acknowledgement",
+        operationId: "operation-timeout",
+        threadId: "thread-timeout",
+      });
+
+      await expect(handle.status()).resolves.toMatchObject({
+        status: "queued",
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(handle.accepted).rejects.toThrow(
+        "Background agent session acknowledgement timed out",
+      );
+      await expect(handle.status()).resolves.toMatchObject({
+        status: "errored",
+        terminalReason: "Background agent session acknowledgement timed out",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts a retry when the exact durable turn is already running", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(
+        Response.json(
+          { error: "Run already in progress for this thread" },
+          { status: 409 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ status: "running", runId: "run-existing" }),
+      );
+
+    const handle = startBackgroundAgentSession({
+      message: "Retry after a lost acknowledgement",
+      operationId: "operation-retry",
+      threadId: "thread-retry",
+    });
+
+    await expect(handle.accepted).resolves.toEqual({
+      operationId: "operation-retry",
+      threadId: "thread-retry",
+      turnId: handle.turnId,
+    });
+    await expect(handle.completion).resolves.toBeUndefined();
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/_agent-native/agent-chat",
+      `/_agent-native/agent-chat/runs/latest?threadId=thread-retry&turnId=${handle.turnId}`,
+    ]);
+  });
+
+  it("rejects a 409 when no matching durable turn exists", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(
+        Response.json(
+          { error: "Run already in progress for this thread" },
+          { status: 409 },
+        ),
+      )
+      .mockResolvedValueOnce(Response.json({}, { status: 404 }));
+    const handle = startBackgroundAgentSession({
+      message: "Conflicting delivery",
+      operationId: "operation-conflict",
+      threadId: "thread-conflict",
+    });
+
+    await expect(handle.accepted).rejects.toThrow(
+      "Background agent session was rejected (HTTP 409)",
+    );
+  });
+
+  it("cancels a durable turn after its start acknowledgement is lost", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockRejectedValueOnce(new Error("connection reset after dispatch"))
+      .mockResolvedValueOnce(Response.json({}, { status: 404 }))
+      .mockResolvedValueOnce(
+        Response.json({ status: "running", runId: "run-lost-ack" }),
+      )
+      .mockResolvedValueOnce(Response.json({ ok: true }));
+    const handle = startBackgroundAgentSession({
+      message: "Start then cancel after a lost acknowledgement",
+      operationId: "operation-cancel-lost-ack",
+      threadId: "thread-cancel-lost-ack",
+    });
+    await expect(handle.accepted).rejects.toThrow(
+      "connection reset after dispatch",
+    );
+
+    await handle.cancel("dismissed");
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/_agent-native/agent-chat",
+      `/_agent-native/agent-chat/runs/turn/${handle.turnId}/abort`,
+      `/_agent-native/agent-chat/runs/latest?threadId=thread-cancel-lost-ack&turnId=${handle.turnId}`,
+      `/_agent-native/agent-chat/runs/turn/${handle.turnId}/abort`,
+    ]);
   });
 
   it.each([
@@ -249,7 +386,9 @@ describe("background agent sessions", () => {
         "Background agent session was rejected (HTTP 503): dispatch unavailable",
     },
   ])("reports an errored status after $name", async ({ response, message }) => {
-    vi.mocked(fetch).mockImplementationOnce(response);
+    vi.mocked(fetch)
+      .mockImplementationOnce(response)
+      .mockResolvedValueOnce(Response.json({}, { status: 404 }));
     const handle = startBackgroundAgentSession({
       message: "Start and fail",
       operationId: "operation-failed",
@@ -263,6 +402,31 @@ describe("background agent sessions", () => {
       turnId: handle.turnId,
       status: "errored",
       terminalReason: message,
+    });
+  });
+
+  it("reports durable status when the start acknowledgement is lost", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockRejectedValueOnce(new Error("connection reset after dispatch"))
+      .mockResolvedValueOnce(
+        Response.json({ status: "running", runId: "run-durable" }),
+      );
+    const handle = startBackgroundAgentSession({
+      message: "Start despite a lost acknowledgement",
+      operationId: "operation-lost-ack",
+      threadId: "thread-lost-ack",
+    });
+
+    await expect(handle.accepted).rejects.toThrow(
+      "connection reset after dispatch",
+    );
+    await expect(handle.status()).resolves.toEqual({
+      operationId: "operation-lost-ack",
+      threadId: "thread-lost-ack",
+      turnId: handle.turnId,
+      status: "running",
+      runId: "run-durable",
     });
   });
 

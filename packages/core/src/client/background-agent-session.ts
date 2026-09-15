@@ -60,6 +60,8 @@ export interface BackgroundAgentSessionHandle extends BackgroundAgentSessionRece
   open(options?: { prefill?: string }): void;
 }
 
+const BACKGROUND_SESSION_ACCEPTANCE_TIMEOUT_MS = 30_000;
+
 function generateSessionId(prefix: string): string {
   const id = globalThis.crypto?.randomUUID?.();
   return id
@@ -85,6 +87,15 @@ function turnIdForReceipt(threadId: string, operationId: string): string {
     .padStart(16, "0")}`;
 }
 
+class BackgroundAgentSessionHttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 async function responseError(response: Response): Promise<Error> {
   const body = await response
     .json()
@@ -93,7 +104,8 @@ async function responseError(response: Response): Promise<Error> {
     body && typeof body.error === "string" && body.error.trim()
       ? `: ${body.error.trim()}`
       : "";
-  return new Error(
+  return new BackgroundAgentSessionHttpError(
+    response.status,
     `Background agent session was rejected (HTTP ${response.status})${detail}`,
   );
 }
@@ -134,7 +146,7 @@ export function startBackgroundAgentSession(
     rejectCompletion = reject;
   });
 
-  const accepted = fetch(agentNativePath("/_agent-native/agent-chat"), {
+  const routeRequest = fetch(agentNativePath("/_agent-native/agent-chat"), {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
@@ -164,7 +176,21 @@ export function startBackgroundAgentSession(
     }),
   })
     .then(async (response) => {
-      if (!response.ok) throw await responseError(response);
+      if (!response.ok) {
+        if (response.status === 409) {
+          const snapshot = await getBackgroundAgentSessionStatus({
+            operationId,
+            threadId,
+            turnId,
+          });
+          if (snapshot.status !== "unavailable") {
+            routeAccepted = true;
+            resolveCompletion();
+            return { operationId, threadId, turnId };
+          }
+        }
+        throw await responseError(response);
+      }
       routeAccepted = true;
       void drainResponse(response).then(resolveCompletion, rejectCompletion);
       return { operationId, threadId, turnId };
@@ -174,6 +200,24 @@ export function startBackgroundAgentSession(
       rejectCompletion(routeError);
       throw routeError;
     });
+  let acceptanceTimer: ReturnType<typeof setTimeout> | undefined;
+  const acceptanceTimeout = new Promise<BackgroundAgentSessionReceipt>(
+    (_resolve, reject) => {
+      acceptanceTimer = setTimeout(() => {
+        if (routeAccepted || routeError) return;
+        routeError = new Error(
+          "Background agent session acknowledgement timed out",
+        );
+        rejectCompletion(routeError);
+        reject(routeError);
+      }, BACKGROUND_SESSION_ACCEPTANCE_TIMEOUT_MS);
+    },
+  );
+  void routeRequest.then(
+    () => clearTimeout(acceptanceTimer),
+    () => clearTimeout(acceptanceTimer),
+  );
+  const accepted = Promise.race([routeRequest, acceptanceTimeout]);
   void accepted.catch(() => {});
   void completion.catch(() => {});
 
@@ -183,23 +227,61 @@ export function startBackgroundAgentSession(
     turnId,
     accepted,
     completion,
-    status: () =>
-      routeAccepted
-        ? getBackgroundAgentSessionStatus({ operationId, threadId, turnId })
-        : Promise.resolve(
-            routeError
-              ? {
-                  operationId,
-                  threadId,
-                  turnId,
-                  status: "errored" as const,
-                  terminalReason: routeError.message,
-                }
-              : { operationId, threadId, turnId, status: "queued" as const },
-          ),
+    status: async () => {
+      const snapshot = await getBackgroundAgentSessionStatus({
+        operationId,
+        threadId,
+        turnId,
+      });
+      if (snapshot.status !== "unavailable") return snapshot;
+      if (routeError) {
+        return {
+          operationId,
+          threadId,
+          turnId,
+          status: "errored",
+          terminalReason: routeError.message,
+        };
+      }
+      return !routeAccepted
+        ? { operationId, threadId, turnId, status: "queued" }
+        : snapshot;
+    },
     cancel: async (reason) => {
-      await accepted;
-      await cancelBackgroundAgentSession({ threadId, turnId, reason });
+      const deadline = Date.now() + 5_000;
+      for (;;) {
+        try {
+          await cancelBackgroundAgentSession({ threadId, turnId, reason });
+          return;
+        } catch (error) {
+          if (
+            !(error instanceof BackgroundAgentSessionHttpError) ||
+            error.status !== 404 ||
+            routeAccepted ||
+            Date.now() >= deadline
+          ) {
+            throw routeError ?? error;
+          }
+          if (routeError) {
+            const snapshot = await getBackgroundAgentSessionStatus({
+              operationId,
+              threadId,
+              turnId,
+            });
+            if (snapshot.status === "unavailable") {
+              await new Promise<void>((resolve) => setTimeout(resolve, 25));
+              continue;
+            }
+          }
+          await Promise.race([
+            accepted.then(
+              () => undefined,
+              () => undefined,
+            ),
+            new Promise<void>((resolve) => setTimeout(resolve, 25)),
+          ]);
+        }
+      }
     },
     open: (openOptions) =>
       requestAgentChatThreadOpen({
