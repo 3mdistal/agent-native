@@ -5854,6 +5854,10 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
               ...(turnId ? { turnId } : {}),
             });
             if (!run) {
+              if (turnId) {
+                setResponseStatus(event, 404);
+                return { error: "Run not found" };
+              }
               return { threadId, status: "queued" };
             }
             return {

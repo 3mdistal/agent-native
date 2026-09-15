@@ -194,10 +194,29 @@ describe("FIX 3 — stale-run reaper server-owned recovery (reapIfStale)", () =>
     expect(await isTurnAborted(thread, `${turn}-other`)).toBe(false);
     const [marker] = (await pglite
       .prepare(`SELECT status, dispatch_mode FROM agent_runs WHERE id = ?`)
-      .all(`turn-abort-${turn}`)) as
-      | { status: string; dispatch_mode: string }
-      | undefined;
+      .all(
+        `turn-abort:${encodeURIComponent(thread)}:${encodeURIComponent(turn)}`,
+      )) as { status: string; dispatch_mode: string } | undefined;
     expect(marker).toEqual({ status: "aborted", dispatch_mode: "turn-abort" });
+  });
+
+  it("keeps early Stop markers distinct when two threads reuse one turn id", async () => {
+    currentClient = makeRawClient(true);
+    const { thread, turn } = ids();
+    const otherThread = `${thread}-other`;
+
+    await markTurnAborted(thread, turn);
+    await markTurnAborted(otherThread, turn);
+
+    expect(await isTurnAborted(thread, turn)).toBe(true);
+    expect(await isTurnAborted(otherThread, turn)).toBe(true);
+    const markers = (await pglite
+      .prepare(
+        `SELECT id, thread_id FROM agent_runs WHERE turn_id = ? AND dispatch_mode = 'turn-abort' ORDER BY thread_id`,
+      )
+      .all(turn)) as Array<{ id: string; thread_id: string }>;
+    expect(markers).toHaveLength(2);
+    expect(new Set(markers.map((marker) => marker.id)).size).toBe(2);
   });
 
   it("also aborts a run inserted after the caller's first cancellation check", async () => {

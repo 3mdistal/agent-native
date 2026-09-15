@@ -112,6 +112,7 @@ export function startBackgroundAgentSession(
     options.actionScope === undefined
       ? undefined
       : normalizeAgentActionScope(options.actionScope);
+  let routeAccepted = false;
   let resolveCompletion!: () => void;
   let rejectCompletion!: (error: unknown) => void;
   const completion = new Promise<void>((resolve, reject) => {
@@ -150,6 +151,7 @@ export function startBackgroundAgentSession(
   })
     .then(async (response) => {
       if (!response.ok) throw await responseError(response);
+      routeAccepted = true;
       void drainResponse(response).then(resolveCompletion, rejectCompletion);
       return { operationId, threadId, turnId };
     })
@@ -167,7 +169,9 @@ export function startBackgroundAgentSession(
     accepted,
     completion,
     status: () =>
-      getBackgroundAgentSessionStatus({ operationId, threadId, turnId }),
+      routeAccepted
+        ? getBackgroundAgentSessionStatus({ operationId, threadId, turnId })
+        : Promise.resolve({ operationId, threadId, turnId, status: "queued" }),
     cancel: async (reason) => {
       await accepted;
       await cancelBackgroundAgentSession({ threadId, turnId, reason });

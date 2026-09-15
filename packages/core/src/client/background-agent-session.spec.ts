@@ -197,4 +197,39 @@ describe("background agent sessions", () => {
       "/_agent-native/agent-chat/runs/turn/operation-5/abort",
     ]);
   });
+
+  it("reports local queued state only before route acceptance", async () => {
+    let acceptStart!: (response: Response) => void;
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            acceptStart = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(Response.json({}, { status: 404 }));
+
+    const handle = startBackgroundAgentSession({
+      message: "Start and inspect status",
+      operationId: "operation-6",
+      threadId: "thread-6",
+    });
+    await expect(handle.status()).resolves.toEqual({
+      operationId: "operation-6",
+      threadId: "thread-6",
+      turnId: "operation-6",
+      status: "queued",
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    acceptStart(streamResponse());
+    await handle.accepted;
+    await expect(handle.status()).resolves.toEqual({
+      operationId: "operation-6",
+      threadId: "thread-6",
+      turnId: "operation-6",
+      status: "unavailable",
+    });
+  });
 });
