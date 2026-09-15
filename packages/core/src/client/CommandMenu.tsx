@@ -678,7 +678,12 @@ export function useCommandMenuShortcut(
 ) {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      if (
+        (e.metaKey || e.ctrlKey) &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "k"
+      ) {
         const target = e.target instanceof HTMLElement ? e.target : null;
         const isContentEditable = target?.isContentEditable;
         if (
