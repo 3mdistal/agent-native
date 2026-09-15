@@ -81,7 +81,7 @@ describe("background agent sessions", () => {
         "Reply to the comment\n\n<context>\nUse only the supplied comment context.\n</context>",
       displayMessage: "Reply to the comment",
       queuedMessageId: "operation-1",
-      turnId: "operation-1",
+      turnId: handle.turnId,
       threadId: "thread-1",
       scope: { type: "content-comment-ai", id: "comment-7" },
       actionScope: {
@@ -135,7 +135,7 @@ describe("background agent sessions", () => {
     const receipt = {
       operationId: "operation-3",
       threadId: "thread-3",
-      turnId: "operation-3",
+      turnId: "background-turn-3",
     };
 
     await expect(getBackgroundAgentSessionStatus(receipt)).resolves.toEqual({
@@ -149,8 +149,8 @@ describe("background agent sessions", () => {
       status: "unavailable",
     });
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      "/_agent-native/agent-chat/runs/latest?threadId=thread-3&turnId=operation-3",
-      "/_agent-native/agent-chat/runs/latest?threadId=thread-3&turnId=operation-3",
+      "/_agent-native/agent-chat/runs/latest?threadId=thread-3&turnId=background-turn-3",
+      "/_agent-native/agent-chat/runs/latest?threadId=thread-3&turnId=background-turn-3",
     ]);
   });
 
@@ -194,7 +194,7 @@ describe("background agent sessions", () => {
     await cancellation;
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       "/_agent-native/agent-chat",
-      "/_agent-native/agent-chat/runs/turn/operation-5/abort",
+      `/_agent-native/agent-chat/runs/turn/${handle.turnId}/abort`,
     ]);
   });
 
@@ -218,7 +218,7 @@ describe("background agent sessions", () => {
     await expect(handle.status()).resolves.toEqual({
       operationId: "operation-6",
       threadId: "thread-6",
-      turnId: "operation-6",
+      turnId: handle.turnId,
       status: "queued",
     });
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -228,8 +228,63 @@ describe("background agent sessions", () => {
     await expect(handle.status()).resolves.toEqual({
       operationId: "operation-6",
       threadId: "thread-6",
-      turnId: "operation-6",
+      turnId: handle.turnId,
       status: "unavailable",
     });
+  });
+
+  it.each([
+    {
+      name: "network rejection",
+      response: () => Promise.reject(new Error("network unavailable")),
+      message: "network unavailable",
+    },
+    {
+      name: "non-OK response",
+      response: () =>
+        Promise.resolve(
+          Response.json({ error: "dispatch unavailable" }, { status: 503 }),
+        ),
+      message:
+        "Background agent session was rejected (HTTP 503): dispatch unavailable",
+    },
+  ])("reports an errored status after $name", async ({ response, message }) => {
+    vi.mocked(fetch).mockImplementationOnce(response);
+    const handle = startBackgroundAgentSession({
+      message: "Start and fail",
+      operationId: "operation-failed",
+      threadId: "thread-failed",
+    });
+
+    await expect(handle.accepted).rejects.toThrow(message);
+    await expect(handle.status()).resolves.toEqual({
+      operationId: "operation-failed",
+      threadId: "thread-failed",
+      turnId: handle.turnId,
+      status: "errored",
+      terminalReason: message,
+    });
+  });
+
+  it("derives different retry-stable turn ids for one operation across threads", () => {
+    const first = startBackgroundAgentSession({
+      message: "First",
+      operationId: "shared-operation",
+      threadId: "thread-a",
+    });
+    const retry = startBackgroundAgentSession({
+      message: "First retry",
+      operationId: "shared-operation",
+      threadId: "thread-a",
+    });
+    const second = startBackgroundAgentSession({
+      message: "Second",
+      operationId: "shared-operation",
+      threadId: "thread-b",
+    });
+
+    expect(first.turnId).toBe(retry.turnId);
+    expect(first.turnId).not.toBe(second.turnId);
+    expect(first.turnId).toMatch(/^background-turn-[a-f0-9]{32}$/);
   });
 });

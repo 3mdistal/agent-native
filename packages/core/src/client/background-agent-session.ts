@@ -72,6 +72,19 @@ function requiredId(value: string | undefined, prefix: string): string {
   return normalized || generateSessionId(prefix);
 }
 
+function turnIdForReceipt(threadId: string, operationId: string): string {
+  const input = `${threadId}\0${operationId}`;
+  let first = 0xcbf29ce484222325n;
+  let second = 0x84222325cbf29ce4n;
+  for (const byte of new TextEncoder().encode(input)) {
+    first = BigInt.asUintN(64, (first ^ BigInt(byte)) * 0x100000001b3n);
+    second = BigInt.asUintN(64, (second ^ BigInt(byte)) * 0x100000001b3n);
+  }
+  return `background-turn-${first.toString(16).padStart(16, "0")}${second
+    .toString(16)
+    .padStart(16, "0")}`;
+}
+
 async function responseError(response: Response): Promise<Error> {
   const body = await response
     .json()
@@ -107,12 +120,13 @@ export function startBackgroundAgentSession(
 
   const operationId = requiredId(options.operationId, "background-operation");
   const threadId = requiredId(options.threadId, "background-thread");
-  const turnId = operationId;
+  const turnId = turnIdForReceipt(threadId, operationId);
   const actionScope =
     options.actionScope === undefined
       ? undefined
       : normalizeAgentActionScope(options.actionScope);
   let routeAccepted = false;
+  let routeError: Error | undefined;
   let resolveCompletion!: () => void;
   let rejectCompletion!: (error: unknown) => void;
   const completion = new Promise<void>((resolve, reject) => {
@@ -156,8 +170,9 @@ export function startBackgroundAgentSession(
       return { operationId, threadId, turnId };
     })
     .catch((error) => {
-      rejectCompletion(error);
-      throw error;
+      routeError = error instanceof Error ? error : new Error(String(error));
+      rejectCompletion(routeError);
+      throw routeError;
     });
   void accepted.catch(() => {});
   void completion.catch(() => {});
@@ -171,7 +186,17 @@ export function startBackgroundAgentSession(
     status: () =>
       routeAccepted
         ? getBackgroundAgentSessionStatus({ operationId, threadId, turnId })
-        : Promise.resolve({ operationId, threadId, turnId, status: "queued" }),
+        : Promise.resolve(
+            routeError
+              ? {
+                  operationId,
+                  threadId,
+                  turnId,
+                  status: "errored" as const,
+                  terminalReason: routeError.message,
+                }
+              : { operationId, threadId, turnId, status: "queued" as const },
+          ),
     cancel: async (reason) => {
       await accepted;
       await cancelBackgroundAgentSession({ threadId, turnId, reason });
