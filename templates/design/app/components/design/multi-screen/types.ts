@@ -157,6 +157,11 @@ export interface DuplicateRequest {
   dropCanvasPosition?: { x: number; y: number };
 }
 
+export interface ScreenContentRenderOptions {
+  onBootStart?: () => void;
+  onBootReady?: () => void;
+}
+
 export interface MultiScreenCanvasProps {
   screens: ScreenFile[];
   zoom: number;
@@ -278,7 +283,10 @@ export interface MultiScreenCanvasProps {
     screen: ScreenFile,
     metadata: ResolvedScreenMetadata,
     geometry: FrameGeometry,
+    options?: ScreenContentRenderOptions,
   ) => ReactNode;
+  /** Cached inert HTML used while a live screen is waiting for a boot slot. */
+  screenSnapshotsById?: Record<string, { html: string } | undefined>;
   /**
    * Renders the fully editable runtime for one responsive sub-frame. Keeping
    * this separate from `renderScreenContent` prevents a breakpoint preview
@@ -293,6 +301,8 @@ export interface MultiScreenCanvasProps {
       displayWidth: number;
       displayHeight: number;
       active: boolean;
+      onBootStart?: () => void;
+      onBootReady?: () => void;
     },
   ) => ReactNode;
   onScreenSelectionChange?: (ids: string[]) => void;

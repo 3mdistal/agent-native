@@ -340,6 +340,7 @@ import type {
   GradientEditOverlayTarget,
   MultiScreenCanvasTool,
   Point,
+  ScreenContentRenderOptions,
   ScreenProjectionNodeIdentity,
   VectorEditOverlayState,
 } from "@/components/design/multi-screen/types";
@@ -903,6 +904,12 @@ import {
   getBoardSelectionFitBounds,
 } from "./design-editor/overview-camera";
 import {
+  clearPendingEditSessionMarker,
+  readPendingEditSessionMarker,
+  type PendingEditSessionMarkerResult,
+  writePendingEditSessionMarker,
+} from "./design-editor/pending-edit-session-marker";
+import {
   applyInteractionStateStyleCommit,
   buildPendingVisualStyleRevertPatches,
   deriveStatePreviewTarget,
@@ -1334,6 +1341,37 @@ function DesignEditor() {
   const [pendingLiveNonStyleEdits, setPendingLiveNonStyleEdits] = useState<
     PendingLiveNonStyleEdit[]
   >([]);
+  const [pendingEditSessionMarker, setPendingEditSessionMarker] =
+    useState<PendingEditSessionMarkerResult>({ status: "absent" });
+  const [
+    pendingEditSessionRecoveryMarker,
+    setPendingEditSessionRecoveryMarker,
+  ] = useState<PendingEditSessionMarkerResult>({ status: "absent" });
+  const pendingEditSessionDesignIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    pendingEditSessionDesignIdRef.current = null;
+    const marker = readPendingEditSessionMarker(id);
+    setPendingEditSessionMarker(marker);
+    setPendingEditSessionRecoveryMarker(marker);
+  }, [id]);
+  const clearPendingEditSessionRecovery = useCallback(() => {
+    if (!id) return;
+    pendingEditSessionDesignIdRef.current = null;
+    const result = clearPendingEditSessionMarker(id);
+    const nextState: PendingEditSessionMarkerResult =
+      result.status === "cleared"
+        ? { status: "absent" }
+        : { status: "unavailable", reason: result.reason };
+    setPendingEditSessionMarker(nextState);
+    setPendingEditSessionRecoveryMarker(nextState);
+  }, [id]);
+  const clearPendingEditSessionRecoveryRef = useRef(
+    clearPendingEditSessionRecovery,
+  );
+  useEffect(() => {
+    clearPendingEditSessionRecoveryRef.current =
+      clearPendingEditSessionRecovery;
+  }, [clearPendingEditSessionRecovery]);
   const [pendingVisualStyleRevertRequest, setPendingVisualStyleRevertRequest] =
     useState<{
       requestId: number;
@@ -1545,6 +1583,9 @@ function DesignEditor() {
   const clearPendingLiveEditState = useCallback(() => {
     stagedSourceHandoffRef.current = "idle";
     setApplyingViaHost(false);
+    if (pendingEditSessionDesignIdRef.current === id) {
+      clearPendingEditSessionRecovery();
+    }
     if (stagedHandoffStartTimerRef.current !== undefined) {
       window.clearTimeout(stagedHandoffStartTimerRef.current);
       stagedHandoffStartTimerRef.current = undefined;
@@ -1563,7 +1604,7 @@ function DesignEditor() {
     pendingLiveNonStyleEditsRef.current = [];
     setPendingVisualStyleEdits([]);
     setPendingLiveNonStyleEdits([]);
-  }, [cancelPendingStructureVerification]);
+  }, [cancelPendingStructureVerification, clearPendingEditSessionRecovery, id]);
   const clearPendingLiveEditStateRef = useRef(clearPendingLiveEditState);
   useEffect(() => {
     clearPendingLiveEditStateRef.current = clearPendingLiveEditState;
@@ -7782,6 +7823,7 @@ function DesignEditor() {
         replaced?: true;
         replacementSelector?: string;
         replacementSourceId?: string;
+        replacementElementInfo?: ElementInfo;
         /** This change DELETED the subject; it has no anchor. */
         removed?: true;
       },
@@ -12018,6 +12060,7 @@ function DesignEditor() {
         replaced?: true;
         replacementSelector?: string;
         replacementSourceId?: string;
+        replacementElementInfo?: ElementInfo;
       },
     ) =>
       runVisualStructureChange(
@@ -12259,6 +12302,7 @@ function DesignEditor() {
         replaced?: true;
         replacementSelector?: string;
         replacementSourceId?: string;
+        replacementElementInfo?: ElementInfo;
       },
     ) =>
       runScreenVisualStructureChange(
@@ -15196,7 +15240,18 @@ function DesignEditor() {
   });
   historyDispatchRef.current = { undo: runCurrentUndo, redo: runCurrentRedo };
   const dispatchHistory = useCallback((direction: "undo" | "redo") => {
-    const run = () => historyDispatchRef.current[direction]();
+    const pendingCountBefore =
+      pendingVisualStyleEditsRef.current.length +
+      pendingLiveNonStyleEditsRef.current.length;
+    const run = () => {
+      historyDispatchRef.current[direction]();
+      const pendingCountAfter =
+        pendingVisualStyleEditsRef.current.length +
+        pendingLiveNonStyleEditsRef.current.length;
+      if (pendingCountBefore > 0 && pendingCountAfter === 0) {
+        clearPendingEditSessionRecoveryRef.current();
+      }
+    };
     const queue = linkedComponentMutationQueueRef.current?.queue;
     const pending = queue
       ? queue.dispatchHistory(queue.hasPending() ? () => flushSync(run) : run)
@@ -16776,6 +16831,26 @@ function DesignEditor() {
       ),
     [pendingLiveNonStyleEdits, pendingVisualStyleEdits],
   );
+  useEffect(() => {
+    if (!id) return;
+    if (pendingVisualEditCount > 0) {
+      pendingEditSessionDesignIdRef.current = id;
+      const result = writePendingEditSessionMarker(id, pendingVisualEditCount);
+      setPendingEditSessionMarker(
+        result.status === "stored"
+          ? { status: "absent" }
+          : { status: "unavailable", reason: result.reason },
+      );
+      return;
+    }
+    if (pendingEditSessionDesignIdRef.current === id) {
+      pendingEditSessionDesignIdRef.current = null;
+      const result = clearPendingEditSessionMarker(id);
+      if (result.status === "unavailable") {
+        setPendingEditSessionMarker(result);
+      }
+    }
+  }, [id, pendingVisualEditCount]);
   const pendingVisualStyleScreenSourceTypes = useMemo(
     () =>
       new Map<string, unknown>(
@@ -16842,15 +16917,56 @@ function DesignEditor() {
       screenRoutesById,
     ],
   );
-  const visualEditPromptResult = useCallback<() => VisualEditPromptResult>(
-    () => ({
+  const visualEditPromptResult = useCallback<
+    () => VisualEditPromptResult
+  >(() => {
+    if (pendingVisualEditCount > 0) {
+      return {
+        designId: id ?? null,
+        pendingEditCount: pendingVisualEditCount,
+        status: "ready",
+        prompt: pendingVisualStylePrompt,
+      };
+    }
+    const recoveryMarker = pendingEditSessionRecoveryMarker;
+    if (recoveryMarker.status === "present") {
+      const count = recoveryMarker.marker.count;
+      return {
+        designId: id ?? null,
+        pendingEditCount: count,
+        status: "session-ended",
+        prompt: `The previous visual-edit session ended with ${count} pending edit${count === 1 ? "" : "s"}. Those live edits are no longer recoverable; recreate them in the canvas before asking the agent to apply source changes.`,
+      };
+    }
+    if (recoveryMarker.status === "unavailable") {
+      return {
+        designId: id ?? null,
+        pendingEditCount: 0,
+        status: "unknown",
+        prompt: `The previous visual-edit session marker could not be read (${recoveryMarker.reason}). Do not treat an empty prompt as proof that no edits were lost; inspect the source and recreate the intended canvas changes before applying.`,
+      };
+    }
+    if (pendingEditSessionMarker.status === "unavailable") {
+      return {
+        designId: id ?? null,
+        pendingEditCount: 0,
+        status: "unknown",
+        prompt: `The current visual-edit session marker could not be read (${pendingEditSessionMarker.reason}). Do not treat an empty prompt as proof that no edits were lost; inspect the source and recreate the intended canvas changes before applying.`,
+      };
+    }
+    return {
       designId: id ?? null,
-      pendingEditCount: pendingVisualEditCount,
-      status: pendingVisualEditCount > 0 ? "ready" : "empty",
+      pendingEditCount: 0,
+      status: "empty",
       prompt: pendingVisualStylePrompt,
-    }),
-    [id, pendingVisualEditCount, pendingVisualStylePrompt],
-  );
+    };
+  }, [
+    id,
+    pendingEditSessionMarker,
+    pendingEditSessionRecoveryMarker,
+    pendingVisualEditCount,
+    pendingVisualStylePrompt,
+  ]);
   const handleApplyPendingVisualStylesWithAgent = useCallback(
     async () =>
       runApplyPendingVisualStylesWithAgent({
@@ -21367,6 +21483,7 @@ function DesignEditor() {
       metadata: OverviewScreenRendererArgs[1],
       geometry: OverviewScreenRendererArgs[2],
       breakpointFrame?: OverviewBreakpointRendererArgs[2],
+      renderOptions?: ScreenContentRenderOptions,
     ) => {
       const breakpointWidthPx = breakpointFrame?.widthPx;
       const screenIsActive =
@@ -21493,6 +21610,8 @@ function DesignEditor() {
           nativePreviewActive={screenIsActive}
           previewToken={screenPreviewToken}
           externalSnapshotHtml={screenSnapshot}
+          onBootStart={renderOptions?.onBootStart}
+          onBootReady={renderOptions?.onBootReady}
           onExternalContentSnapshot={(snapshot) =>
             handleScreenExternalContentSnapshot(screen.id, snapshot)
           }
@@ -21748,8 +21867,14 @@ function DesignEditor() {
     ],
   );
   const renderScreenContent = useCallback<OverviewScreenRenderer>(
-    (screen, metadata, geometry) =>
-      renderEditableScreenContent(screen, metadata, geometry),
+    (screen, metadata, geometry, options) =>
+      renderEditableScreenContent(
+        screen,
+        metadata,
+        geometry,
+        undefined,
+        options,
+      ),
     [renderEditableScreenContent],
   );
   const renderBreakpointContent = useCallback<OverviewBreakpointRenderer>(
@@ -21764,6 +21889,10 @@ function DesignEditor() {
           height: frame.displayHeight,
         },
         frame,
+        {
+          onBootStart: frame.onBootStart,
+          onBootReady: frame.onBootReady,
+        },
       ),
     [renderEditableScreenContent],
   );
@@ -24469,6 +24598,7 @@ function DesignEditor() {
                         }
                         onEditBreakpoint={handleOverviewEditBreakpoint}
                         renderScreenContent={renderScreenContent}
+                        screenSnapshotsById={liveScreenSnapshotsById}
                         renderBreakpointContent={renderBreakpointContent}
                       />
                       {id ? (
