@@ -2309,6 +2309,10 @@ jobs:
             process.stdout.write(aliasUrl);
           NODE
           )"
+          if [[ "$alias_url" == "$immutable_url" ]]; then
+            echo "::error::Netlify preview alias resolved to the immutable deploy URL."
+            exit 1
+          fi
           smoke_args=(
             --canonical-host "$HOST"
             --auth-routes

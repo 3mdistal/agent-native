@@ -1550,9 +1550,25 @@ describe("production Netlify site concurrency guard", () => {
     assert.match(String(previewSmoke.run), /resolveNetlifyPreviewAliasUrl/);
     assert.match(
       String(previewSmoke.run),
+      /if \[\[ "\$alias_url" == "\$immutable_url" \]\]/,
+    );
+    const previewSmokeNodeHeredocs = [
+      ...String(previewSmoke.run).matchAll(
+        /node(?: --experimental-strip-types)? <<'NODE'\n([\s\S]*?)\n\s*NODE/g,
+      ),
+    ].map((match) => match[1]);
+    assert(previewSmokeNodeHeredocs.length > 0);
+    for (const body of previewSmokeNodeHeredocs) {
+      assert.doesNotMatch(body, /\bimmutable_url\b/);
+    }
+    assert.match(
+      String(previewSmoke.run),
       /IMMUTABLE_URL="\$immutable_url" node[\s\S]*process\.env\.IMMUTABLE_URL/,
     );
-    assert.doesNotMatch(String(previewSmoke.run), /aliasUrl === immutable_url/);
+    assert.match(
+      String(previewSmoke.run),
+      /aliasUrl === process\.env\.IMMUTABLE_URL/,
+    );
     assert.doesNotMatch(String(previewSmoke.run), /--allow-missing-health/);
 
     assert(previewDatabaseMirror);
