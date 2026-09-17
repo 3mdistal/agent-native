@@ -490,7 +490,6 @@ import {
   discardDesignSaveOutboxEntry,
   drainDesignSaveOutbox,
   journalDesignSaveOutboxEntry,
-  updateFileResultPersistedContent,
   type DesignSaveOutboxEntry,
 } from "@/lib/design-save-outbox";
 import { isDesignSystemUsableForGeneration } from "@/lib/design-system-data";
@@ -688,7 +687,10 @@ import { runRecordPendingLiveTextEdit } from "./design-editor/commands/record-pe
 import { runRecordPendingVisualStyleEdit } from "./design-editor/commands/record-pending-visual-style-edit";
 import { runRedo } from "./design-editor/commands/redo";
 import { runRenderPngBlob } from "./design-editor/commands/render-png-blob";
-import { runSaveFileContent } from "./design-editor/commands/save-file-content";
+import {
+  runFileContentSaveKeepalive,
+  runSaveFileContent,
+} from "./design-editor/commands/save-file-content";
 import { runScreenElementSelect } from "./design-editor/commands/screen-element-select";
 import { runScreenTextContentChange } from "./design-editor/commands/screen-text-content-change";
 import { runScreenVisualDuplicateChange } from "./design-editor/commands/screen-visual-duplicate-change";
@@ -809,6 +811,7 @@ import {
   resolveOptimisticTextDecorationLine,
   resolveServerFiles,
   shouldRetirePendingLocalFileContent,
+  shouldClearLatestUnloadSaveForOutboxEntry,
   shouldSendKeepalive,
   type OptimisticTextDecorationLineEntry,
   type PreviewContentReplaceResult,
@@ -3986,6 +3989,26 @@ function DesignEditor() {
         toast.error(t("designEditor.toasts.saveConflict"), {
           id: "design-save-conflict:outbox",
         });
+        for (const { entry } of result.rebased) {
+          const content = entry.payload.content;
+          if (typeof content === "string") {
+            rollbackPendingLocalFileContent(entry.resourceId, content);
+          }
+        }
+      }
+      for (const entry of [
+        ...result.saved,
+        ...result.rebased.map(({ entry }) => entry),
+        ...result.dropped.map(({ entry }) => entry),
+      ]) {
+        if (
+          shouldClearLatestUnloadSaveForOutboxEntry(
+            latestFileSaveForUnloadRef.current[entry.resourceId],
+            entry,
+          )
+        ) {
+          delete latestFileSaveForUnloadRef.current[entry.resourceId];
+        }
       }
       if (result.saved.length > 0 || result.rebased.length > 0) {
         void queryClient.invalidateQueries({
@@ -4006,6 +4029,7 @@ function DesignEditor() {
   }, [
     designSaveActorScope,
     id,
+    rollbackPendingLocalFileContent,
     queryClient,
     t,
     warnChangesWillRetry,
@@ -4064,7 +4088,8 @@ function DesignEditor() {
           syncCollab: pending.syncCollab,
           operationSource: pending.operationSource,
           operationRevision: pending.operationRevision,
-          expectedVersionHash: pending.expectedVersionHash,
+          expectedVersionHash:
+            pending.unloadExpectedVersionHash ?? pending.expectedVersionHash,
           ...(pending.identityMigrationSourceContent !== undefined
             ? { identityOnly: true }
             : {}),
@@ -4137,21 +4162,39 @@ function DesignEditor() {
       },
     ) => {
       if (!canEditDesignRef.current) return;
+      const queuedIdentityMigration = pendingFileSavesRef.current[fileId];
+      const latestIdentityMigration =
+        latestFileSaveForUnloadRef.current[fileId];
+      const identityMigrationIsInFlight =
+        options.identityMigrationSourceContent === undefined &&
+        queuedIdentityMigration === undefined &&
+        latestIdentityMigration?.identityMigrationSourceContent !== undefined;
+      const expectedVersionHash = identityMigrationIsInFlight
+        ? sourceContentHash(latestIdentityMigration.content)
+        : options.expectedVersionHash;
       // Allocate the revision when the edit ENTERS the queue, not when its
       // debounce fires. A pagehide keepalive and the ordinary chained save
       // therefore carry the same idempotency key, while any newer queued edit
       // is guaranteed to have a higher revision even if requests arrive at
       // the server out of order.
-      const pending = coalescePendingFileContentSave(
+      const nextPending = coalescePendingFileContentSave(
         createFileContentSaveRequest(
           fileId,
           content,
           options.syncCollab ?? true,
-          options.expectedVersionHash,
+          expectedVersionHash,
           options.identityMigrationSourceContent,
         ),
         pendingFileSavesRef.current[fileId],
       );
+      const pending = {
+        ...nextPending,
+        unloadExpectedVersionHash:
+          pendingFileSavesRef.current[fileId]?.unloadExpectedVersionHash ??
+          latestFileSaveForUnloadRef.current[fileId]
+            ?.unloadExpectedVersionHash ??
+          nextPending.expectedVersionHash,
+      };
       markPendingLocalFileContent(
         fileId,
         content,
@@ -4253,25 +4296,17 @@ function DesignEditor() {
       // Keep pagehide mirrors behind the same source-version guard as normal saves.
       const collabLive = pending.syncCollab === false;
       if (!shouldSendKeepalive(true, collabLive)) return;
-      const entry = createFileSaveOutboxEntry(pending);
-      if (!entry) return;
-      void journalOutboxEntry(entry);
-      const attempt = tryCallActionKeepalive(
-        "update-file",
-        entry.payload as any,
+      runFileContentSaveKeepalive(
+        {
+          acknowledgeOutboxEntry,
+          createFileSaveOutboxEntry,
+          journalOutboxEntry,
+          latestFileSaveForUnloadRef,
+          sendKeepalive: (payload) =>
+            tryCallActionKeepalive("update-file", payload as any),
+        },
+        pending,
       );
-      if (!attempt.accepted) return;
-      void attempt.completion
-        .then((result: unknown) => {
-          if (!updateFileResultPersistedContent(result, pending.content)) {
-            return;
-          }
-          return acknowledgeOutboxEntry(entry);
-        })
-        // Pagehide/navigation can intentionally abort this request. The
-        // journaled operation remains available for replay, and there is no
-        // useful visible surface for a toast while the page is leaving.
-        .catch(() => {});
     },
     [acknowledgeOutboxEntry, createFileSaveOutboxEntry, journalOutboxEntry],
   );
@@ -7543,21 +7578,21 @@ function DesignEditor() {
           freshActiveContent: getFreshActiveFileContent({
             activeContent,
             pendingContent: activeFile?.id
-              ? pendingLocalFileContentsRef.current.get(activeFile.id)?.content
+              ? (latestFileSaveForUnloadRef.current[activeFile.id]?.content ??
+                pendingLocalFileContentsRef.current.get(activeFile.id)?.content)
               : null,
             latestContent: latestActiveContentRef.current,
             lastLocalContent: lastLocalContentRef.current,
           }),
           fileContentById,
-          // Same-tick freshness for NON-ACTIVE screens (see the param's doc on
-          // getFreshScreenContent): applyFileContentUpdate writes this ref
-          // synchronously via markPendingLocalFileContent, while the
-          // files-derived map above only refreshes on the next render. Without
-          // it, the second message of a bridge drop sequence (auto-layout
-          // conversion style → structure move) rebased off stale content and
-          // clobbered the first message's edit.
+          // Same-tick freshness (see the param's doc on getFreshScreenContent):
+          // applyFileContentUpdate writes these refs synchronously, while the
+          // files-derived map above only refreshes on the next render. The
+          // save outbox is also authoritative while reconciliation lags.
           pendingContent:
-            pendingLocalFileContentsRef.current.get(screenId)?.content ?? null,
+            latestFileSaveForUnloadRef.current[screenId]?.content ??
+            pendingLocalFileContentsRef.current.get(screenId)?.content ??
+            null,
         }),
         {
           fileId: screenId,
@@ -9131,6 +9166,7 @@ function DesignEditor() {
         refreshPreview?: boolean;
         skipPreview?: boolean;
         forcePreviewFullDocument?: boolean;
+        immediateSave?: boolean;
         persist?: boolean;
         recordHistory?: boolean;
         historyBeforeContent?: string;
@@ -19420,6 +19456,7 @@ function DesignEditor() {
         screenStylePreviewRef.current.delete(screenId);
       }
       applyFileContentUpdate(screenId, next, {
+        immediateSave: !previewOnly,
         persist: !previewOnly,
         recordHistory: !previewOnly,
         historyBeforeContent: previewOnly ? undefined : historyBeforeContent,
