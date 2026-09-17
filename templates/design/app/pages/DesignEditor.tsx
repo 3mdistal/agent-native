@@ -272,7 +272,6 @@ import {
 import { HistoryPanel } from "@/components/design/editor/HistoryPanel";
 import type { DesignMigrationResult } from "@/components/design/editor/MakeRealDialog";
 import { MakeRealDialog } from "@/components/design/editor/MakeRealDialog";
-import { PendingScreenDeletionDialog } from "@/components/design/editor/PendingScreenDeletionDialog";
 import { PendingVisualStyleWarningDialog } from "@/components/design/editor/PendingVisualStyleWarningDialog";
 import { ReadOnlyEditorPanel } from "@/components/design/editor/ReadOnlyEditorPanel";
 import { SaveTemplateDialog } from "@/components/design/editor/SaveTemplateDialog";
@@ -2508,6 +2507,11 @@ function DesignEditor() {
   // Disable every history command while one of those mutations is in flight
   // so a rapid second Cmd+Z cannot race a create against the pending delete.
   const fileHistoryMutationPendingRef = useRef(false);
+  const pendingHistoryDirectionsRef = useRef<Array<"undo" | "redo">>([]);
+  const pendingHistoryDrainScheduledRef = useRef(false);
+  const replayPendingHistoryRef = useRef<
+    ((direction: "undo" | "redo") => void) | null
+  >(null);
   const historyOrderRef = useRef<(UndoRedoOrderKind | "selection")[]>([]);
   const redoOrderRef = useRef<(UndoRedoOrderKind | "selection")[]>([]);
   // Figma parity (ground-truth Round 4): a plain selection change (no
@@ -2533,6 +2537,10 @@ function DesignEditor() {
     }
     redoOrderRef.current = [];
     undoManagerRef.current?.clear(false, true);
+  }, []);
+  const clearPendingHistoryDirections = useCallback(() => {
+    pendingHistoryDirectionsRef.current = [];
+    pendingHistoryDrainScheduledRef.current = false;
   }, []);
   // Figma-parity undo/redo selection restore: snapshots "what's selected
   // right now" from the ref mirrors above (always current — see their doc
@@ -2581,25 +2589,69 @@ function DesignEditor() {
         selection.selectedLayerIds.length === 1
           ? selection.selectedLayerIds[0]
           : undefined;
-      pendingOverviewScreenSelectionRef.current = null;
-      pendingOverviewLayerSelectionRef.current =
-        restoredLayerId &&
-        codeLayerOwnerByNodeIdRef.current.has(restoredLayerId)
+      const restoredScreenSelectionId =
+        selection.overviewSelectedScreenIds.length === 1 &&
+        selection.selectedLayerIds.length === 1 &&
+        selection.overviewSelectedScreenIds[0] === restoredLayerId
           ? restoredLayerId
           : null;
+      pendingOverviewScreenSelectionRef.current = restoredScreenSelectionId;
+      pendingOverviewLayerSelectionRef.current =
+        restoredLayerId &&
+        (codeLayerOwnerByNodeIdRef.current.has(restoredLayerId) ||
+          restoredLayerId === restoredScreenSelectionId)
+          ? restoredLayerId
+          : null;
+      if (pendingOverviewLayerSelectionRef.current) {
+        schedulePendingOverviewLayerSelectionClear(
+          pendingOverviewLayerSelectionRef.current,
+        );
+      } else {
+        clearPendingOverviewLayerSelectionTimer();
+      }
       setOverviewSelectedScreenIds(selection.overviewSelectedScreenIds);
       setSelectedLayerIdsState(selection.selectedLayerIds);
       if (selection.activeFileId) {
         setActiveFileId(selection.activeFileId);
       }
     },
-    [],
+    [
+      clearPendingOverviewLayerSelectionTimer,
+      schedulePendingOverviewLayerSelectionClear,
+    ],
   );
   const syncUndoRedoState = useCallback(() => {
     if (fileHistoryMutationPendingRef.current) {
       setCanUndo(false);
       setCanRedo(false);
       return;
+    }
+    if (
+      pendingHistoryDirectionsRef.current.length > 0 &&
+      !pendingHistoryDrainScheduledRef.current
+    ) {
+      pendingHistoryDrainScheduledRef.current = true;
+      queueMicrotask(function drainPendingHistory() {
+        if (fileHistoryMutationPendingRef.current) {
+          pendingHistoryDrainScheduledRef.current = false;
+          return;
+        }
+        const direction = pendingHistoryDirectionsRef.current.shift();
+        if (!direction) {
+          pendingHistoryDrainScheduledRef.current = false;
+          return;
+        }
+        replayPendingHistoryRef.current?.(direction);
+        if (fileHistoryMutationPendingRef.current) {
+          pendingHistoryDrainScheduledRef.current = false;
+          return;
+        }
+        if (pendingHistoryDirectionsRef.current.length > 0) {
+          queueMicrotask(drainPendingHistory);
+        } else {
+          pendingHistoryDrainScheduledRef.current = false;
+        }
+      });
     }
     const undoManager = undoManagerRef.current;
     const canUseOverviewHistory = viewModeRef.current === "overview";
@@ -3069,6 +3121,7 @@ function DesignEditor() {
     fileDeletionUndoStackRef.current = [];
     fileDeletionRedoStackRef.current = [];
     fileHistoryMutationPendingRef.current = false;
+    clearPendingHistoryDirections();
     selectionUndoStackRef.current = [];
     selectionRedoStackRef.current = [];
     clipboardPasteUndoStackRef.current = [];
@@ -3076,7 +3129,7 @@ function DesignEditor() {
     latestClipboardMutationContentRef.current.clear();
     historyOrderRef.current = [];
     redoOrderRef.current = [];
-  }, []);
+  }, [clearPendingHistoryDirections]);
   // U12: record a screen create/duplicate as an undoable entry. Always pushed
   // to the undo stack (screen creation is only meaningful in overview mode's
   // shared chronological history) and clears the redo stack like any other
@@ -3682,6 +3735,7 @@ function DesignEditor() {
   }, [reviewAgentQueueThreadIds, reviewSendingThreadId]);
   const canEditDesignRef = useRef(canEditDesign);
   const rawServerFilesByIdRef = useRef(new Map<string, DesignFile>());
+  const historyFilesRef = useRef<DesignFile[]>([]);
   const pendingLocalFileContentsRef = useRef<
     Map<string, PendingLocalFileContent>
   >(new Map());
@@ -3794,6 +3848,10 @@ function DesignEditor() {
     skipActionQueryInvalidation: true,
   });
   const createFileAsync = createFileMutation.mutateAsync;
+  const createDesignVersionMutation = useActionMutation(
+    "create-design-version",
+  );
+  const createDesignVersionAsync = createDesignVersionMutation.mutateAsync;
   const deleteFileMutation = useActionMutation("delete-file");
   const updateDesignMutation = useActionMutation("update-design");
   const updateDesignAsync = updateDesignMutation.mutateAsync;
@@ -4653,6 +4711,7 @@ function DesignEditor() {
       }),
     [pendingLocalFileContentsSnapshot, serverFiles],
   );
+  historyFilesRef.current = files;
 
   const codeLayerSourceForScreen = useCallback(
     (
@@ -6268,6 +6327,29 @@ function DesignEditor() {
     }) => {
       if (!id) return;
       const now = new Date().toISOString();
+      const optimisticFile: DesignFile = {
+        id: args.fileId,
+        filename: args.filename,
+        fileType: args.fileType,
+        content: annotateScreenHtmlForPersist(args.content, args.fileType),
+        createdAt:
+          typeof args.result?.createdAt === "string"
+            ? args.result.createdAt
+            : now,
+        updatedAt:
+          typeof args.result?.updatedAt === "string"
+            ? args.result.updatedAt
+            : now,
+      };
+      // Queued history replay drains in a microtask, before React can publish
+      // the query-cache update through the rendered files projection.
+      historyFilesRef.current = historyFilesRef.current.some(
+        (file) => file.id === args.fileId,
+      )
+        ? historyFilesRef.current.map((file) =>
+            file.id === args.fileId ? optimisticFile : file,
+          )
+        : [...historyFilesRef.current, optimisticFile];
       void queryClient.cancelQueries({
         queryKey: ["action", "get-design", { id }],
         exact: true,
@@ -6276,20 +6358,6 @@ function DesignEditor() {
         if (!old || typeof old !== "object" || !Array.isArray(old.files)) {
           return old;
         }
-        const optimisticFile: DesignFile = {
-          id: args.fileId,
-          filename: args.filename,
-          fileType: args.fileType,
-          content: annotateScreenHtmlForPersist(args.content, args.fileType),
-          createdAt:
-            typeof args.result?.createdAt === "string"
-              ? args.result.createdAt
-              : now,
-          updatedAt:
-            typeof args.result?.updatedAt === "string"
-              ? args.result.updatedAt
-              : now,
-        };
         return {
           ...old,
           files: old.files.some((file: DesignFile) => file.id === args.fileId)
@@ -14704,14 +14772,11 @@ function DesignEditor() {
     handleDeleteSelection();
   }, [handleCopySelection, handleDeleteSelection]);
 
-  const [pendingScreenDeletion, setPendingScreenDeletion] = useState<{
-    files: DesignFile[];
-  } | null>(null);
-  const [screenDeletionConfirming, setScreenDeletionConfirming] =
-    useState(false);
-  // Covers the gap before React re-renders after confirm — a second activation
-  // must not start another delete while the first mutation is still settling.
-  const screenDeletionConfirmingRef = useRef(false);
+  const captureDeleteHistoryCheckpoint = useCallback(async () => {
+    if (!id) throw new Error(t("common.genericError"));
+    const version = await createDesignVersionAsync({ designId: id });
+    return version.id;
+  }, [createDesignVersionAsync, id, t]);
 
   const performDeleteFiles = useCallback(
     (
@@ -14753,6 +14818,8 @@ function DesignEditor() {
           fileCreationUndoStackRef,
           fileDeletionUndoStackRef,
           fileHistoryMutationPendingRef,
+          captureHistoryCheckpoint: captureDeleteHistoryCheckpoint,
+          clearPendingHistory: clearPendingHistoryDirections,
           files,
           geometryRedoStackRef,
           geometryUndoStackRef,
@@ -14782,13 +14849,47 @@ function DesignEditor() {
     [
       activeFile,
       canvasFrameGeometryById,
+      captureDeleteHistoryCheckpoint,
       clearRedoStacks,
+      clearPendingHistoryDirections,
       deleteFileMutation,
       queryClient,
       syncUndoRedoState,
       t,
       writeFrameGeometrySnapshot,
     ],
+  );
+  const handleDeleteInlineFile = useCallback(
+    async (fileId: string) => {
+      if (!canEditDesign) return;
+      if (fileHistoryMutationPendingRef.current) {
+        throw new Error(t("common.genericError"));
+      }
+      const queryKey = ["action", "get-design", { id }] as const;
+      let file =
+        files.find((candidate) => candidate.id === fileId) ??
+        rawServerFilesByIdRef.current.get(fileId) ??
+        historyFilesRef.current.find((candidate) => candidate.id === fileId);
+      if (!file) {
+        await queryClient.refetchQueries({ queryKey, exact: true });
+        const refreshed = queryClient.getQueryData<{
+          files?: DesignFile[];
+        }>(queryKey);
+        file = refreshed?.files?.find((candidate) => candidate.id === fileId);
+      }
+      if (!file) throw new Error(t("common.genericError"));
+
+      const targetFile = file;
+      let deleted = false;
+      await performDeleteFiles([targetFile], {
+        recordDeletionHistory: true,
+        onMutationSettled: (deletedFiles) => {
+          deleted = deletedFiles.some((candidate) => candidate.id === fileId);
+        },
+      });
+      if (!deleted) throw new Error(t("common.genericError"));
+    },
+    [canEditDesign, files, id, performDeleteFiles, queryClient, t],
   );
 
   // MultiScreenCanvas consumes arrow keys in the capture phase while a frame
@@ -14806,19 +14907,20 @@ function DesignEditor() {
     return true;
   }, [files, selectedElement, selectedLayerIdsState]);
 
-  // Gate screen deletion behind confirmation, then record the deleted rows as
-  // one grouped history entry so Cmd+Z can recreate every selected screen.
+  // Delete selected screens immediately and record the rows as one grouped
+  // history entry so Cmd+Z can recreate every selected screen.
   // Always returns false to MultiScreenCanvas so it never performs its own
-  // synchronous local frame-geometry delete ahead of the confirmation.
+  // synchronous local frame-geometry delete ahead of the file mutation.
   const handleDeleteOverviewSelection = useCallback(
     (selectedIds: string[]) => {
       if (!canEditDesign) return false;
+      if (fileHistoryMutationPendingRef.current) return false;
       // BUG-DELETE-OVERVIEW-COLLISION: MultiScreenCanvas consumes Delete in
       // the capture phase whenever a frame is selected, and an in-screen
       // element selection keeps its screen there — so deleting one node in a
       // screen offered to delete the whole screen and the editor's own
       // onDelete hotkey never ran. Route to the element delete instead; the
-      // screen-delete confirmation is only for a real frame selection.
+      // Screen deletion is only for a real frame selection.
       if (
         overviewSelectionTargetsElement({
           selectedElement,
@@ -14829,58 +14931,37 @@ function DesignEditor() {
         handleDeleteSelection();
         return false;
       }
-      if (!selectedIds.length || files.length <= 1) return false;
+      if (!selectedIds.length || overviewScreens.length <= 1) return false;
 
       const selectedIdSet = new Set(selectedIds);
-      const selectedFiles = files.filter((file) => selectedIdSet.has(file.id));
+      const overviewScreenIds = new Set(
+        overviewScreens.map((screen) => screen.id),
+      );
+      const selectedFiles = files.filter(
+        (file) => selectedIdSet.has(file.id) && overviewScreenIds.has(file.id),
+      );
       if (!selectedFiles.length) return false;
 
       const maxDeleteCount =
-        selectedFiles.length >= files.length
-          ? Math.max(0, files.length - 1)
+        selectedFiles.length >= overviewScreens.length
+          ? Math.max(0, overviewScreens.length - 1)
           : selectedFiles.length;
       const filesToDelete = selectedFiles.slice(0, maxDeleteCount);
       if (!filesToDelete.length) return false;
 
-      setPendingScreenDeletion({ files: filesToDelete });
+      performDeleteFiles(filesToDelete, { recordDeletionHistory: true });
       return false;
     },
     [
       canEditDesign,
       files,
+      performDeleteFiles,
       handleDeleteSelection,
+      overviewScreens,
       selectedElement,
       selectedLayerIdsState,
     ],
   );
-
-  const handleCancelScreenDeletion = useCallback(() => {
-    if (screenDeletionConfirmingRef.current || screenDeletionConfirming) return;
-    setPendingScreenDeletion(null);
-  }, [screenDeletionConfirming]);
-
-  const handleConfirmScreenDeletion = useCallback(() => {
-    const pending = pendingScreenDeletion;
-    if (
-      !pending ||
-      screenDeletionConfirmingRef.current ||
-      screenDeletionConfirming
-    ) {
-      return;
-    }
-    // Keep the dialog locked until delete settles so a rapid second confirm
-    // cannot start a concurrent deletion / duplicate history entry.
-    screenDeletionConfirmingRef.current = true;
-    setScreenDeletionConfirming(true);
-    setPendingScreenDeletion(null);
-    performDeleteFiles(pending.files, {
-      recordDeletionHistory: true,
-      onMutationSettled: () => {
-        screenDeletionConfirmingRef.current = false;
-        setScreenDeletionConfirming(false);
-      },
-    });
-  }, [pendingScreenDeletion, performDeleteFiles, screenDeletionConfirming]);
 
   // ── Props/animation clipboard, transforms, nudge ───────────────────────────
   const handleCopyProps = useCallback(() => {
@@ -15293,7 +15374,9 @@ function DesignEditor() {
         fileDeletionRedoStackRef,
         fileDeletionUndoStackRef,
         fileHistoryMutationPendingRef,
+        clearPendingHistory: clearPendingHistoryDirections,
         files,
+        filesRef: historyFilesRef,
         geometryRedoStackRef,
         geometryUndoStackRef,
         getFreshActiveContent,
@@ -15308,6 +15391,7 @@ function DesignEditor() {
         localContentRedoStackRef,
         localContentUndoStackRef,
         markPendingLocalFileContent,
+        optimisticallyInsertCreatedFile,
         pendingLiveNonStyleEditsRef,
         pendingLiveNonStyleRedoStackRef,
         pendingLiveNonStyleUndoStackRef,
@@ -15352,6 +15436,7 @@ function DesignEditor() {
       applyGeometryHistoryContentChangesRef,
       applyLocalContentUpdate,
       canEditDesign,
+      clearPendingHistoryDirections,
       createFileMutation,
       deleteFileMutation,
       files,
@@ -15361,6 +15446,7 @@ function DesignEditor() {
       isSynced,
       liveScreenSnapshotsById,
       markPendingLocalFileContent,
+      optimisticallyInsertCreatedFile,
       performDeleteFiles,
       publishAuthoritativeClipboardMutation,
       queryClient,
@@ -15405,7 +15491,9 @@ function DesignEditor() {
         fileDeletionRedoStackRef,
         fileDeletionUndoStackRef,
         fileHistoryMutationPendingRef,
+        clearPendingHistory: clearPendingHistoryDirections,
         files,
+        filesRef: historyFilesRef,
         focusCreatedScreen,
         geometryRedoStackRef,
         geometryUndoStackRef,
@@ -15473,6 +15561,7 @@ function DesignEditor() {
       applyGeometryHistoryContentChangesRef,
       applyLocalContentUpdate,
       canEditDesign,
+      clearPendingHistoryDirections,
       createFileMutation,
       deleteRuntimeElement,
       files,
@@ -15508,6 +15597,10 @@ function DesignEditor() {
   });
   historyDispatchRef.current = { undo: runCurrentUndo, redo: runCurrentRedo };
   const dispatchHistory = useCallback((direction: "undo" | "redo") => {
+    if (fileHistoryMutationPendingRef.current) {
+      pendingHistoryDirectionsRef.current.push(direction);
+      return;
+    }
     const pendingCountBefore =
       pendingVisualStyleEditsRef.current.length +
       pendingLiveNonStyleEditsRef.current.length;
@@ -15526,6 +15619,7 @@ function DesignEditor() {
       : run();
     if (pending) void pending.catch((error) => toast.error(String(error)));
   }, []);
+  replayPendingHistoryRef.current = dispatchHistory;
   const handleUndo = useCallback(
     () => dispatchHistory("undo"),
     [dispatchHistory],
@@ -16769,7 +16863,7 @@ function DesignEditor() {
     // never reaches MultiScreenCanvas' capture-phase Delete.
     onDelete: canEditDesign
       ? () => {
-          handleDeleteOverviewSelection(selectedLayerIdsState);
+          handleDeleteOverviewSelection(overviewSelectedScreenIds);
         }
       : undefined,
     // Screen and element rows share the Layers panel's inline rename editor.
@@ -23036,8 +23130,24 @@ function DesignEditor() {
               <DropdownMenuShortcut>{shortcut("$mod+d")}</DropdownMenuShortcut>
             </DropdownMenuItem>
             <DropdownMenuItem
-              onClick={handleDeleteSelection}
-              disabled={!selectedElement && (!activeFile || files.length <= 1)}
+              onClick={() => {
+                if (viewMode === "overview") {
+                  handleDeleteOverviewSelection(overviewSelectedScreenIds);
+                } else {
+                  handleDeleteSelection();
+                }
+              }}
+              disabled={
+                viewMode === "overview"
+                  ? !overviewSelectionTargetsElement({
+                      selectedElement,
+                      selectedLayerIds: selectedLayerIdsState,
+                      fileIds: files.map((file) => file.id),
+                    }) &&
+                    (overviewScreens.length <= 1 ||
+                      overviewSelectedScreenIds.length === 0)
+                  : !selectedElement && !activeFile
+              }
             >
               {"Delete" /* i18n-ignore design menu command */}
               <DropdownMenuShortcut>⌫</DropdownMenuShortcut>
@@ -24229,6 +24339,9 @@ function DesignEditor() {
                           selectedNodeId={selectedElementLayerId}
                           selectedSelector={selectedCanvasSelector}
                           canEdit={canEditDesign}
+                          onDeleteInlineFile={
+                            canEditDesign ? handleDeleteInlineFile : undefined
+                          }
                           onActiveFileChange={setActiveCodeFile}
                           localhostConnections={workbenchLocalhostConnections}
                           onRequestLocalWriteConsent={
@@ -24402,7 +24515,7 @@ function DesignEditor() {
             canDelete={Boolean(
               canEditDesign &&
               (selectedElement ||
-                (selectedScreenIds.length > 0 && files.length > 1)),
+                (selectedScreenIds.length > 0 && overviewScreens.length > 1)),
             )}
             canReorder={canEditDesign && Boolean(selectedElement)}
             // Rename is only offered for a single selectable layer target;
@@ -25499,13 +25612,6 @@ function DesignEditor() {
         onHydrated={() => {
           void queryClient.invalidateQueries({ queryKey: ["action"] });
         }}
-      />
-
-      <PendingScreenDeletionDialog
-        pendingScreenDeletion={pendingScreenDeletion}
-        onCancel={handleCancelScreenDeletion}
-        onConfirm={handleConfirmScreenDeletion}
-        confirming={screenDeletionConfirming}
       />
 
       {/* ── Render: motion dock ── */}
