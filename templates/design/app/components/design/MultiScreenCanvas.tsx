@@ -3009,7 +3009,9 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
       sourceScreenId: string,
     ) => {
       crossScreenLastBoardPointRef.current = boardPoint;
-      const target = getFrameEntryAtPoint(boardPoint);
+      const target = getFrameEntryAtPoint(boardPoint, {
+        excludeId: sourceScreenId,
+      });
       traceOnce(
         crossScreenResolveTraceRef,
         "drop",
@@ -3347,6 +3349,22 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
               msg.sourceId,
             )
           : undefined;
+      const boardPointFromParentPointer = (
+        iframeX: number,
+        iframeY: number,
+        viewportW: number,
+        viewportH: number,
+      ): Point | null => {
+        if (sourceScreenId === boardFileId) return null;
+        const iframeRect = sourcePreviewIframe.getBoundingClientRect();
+        if (iframeRect.width <= 0 || iframeRect.height <= 0) return null;
+        return getCanvasPoint(
+          iframeRect.left +
+            iframeX * (iframeRect.width / Math.max(1, viewportW)),
+          iframeRect.top +
+            iframeY * (iframeRect.height / Math.max(1, viewportH)),
+        );
+      };
 
       if (msg.phase !== "move") {
         dndHostLog("overview:cross-screen", {
@@ -3455,6 +3473,29 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
           cancelPendingParentDrag();
           clearCrossScreenDrag();
         };
+        const handleParentKeyDown = (ev: KeyboardEvent) => {
+          if (ev.key !== "Escape") return;
+          ev.preventDefault();
+          ev.stopPropagation();
+          ev.stopImmediatePropagation();
+          cancelPendingParentDrag();
+          // Escape can land in the overview host after the pointer has left the
+          // source iframe. In that case the bridge never sees its own keydown,
+          // while the parent mouseup listener would otherwise still finalize a
+          // board fallback drop. Invalidate any pending hit-test first and
+          // forward the real keydown timestamp so the bridge can distinguish
+          // this cancellation from a later Escape after a committed release.
+          crossScreenDropSeqRef.current += 1;
+          crossScreenEndSeenRef.current = true;
+          sourcePreviewIframe.contentWindow?.postMessage(
+            {
+              type: "agent-native:cancel-active-drag",
+              pressedAt: performance.timeOrigin + ev.timeStamp,
+            },
+            "*",
+          );
+          clearCrossScreenDrag();
+        };
         const cleanup = () => {
           if (didCleanup) return;
           didCleanup = true;
@@ -3462,6 +3503,7 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
           window.removeEventListener("mousemove", handleParentMouseMove, true);
           window.removeEventListener("mouseup", handleParentMouseUp, true);
           window.removeEventListener("blur", handleParentWindowBlur, true);
+          window.removeEventListener("keydown", handleParentKeyDown, true);
           restorePreviewPointerEvents();
           if (crossScreenParentDragCleanupRef.current === cleanup) {
             crossScreenParentDragCleanupRef.current = null;
@@ -3471,6 +3513,7 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
         window.addEventListener("mousemove", handleParentMouseMove, true);
         window.addEventListener("mouseup", handleParentMouseUp, true);
         window.addEventListener("blur", handleParentWindowBlur, true);
+        window.addEventListener("keydown", handleParentKeyDown, true);
         return;
       }
 
@@ -3500,18 +3543,14 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
           })
         ) {
           const previewPoint =
-            crossScreenLastBoardPointRef.current ??
-            boardPointFromDragMessage(
-              sourceScreenId,
+            boardPointFromParentPointer(
               iframeX,
               iframeY,
               viewportW,
               viewportH,
-            );
+            ) ?? crossScreenLastBoardPointRef.current;
           if (previewPoint) {
-            setCrossScreenGhost(
-              buildCrossScreenGhost(previewPoint, sourceScreenId),
-            );
+            updateCrossScreenTargetFromBoardPoint(previewPoint, sourceScreenId);
           }
           return;
         }
@@ -3564,21 +3603,11 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
             crossScreenDragMsgRef.current?.styleSnapshotCaptureFailed === true,
         };
 
-        // The host renders the source iframe element itself larger than the
-        // screen's visible frame (see isPointerInsideSourceIframe's doc), so
-        // the bridge's own window.innerWidth/innerHeight always reads back
-        // "inside" well past the visible edge — use the frame's real
-        // rendered geometry as the boundary instead.
-        const sourceRenderedGeometry =
-          renderedFrameGeometryRef.current[sourceScreenId] ??
-          frameGeometryRef.current[sourceScreenId];
         const pointerInsideSourceIframe = isPointerInsideSourceIframe({
           iframeX,
           iframeY,
           viewportW,
           viewportH,
-          frameWidth: sourceRenderedGeometry?.width,
-          frameHeight: sourceRenderedGeometry?.height,
         });
         const sourceIsBoard = sourceScreenId === boardFileId;
         // Regular screen iframes are finite artboards, so an in-bounds pointer
@@ -3621,6 +3650,14 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
       }
 
       if (msg.phase === "end") {
+        // Escape can cancel the bridge before its queued native mouseup is
+        // delivered here. That mouseup still posts an end message, but the
+        // host has already invalidated this gesture and must not reinterpret
+        // the late end as a new cross-screen drop.
+        if (crossScreenEndSeenRef.current) {
+          clearCrossScreenDrag();
+          return;
+        }
         // Use the saved payload from the last "move" as the primary source of
         // truth; fall back to the "end" message's own fields in case the ref
         // was cleared (e.g. a brief re-entry into the source iframe nulled it
@@ -3643,14 +3680,33 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
         // release, and a drop that reads them empty returns silently — the
         // whole gesture vanishes with the element back on the board and no
         // error anywhere. The end message always describes its own pointer.
+        const endPointOutsideSource =
+          sourceScreenId !== boardFileId &&
+          Number.isFinite(msg.iframeX) &&
+          Number.isFinite(msg.iframeY) &&
+          Number.isFinite(msg.viewportW) &&
+          Number.isFinite(msg.viewportH) &&
+          !isPointerInsideSourceIframe({
+            iframeX: msg.iframeX!,
+            iframeY: msg.iframeY!,
+            viewportW: msg.viewportW!,
+            viewportH: msg.viewportH!,
+          });
         const lastBoardPoint =
-          boardPointFromDragMessage(
-            sourceScreenId,
-            msg.iframeX ?? 0,
-            msg.iframeY ?? 0,
-            msg.viewportW ?? 0,
-            msg.viewportH ?? 0,
-          ) ?? crossScreenLastBoardPointRef.current;
+          (endPointOutsideSource
+            ? boardPointFromParentPointer(
+                msg.iframeX!,
+                msg.iframeY!,
+                msg.viewportW!,
+                msg.viewportH!,
+              )
+            : boardPointFromDragMessage(
+                sourceScreenId,
+                msg.iframeX ?? 0,
+                msg.iframeY ?? 0,
+                msg.viewportW ?? 0,
+                msg.viewportH ?? 0,
+              )) ?? crossScreenLastBoardPointRef.current;
         // Exclude the source screen from the hit test itself rather than
         // discarding an equal-id result afterward: a dragged element still
         // lives in the source document until commit, so the source screen's
