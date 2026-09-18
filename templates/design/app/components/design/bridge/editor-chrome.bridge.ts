@@ -2971,13 +2971,251 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     height: true,
   };
 
+  type PortableStyleCacheEntry = {
+    generation: number;
+    styles: Record<string, string> | null;
+  };
+
+  type PortableStyleComputedStylesCache = {
+    entries: Map<Element, PortableStyleCacheEntry>;
+    mutationObserver: MutationObserver;
+    mutationGeneration: number;
+    observedMutationRoots: Node[];
+  };
+
+  var portableStyleMutationObserverOptions = {
+    subtree: true,
+    childList: true,
+    attributes: true,
+    characterData: true,
+  };
+
+  function portableStyleMutationAffectsCache(record: MutationRecord): boolean {
+    if (record.type === "attributes") {
+      return !(
+        record.target instanceof Element &&
+        (record.attributeName === "data-an-pending-node-id" ||
+          isOverlayElement(record.target))
+      );
+    }
+    if (record.type !== "childList") {
+      return !(
+        record.target instanceof Node &&
+        record.target.parentElement &&
+        isOverlayElement(record.target.parentElement)
+      );
+    }
+    if (record.target instanceof Element && isOverlayElement(record.target)) {
+      return false;
+    }
+    var nodes = Array.prototype.slice
+      .call(record.addedNodes)
+      .concat(Array.prototype.slice.call(record.removedNodes));
+    return (
+      nodes.length === 0 ||
+      nodes.some(function (node: Node) {
+        return !(
+          (node instanceof Element && isOverlayElement(node)) ||
+          (node.parentElement && isOverlayElement(node.parentElement))
+        );
+      })
+    );
+  }
+
+  function portableStyleMutationGeneration(
+    cache: PortableStyleComputedStylesCache,
+  ): number {
+    try {
+      var records = cache.mutationObserver.takeRecords();
+      if (records.some(portableStyleMutationAffectsCache)) {
+        cache.mutationGeneration += 1;
+      }
+    } catch (_error) {
+      // A cache with an unreadable observer cannot prove that a DOM/style
+      // mutation did not happen. Advancing the generation forces every
+      // subsequent lookup to miss and keeps the optimization fail-closed.
+      cache.mutationGeneration += 1;
+      dndLog("style:mutation-state-unreadable");
+    }
+    return cache.mutationGeneration;
+  }
+
+  function portableStyleObserveMutationRoot(
+    cache: PortableStyleComputedStylesCache,
+    root: Node,
+  ): boolean {
+    if (cache.observedMutationRoots.indexOf(root) !== -1) return true;
+    try {
+      cache.mutationObserver.observe(
+        root,
+        portableStyleMutationObserverOptions,
+      );
+      cache.observedMutationRoots.push(root);
+      // A newly discovered root may already have changed while an earlier
+      // snapshot was being read, so invalidate entries captured before it was
+      // observed.
+      if (cache.observedMutationRoots.length > 1) {
+        cache.mutationGeneration += 1;
+      }
+      return true;
+    } catch (_error) {
+      cache.mutationGeneration += 1;
+      dndLog("style:mutation-root-unavailable");
+      return false;
+    }
+  }
+
+  function portableStyleObserveElementRoot(
+    cache: PortableStyleComputedStylesCache,
+    el: Element,
+  ): boolean {
+    try {
+      var shadowRoot = (el as Element & { shadowRoot?: ShadowRoot | null })
+        .shadowRoot;
+      if (shadowRoot && !portableStyleObserveMutationRoot(cache, shadowRoot)) {
+        return false;
+      }
+      var getRootNode = (el as Element & { getRootNode?: () => Node })
+        .getRootNode;
+      if (typeof getRootNode !== "function") return true;
+      var root = getRootNode.call(el);
+      if (!(root instanceof Node)) return false;
+      return portableStyleObserveMutationRoot(cache, root);
+    } catch (_error) {
+      cache.mutationGeneration += 1;
+      dndLog("style:mutation-root-read-failed", { tag: el.tagName });
+      return false;
+    }
+  }
+
+  function createPortableStyleComputedStylesCache():
+    | PortableStyleComputedStylesCache
+    | undefined {
+    if (typeof MutationObserver === "undefined") return undefined;
+    var cache = {
+      entries: new Map<Element, PortableStyleCacheEntry>(),
+      mutationObserver: null as unknown as MutationObserver,
+      mutationGeneration: 0,
+      observedMutationRoots: [],
+    };
+    try {
+      var observer = new MutationObserver(function (records) {
+        if (records.some(portableStyleMutationAffectsCache)) {
+          cache.mutationGeneration += 1;
+        }
+      });
+      cache.mutationObserver = observer;
+      if (!portableStyleObserveMutationRoot(cache, document)) {
+        observer.disconnect();
+        return undefined;
+      }
+      return cache;
+    } catch (_error) {
+      dndLog("style:mutation-observer-unavailable");
+      return undefined;
+    }
+  }
+
+  function portableStyleAnimationParent(
+    el: Element,
+  ): Element | null | undefined {
+    try {
+      var assignedSlot = (el as Element & { assignedSlot?: Element | null })
+        .assignedSlot;
+      if (assignedSlot instanceof Element) return assignedSlot;
+      if (el.parentElement) return el.parentElement;
+      var getRootNode = (el as Element & { getRootNode?: () => Node })
+        .getRootNode;
+      if (typeof getRootNode !== "function") return null;
+      var root = getRootNode.call(el) as Document | ShadowRoot;
+      var host = (root as ShadowRoot).host;
+      return host instanceof Element ? host : null;
+    } catch (_error) {
+      dndLog("style:animation-parent-read-failed", { tag: el.tagName });
+      return undefined;
+    }
+  }
+
+  function canReadPortableAnimationState(el: Element): boolean {
+    var animatedElement = el as Element & {
+      getAnimations?: () => Array<{ playState?: string }>;
+    };
+    try {
+      var getAnimations = animatedElement.getAnimations;
+      if (typeof getAnimations !== "function") {
+        dndLog("style:animation-state-unreadable", { tag: el.tagName });
+        return false;
+      }
+      var animations = getAnimations.call(animatedElement);
+      if (!Array.isArray(animations)) {
+        dndLog("style:animation-state-unreadable", { tag: el.tagName });
+        return false;
+      }
+      for (var index = 0; index < animations.length; index += 1) {
+        var playState = animations[index]?.playState;
+        if (typeof playState !== "string") {
+          dndLog("style:animation-state-unreadable", { tag: el.tagName });
+          return false;
+        }
+        if (playState === "running" || playState === "pending") return false;
+      }
+      return true;
+    } catch (_error) {
+      dndLog("style:animation-state-read-failed", { tag: el.tagName });
+      return false;
+    }
+  }
+
+  function canReusePortableComputedStyles(
+    el: Element,
+    cache?: PortableStyleComputedStylesCache,
+  ): boolean {
+    // Computed inherited values can change while only an ancestor is
+    // animated. Recheck the whole style parent chain on every cache lookup;
+    // caching this answer would make a mid-request animation invisible.
+    var current: Element | null = el;
+    while (current) {
+      var parent = portableStyleAnimationParent(current);
+      if (parent === undefined) return false;
+      if (
+        cache &&
+        (!portableStyleObserveElementRoot(cache, current) ||
+          (parent && !portableStyleObserveElementRoot(cache, parent)))
+      ) {
+        return false;
+      }
+      if (!canReadPortableAnimationState(current)) return false;
+      current = parent;
+    }
+    return true;
+  }
+
   function collectPortableComputedStyles(
     el: Element | null,
+    cache?: PortableStyleComputedStylesCache,
+    computedStyle?: CSSStyleDeclaration,
   ): Record<string, string> | null {
     if (!el) return {};
-    var cs = window.getComputedStyle(el);
+    var cacheSafe = !cache || canReusePortableComputedStyles(el, cache);
+    var cacheGeneration = cache
+      ? portableStyleMutationGeneration(cache)
+      : undefined;
+    var cached = cache?.entries.get(el);
+    if (cacheSafe && cached && cached.generation === cacheGeneration) {
+      return cached.styles;
+    }
+    var cacheFailure = function (): null {
+      var failureGeneration = cache
+        ? portableStyleMutationGeneration(cache)
+        : undefined;
+      if (cache && cacheSafe && failureGeneration === cacheGeneration) {
+        cache.entries.set(el, { generation: failureGeneration, styles: null });
+      }
+      return null;
+    };
+    var cs = computedStyle || window.getComputedStyle(el);
     var defaults = portableStyleTagDefaults(el);
-    if (!defaults) return null;
+    if (!defaults) return cacheFailure();
     var hostStyle = (el as HTMLElement).style;
     var styles: Record<string, string> = {};
     var typedElement = el as Element & {
@@ -2985,7 +3223,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     };
     if (typeof typedElement.computedStyleMap !== "function") {
       dndLog("style:typed-om-unavailable", { tag: el.tagName });
-      return null;
+      return cacheFailure();
     }
     try {
       var typedStyles = typedElement.computedStyleMap();
@@ -2993,7 +3231,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         var typedValue = typedStyles.get(property);
         if (typedValue == null || !String(typedValue).trim()) {
           dndLog("style:typed-om-value-missing", { property: property });
-          return null;
+          return cacheFailure();
         }
         var size = String(typedValue).trim();
         // Explicit auto must replace a losing inline size in the moved markup.
@@ -3003,7 +3241,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       }
     } catch (_error) {
       dndLog("style:typed-om-read-failed", { tag: el.tagName });
-      return null;
+      return cacheFailure();
     }
     PORTABLE_STYLE_PROPERTIES.forEach(function (property) {
       if (PORTABLE_STYLE_BOX_SIZE_PROPERTIES[property]) return;
@@ -3038,10 +3276,20 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         }
       }
     }
+    var finalGeneration = cache
+      ? portableStyleMutationGeneration(cache)
+      : undefined;
+    if (cache && cacheSafe && finalGeneration === cacheGeneration) {
+      cache.entries.set(el, { generation: finalGeneration, styles: styles });
+    }
     return styles;
   }
 
-  function collectPortableStyleSnapshot(root: Element | null) {
+  function collectPortableStyleSnapshot(
+    root: Element | null,
+    cache?: PortableStyleComputedStylesCache,
+    rootComputedStyle?: CSSStyleDeclaration,
+  ) {
     if (!root || isDocumentRootElement(root)) return undefined;
     var maxNodes = 5000;
     var descendants = Array.prototype.slice.call(root.querySelectorAll("*"));
@@ -3074,7 +3322,14 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         probeFailed = true;
         return;
       }
-      var styles = collectPortableComputedStyles(node);
+      // The root is also represented by getElementInfo's live computedStyles.
+      // Refresh it instead of reusing an ancestor's value. Descendants use the
+      // request cache only when their style-parent animation state is quiescent.
+      var styles = collectPortableComputedStyles(
+        node,
+        node === root ? undefined : cache,
+        node === root ? rootComputedStyle : undefined,
+      );
       if (styles === null) {
         probeFailed = true;
         return;
@@ -3639,7 +3894,10 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     };
   }
 
-  function getElementInfo(el: Element): unknown {
+  function getElementInfo(
+    el: Element,
+    portableComputedStylesCache?: PortableStyleComputedStylesCache,
+  ): unknown {
     var cs = window.getComputedStyle(el);
     var paintCs = window.getComputedStyle(vectorPaintTarget(el) || el);
     var boundingRect = rectInfoForElement(el);
@@ -3757,7 +4015,11 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       provenance,
       sourceId || runtimeSourceId || pendingNodeId || getSelector(el),
     );
-    var portableStyleSnapshot = collectPortableStyleSnapshot(el);
+    var portableStyleSnapshot = collectPortableStyleSnapshot(
+      el,
+      portableComputedStylesCache,
+      cs,
+    );
     return {
       tagName: el.tagName.toLowerCase(),
       componentName: componentName || undefined,
@@ -4094,9 +4356,16 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         return documentSpaceBoundsContainPoint(el, atPoint);
       });
     }
-    return targets.map(function (target) {
-      return getElementInfo(target);
-    });
+    // Warm the editor-owned probe iframe before observing this request.
+    portableStyleProbeDocument();
+    var portableComputedStylesCache = createPortableStyleComputedStylesCache();
+    try {
+      return targets.map(function (target) {
+        return getElementInfo(target, portableComputedStylesCache);
+      });
+    } finally {
+      portableComputedStylesCache?.mutationObserver.disconnect();
+    }
   }
 
   /** Containment test in the same document space getElementInfo reports
