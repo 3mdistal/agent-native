@@ -1082,11 +1082,13 @@ function readRenderedLayerInfo(
     node: CodeLayerNode;
   },
   breakpointWidth?: number,
+  boardFileId?: string,
 ): ElementInfo | null {
   const base = elementInfoFromCodeLayerNode(owner.node);
   for (const preview of designPreviewWindowsForScreen(
     owner.fileId,
     breakpointWidth,
+    boardFileId,
   )) {
     try {
       const element = preview.document.querySelector(
@@ -5027,6 +5029,8 @@ function DesignEditor() {
     const raw = (designDataJson as Record<string, unknown>).boardFileId;
     return typeof raw === "string" && raw.length > 0 ? raw : undefined;
   }, [designDataJson]);
+  const boardFileIdRef = useRef(boardFileId);
+  boardFileIdRef.current = boardFileId;
 
   // Trigger migration on design open when boardFileId is absent.
   const migrateBoardTriggeredRef = useRef<string | null>(null);
@@ -21742,6 +21746,7 @@ function DesignEditor() {
     const renderedRevision = renderedElementInfoRevisionRef.current;
     const breakpointWidth = activeBreakpointWidthStateRef.current;
     const ownerByNodeId = codeLayerOwnerByNodeIdRef.current;
+    const currentBoardFileId = boardFileIdRef.current;
     type RenderedLayerOwner = {
       fileId: string;
       node: CodeLayerNode;
@@ -21810,6 +21815,7 @@ function DesignEditor() {
       const synchronouslyMeasured = readRenderedLayerInfo(
         owner,
         breakpointWidth,
+        currentBoardFileId,
       );
       if (synchronouslyMeasured) {
         cache(layerId, owner, synchronouslyMeasured);
@@ -21817,7 +21823,11 @@ function DesignEditor() {
       }
       void requestSelectionMeasurement({
         targetWindows: () =>
-          designPreviewWindowsForScreen(owner.fileId, breakpointWidth),
+          designPreviewWindowsForScreen(
+            owner.fileId,
+            breakpointWidth,
+            currentBoardFileId,
+          ),
         screenId: owner.fileId,
         selector: preferredCodeLayerSelector(owner.node),
       }).then((measured) => {
