@@ -456,15 +456,22 @@ test.describe("drag reparent parity", () => {
     await page.waitForTimeout(500);
     const trace = await dumpTrace(page);
     const ghost = page.locator("[data-cross-screen-drag-ghost]");
-    await expect(ghost).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(ghost).toBeVisible({ timeout: 5_000 });
     const ghostAtBoard = await ghost.boundingBox();
     expect(
       ghostAtBoard,
-      `the cross-screen drag ghost must render while the physical drag is held. ` +
-        `Trace: ${trace.slice(-800)}`,
+      `drag ghost geometry missing. Trace: ${trace.slice(-800)}`,
     ).not.toBeNull();
+    expect(ghostAtBoard!.width).toBeGreaterThan(widget.width * 0.8);
+    expect(ghostAtBoard!.height).toBeGreaterThan(widget.height * 0.8);
+    expect(ghostAtBoard!.x + ghostAtBoard!.width / 2).toBeCloseTo(
+      boardPoint.x,
+      0,
+    );
+    expect(ghostAtBoard!.y + ghostAtBoard!.height / 2).toBeCloseTo(
+      boardPoint.y,
+      0,
+    );
     await page.mouse.move(boardPoint.x + 40, boardPoint.y + 24, { steps: 8 });
     await page.waitForTimeout(250);
     const ghostAtSecondPoint = await ghost.boundingBox();
