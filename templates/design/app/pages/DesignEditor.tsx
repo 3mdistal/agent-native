@@ -636,7 +636,10 @@ import { runDistributeSelection } from "./design-editor/commands/distribute-sele
 import { runDownloadAllScreensPdf } from "./design-editor/commands/download-all-screens-pdf";
 import { runDownloadPdf } from "./design-editor/commands/download-pdf";
 import { runDownloadSvg } from "./design-editor/commands/download-svg";
-import { runDuplicateScreen } from "./design-editor/commands/duplicate-screen";
+import {
+  runDuplicateScreen,
+  type DuplicateScreenRecoveryEntry,
+} from "./design-editor/commands/duplicate-screen";
 import { runDuplicateSelection } from "./design-editor/commands/duplicate-selection";
 import { runEditorPaste } from "./design-editor/commands/editor-paste";
 import { runEnterHotkey } from "./design-editor/commands/enter-hotkey";
@@ -1174,14 +1177,20 @@ function DesignEditor() {
     designId: string | undefined;
     searchParams: URLSearchParams;
   } | null>(null);
+  const initialRouteScreenGuardRef = useRef<string | null>(null);
   if (
     !initialEditorUrlRef.current ||
     initialEditorUrlRef.current.designId !== id
   ) {
+    const nextSearchParams = new URLSearchParams(location.search);
     initialEditorUrlRef.current = {
       designId: id,
-      searchParams: new URLSearchParams(location.search),
+      searchParams: nextSearchParams,
     };
+    initialRouteScreenGuardRef.current =
+      nextSearchParams.get("screen") ??
+      nextSearchParams.get("fileId") ??
+      nextSearchParams.get("filename");
   }
   const initialSearchParams = initialEditorUrlRef.current.searchParams;
   const initialRouteScreenTarget =
@@ -2582,6 +2591,14 @@ function DesignEditor() {
   // filename/content/fileType via createFileMutation.
   const fileCreationUndoStackRef = useRef<FileCreationHistoryEntry[]>([]);
   const fileCreationRedoStackRef = useRef<FileCreationHistoryEntry[]>([]);
+  const pendingDuplicateGeometriesRef = useRef<Map<string, FrameGeometry>>(
+    new Map(),
+  );
+  const pendingDuplicateFilenamesRef = useRef<Set<string>>(new Set());
+  const duplicateInFlightRef = useRef<Set<string>>(new Set());
+  const duplicateRecoveryRef = useRef<
+    Map<string, DuplicateScreenRecoveryEntry>
+  >(new Map());
   const fileDeletionUndoStackRef = useRef<FileDeletionHistoryEntry[]>([]);
   const fileDeletionRedoStackRef = useRef<FileDeletionHistoryEntry[]>([]);
   // File deletion undo/redo recreates or removes SQL rows asynchronously.
@@ -3199,6 +3216,10 @@ function DesignEditor() {
     geometryRedoStackRef.current = [];
     fileCreationUndoStackRef.current = [];
     fileCreationRedoStackRef.current = [];
+    pendingDuplicateGeometriesRef.current.clear();
+    pendingDuplicateFilenamesRef.current.clear();
+    duplicateInFlightRef.current.clear();
+    duplicateRecoveryRef.current.clear();
     fileDeletionUndoStackRef.current = [];
     fileDeletionRedoStackRef.current = [];
     fileHistoryMutationPendingRef.current = false;
@@ -3217,15 +3238,24 @@ function DesignEditor() {
   // new action.
   const recordFileCreationHistoryEntry = useCallback(
     (entry: FileCreationHistoryEntry) => {
+      const previous =
+        fileCreationUndoStackRef.current[
+          fileCreationUndoStackRef.current.length - 1
+        ];
+      const continuesBatch =
+        !!entry.historyBatchId &&
+        previous?.historyBatchId === entry.historyBatchId;
       fileCreationUndoStackRef.current = [
         ...fileCreationUndoStackRef.current.slice(-(MAX_DESIGN_UNDO_STACK - 1)),
         entry,
       ];
-      clearRedoStacks();
-      historyOrderRef.current = [
-        ...historyOrderRef.current.slice(-(MAX_DESIGN_UNDO_STACK - 1)),
-        "file-created",
-      ];
+      if (!continuesBatch) {
+        clearRedoStacks();
+        historyOrderRef.current = [
+          ...historyOrderRef.current.slice(-(MAX_DESIGN_UNDO_STACK - 1)),
+          "file-created",
+        ];
+      }
       syncUndoRedoState();
     },
     [clearRedoStacks, syncUndoRedoState],
@@ -3258,6 +3288,7 @@ function DesignEditor() {
   // so continuous zoom/drag ticks coalesce into one history.replaceState
   // instead of one per tick. See that effect's doc comment.
   const urlSyncTimerRef = useRef<number | null>(null);
+  const urlSyncScreenIdRef = useRef<string | null>(null);
   // U9: last handleGeometryCommit timestamp, used to detect a rapid burst of
   // commits (keyboard nudge auto-repeat) so they coalesce into one undo entry
   // and one debounced server write instead of one of each per tick.
@@ -6560,19 +6591,26 @@ function DesignEditor() {
       request?: {
         canvasPosition?: { x: number; y: number };
         preserveCamera?: boolean;
+        historyBatchId?: string;
+        duplicateStackIndex?: number;
       },
     ) =>
       runDuplicateScreen(
         {
           canEditDesign,
           createFileAsync,
+          deleteFileAsync: deleteFileMutation.mutateAsync,
           designDataJsonRef,
+          duplicateRecoveryRef,
           files,
           focusCreatedScreen,
           id,
           liveFrameGeometryRef,
           optimisticallyInsertCreatedFile,
           overviewScreens,
+          pendingDuplicateGeometriesRef,
+          pendingDuplicateFilenamesRef,
+          duplicateInFlightRef,
           queryClient,
           recordFileCreationHistoryEntry,
           t,
@@ -6585,6 +6623,7 @@ function DesignEditor() {
     [
       canEditDesign,
       createFileAsync,
+      deleteFileMutation,
       files,
       focusCreatedScreen,
       recordFileCreationHistoryEntry,
@@ -12791,10 +12830,37 @@ function DesignEditor() {
         sourceNodeIdMap?: readonly (readonly [string, string])[] | null;
         anchorSelector?: string;
         anchorSourceId?: string;
+        anchorElementInfo?: ElementInfo;
+        requestId?: string;
+        dropMode?: "flow-insert" | "absolute-container";
+        forceFlowPositionOverride?: boolean;
+        sourceRect?: { x: number; y: number; width: number; height: number };
+        anchorRect?: { x: number; y: number; width: number; height: number };
         placement?: "before" | "after" | "inside";
       },
-    ) =>
-      runVisualDuplicateChange(
+    ) => {
+      if (isRunningAppSourceType(activeCanvasSourceType) && activeFile) {
+        recordPendingLiveStructureEdit(
+          activeFile.id,
+          elementInfo?.runtimeSelector ?? elementInfo?.selector ?? selector,
+          details?.anchorSelector ?? selector,
+          details?.placement ?? "after",
+          elementInfo,
+          {
+            sourceId: elementInfo?.runtimeSourceId || elementInfo?.sourceId,
+            anchorSourceId: details?.anchorSourceId || details?.sourceId,
+            anchorElementInfo: details?.anchorElementInfo,
+            requestId: details?.requestId,
+            dropMode: details?.dropMode,
+            forceFlowPositionOverride: details?.forceFlowPositionOverride,
+            sourceRect: details?.sourceRect,
+            anchorRect: details?.anchorRect,
+            insertedHtml: cloneHtml,
+          },
+        );
+        return "pending";
+      }
+      return runVisualDuplicateChange(
         {
           activeFile,
           applyLinkedComponentEdit,
@@ -12817,15 +12883,18 @@ function DesignEditor() {
         cloneHtml,
         elementInfo,
         details,
-      ),
+      );
+    },
     [
       remapMotionTracksForClone,
       applyLinkedComponentEdit,
       activeFile,
+      activeCanvasSourceType,
       applyLocalContentUpdate,
       canEditDesign,
       componentCloneContextForFile,
       getFreshActiveContent,
+      recordPendingLiveStructureEdit,
       selectedElement,
       selectedLayerIdsState,
       t,
@@ -13001,6 +13070,12 @@ function DesignEditor() {
         sourceNodeIdMap?: readonly (readonly [string, string])[] | null;
         anchorSelector?: string;
         anchorSourceId?: string;
+        anchorElementInfo?: ElementInfo;
+        requestId?: string;
+        dropMode?: "flow-insert" | "absolute-container";
+        forceFlowPositionOverride?: boolean;
+        sourceRect?: { x: number; y: number; width: number; height: number };
+        anchorRect?: { x: number; y: number; width: number; height: number };
         placement?: "before" | "after" | "inside";
       },
     ) =>
@@ -13015,6 +13090,9 @@ function DesignEditor() {
           componentLinksForFile: componentCloneContextForFile,
           getScreenContent,
           handleVisualDuplicateChange,
+          designSourceType,
+          overviewScreens,
+          recordPendingLiveStructureEdit,
           t,
         },
         screenId,
@@ -13030,8 +13108,11 @@ function DesignEditor() {
       applyFileContentUpdate,
       canEditDesign,
       componentCloneContextForFile,
+      designSourceType,
       getScreenContent,
       handleVisualDuplicateChange,
+      overviewScreens,
+      recordPendingLiveStructureEdit,
       t,
     ],
   );
@@ -15821,6 +15902,7 @@ function DesignEditor() {
         contentUndoSelectionStackRef,
         contentUndoStackRef,
         createFileMutation,
+        deleteFileMutation,
         deleteRuntimeElement,
         designDataJsonRef,
         fileCreationRedoStackRef,
@@ -15878,6 +15960,7 @@ function DesignEditor() {
         setPendingVisualStyleRevertRequest,
         setRuntimeStructureInsertRequest,
         setRuntimeStructureMoveRequest,
+        setOverviewSelectedScreenIds,
         setSelectedElement,
         setSelectedLayerIdsState,
         suppressContentHistoryRef,
@@ -15901,6 +15984,7 @@ function DesignEditor() {
       canEditDesign,
       clearPendingHistoryDirections,
       createFileMutation,
+      deleteFileMutation,
       deleteRuntimeElement,
       files,
       focusCreatedScreen,
@@ -19470,10 +19554,16 @@ function DesignEditor() {
 
   useEffect(() => {
     if (!id || files.length === 0) return;
-    const initialRouteScreen = initialRouteScreenTarget
-      ? findDesignFileByScreenTarget(files, initialRouteScreenTarget)
+    const guardedInitialRouteScreenTarget = initialRouteScreenGuardRef.current;
+    const currentScreenId = activeFileId ?? activeFile?.id;
+    const initialRouteScreen = guardedInitialRouteScreenTarget
+      ? findDesignFileByScreenTarget(files, guardedInitialRouteScreenTarget)
       : undefined;
-    if (initialRouteScreenTarget && !initialRouteScreen && !activeFileId) {
+    if (
+      guardedInitialRouteScreenTarget &&
+      !initialRouteScreen &&
+      !activeFileId
+    ) {
       return;
     }
     // Do not let the URL mirror replace a direct screen/zoom route with the
@@ -19481,11 +19571,11 @@ function DesignEditor() {
     // waiting for the target file. The command owns the first synchronized
     // selection and zoom; once activeFileId reaches that target, normal URL
     // mirroring resumes.
-    if (
-      initialRouteScreen &&
-      (activeFileId ?? activeFile?.id) !== initialRouteScreen.id
-    ) {
+    if (initialRouteScreen && currentScreenId !== initialRouteScreen.id) {
       return;
+    }
+    if (initialRouteScreen && currentScreenId === initialRouteScreen.id) {
+      initialRouteScreenGuardRef.current = null;
     }
     const preserveInitialRouteSelection = Boolean(
       (resolvedInitialRouteSelectionId || initialRouteSelectionId) &&
@@ -19509,6 +19599,11 @@ function DesignEditor() {
       tool: activeTool,
       mode,
     });
+    const nextScreenId = activeFileId ?? activeFile?.id ?? null;
+    const screenChanged =
+      urlSyncScreenIdRef.current !== null &&
+      nextScreenId !== urlSyncScreenIdRef.current;
+    urlSyncScreenIdRef.current = nextScreenId;
     if (nextSearch === location.search) return;
     // Item 11 (URL sync): `zoom` is a dependency here, and zoom changes
     // continuously (every wheel/pinch tick, not just on gesture-end) — every
@@ -19522,6 +19617,18 @@ function DesignEditor() {
     // churn during continuous zoom/drag.
     if (urlSyncTimerRef.current !== null) {
       window.clearTimeout(urlSyncTimerRef.current);
+      urlSyncTimerRef.current = null;
+    }
+    if (screenChanged) {
+      void navigate(
+        {
+          pathname: location.pathname,
+          search: nextSearch,
+          hash: location.hash,
+        },
+        { replace: true, preventScrollReset: true },
+      );
+      return;
     }
     urlSyncTimerRef.current = window.setTimeout(() => {
       urlSyncTimerRef.current = null;
@@ -19554,7 +19661,6 @@ function DesignEditor() {
     location.pathname,
     location.search,
     navigate,
-    initialRouteScreenTarget,
     initialRouteSelectionId,
     resolvedInitialRouteSelectionId,
     selectedUrlSelectionId,

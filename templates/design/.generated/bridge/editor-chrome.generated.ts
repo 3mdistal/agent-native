@@ -10276,6 +10276,7 @@ export const editorChromeBridgeScript: string = `"use strict";
     }
     function postVisualDuplicateChange(originalEl, cloneEl, target, sourceNodeIdMap) {
       if (!originalEl || !cloneEl) return;
+      var anchorEl = target && target.anchor ? target.anchor : originalEl;
       recordSourceSubtree(cloneEl);
       var requestId = "duplicate-" + Date.now() + "-" + Math.random().toString(16).slice(2);
       pendingStructureMoves[requestId] = {
@@ -10290,12 +10291,20 @@ export const editorChromeBridgeScript: string = `"use strict";
           requestId,
           selector: getSelector(originalEl),
           sourceId: getSourceId(originalEl),
-          anchorSelector: target && target.anchor ? getSelector(target.anchor) : "",
-          anchorSourceId: target && target.anchor ? getSourceId(target.anchor) : "",
+          // A free Alt-drag has no resolved insertion target, but the source is
+          // still inserted after its original sibling. Keep that anchor in the
+          // host message so live-source persistence can replay the same relation.
+          anchorSelector: getSelector(anchorEl),
+          anchorSourceId: getSourceId(anchorEl),
           placement: target && target.placement ? target.placement : "after",
+          dropMode: target && target.dropMode ? target.dropMode : void 0,
+          forceFlowPositionOverride: target && target.forceFlowPositionOverride === true ? true : void 0,
+          sourceRect: rectInfoForElement(cloneEl),
+          anchorRect: rectInfoForElement(anchorEl),
           sourceNodeIdMap: Array.isArray(sourceNodeIdMap) ? sourceNodeIdMap : void 0,
           cloneHtml: cloneEl.outerHTML,
-          payload: getElementInfo(cloneEl)
+          payload: getElementInfo(cloneEl),
+          anchorPayload: getElementInfo(anchorEl)
         },
         "*"
       );
@@ -10970,6 +10979,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         var grabbedRect = selectedEl.getBoundingClientRect();
         var clone = selectedEl.cloneNode(true);
         duplicatedSourceNodeIdMap = resetRuntimeStableIds(clone);
+        clone.setAttribute("data-agent-native-clone-root", "true");
         selectedEl.parentElement.insertBefore(clone, selectedEl.nextSibling);
         publishSourceDocumentProvenance(void 0, true);
         selectedEl = clone;
@@ -11303,7 +11313,11 @@ export const editorChromeBridgeScript: string = `"use strict";
             hideInsertionGuide();
             clearReorderLift2();
             clearReorderReflow2();
-            showTransformBadge("Move layer", cx, cy);
+            showTransformBadge(
+              duplicatedForDrag ? "Duplicate layer" : "Move layer",
+              cx,
+              cy
+            );
           } else {
             var rawTarget = resolveReorderOrFreeTarget2(
               cx,
@@ -11325,7 +11339,11 @@ export const editorChromeBridgeScript: string = `"use strict";
             }
             applyReorderLift2(dx, dy);
             applyReorderReflow2(currentTarget, cx, cy);
-            showTransformBadge(currentTarget ? "Move layer" : "Move", cx, cy);
+            showTransformBadge(
+              duplicatedForDrag ? "Duplicate layer" : currentTarget ? "Move layer" : "Move",
+              cx,
+              cy
+            );
           }
         }, cleanupReorderDrag2 = function() {
           document.removeEventListener(events.move, onReorderMove2, true);
@@ -11454,6 +11472,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           );
           if (duplicatedForDrag) {
             applyRuntimeReorder(reorderEl, currentTarget);
+            positionOverlay(selectionOverlay, reorderEl);
             postVisualDuplicateChange(
               originalSelectedEl,
               reorderEl,
