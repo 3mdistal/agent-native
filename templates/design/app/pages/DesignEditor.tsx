@@ -8192,6 +8192,8 @@ function DesignEditor() {
       metadata?: {
         originalStyles?: Record<string, string>;
         interactionState?: InteractionState;
+        pendingUndoGestureId?: string;
+        preserveSelection?: boolean;
       },
     ) =>
       runRecordPendingVisualStyleEdit(
@@ -12739,9 +12741,35 @@ function DesignEditor() {
             ? activeCanvasSourceType
             : designSourceType));
       if (isRunningAppSourceType(sourceType)) {
-        changes.forEach(({ selector, styles }) => {
-          recordPendingVisualStyleEdit(screenId, selector, styles);
-        });
+        const pendingUndoGestureId =
+          changes.length > 1
+            ? pendingVisualStyleGestureIdForPhase(
+                pendingLiveStyleGestureStateRef.current,
+                undefined,
+                true,
+              )
+            : undefined;
+        changes.forEach(
+          ({
+            selector,
+            styles,
+            elementInfo,
+            originalStyles,
+            preserveSelection,
+          }) => {
+            recordPendingVisualStyleEdit(
+              screenId,
+              selector,
+              styles,
+              elementInfo,
+              {
+                originalStyles,
+                pendingUndoGestureId,
+                preserveSelection,
+              },
+            );
+          },
+        );
         return true;
       }
       const content =
@@ -12781,6 +12809,7 @@ function DesignEditor() {
       getFreshActiveContent,
       getScreenContent,
       overviewScreens,
+      pendingVisualStyleGestureIdForPhase,
       recordPendingVisualStyleEdit,
       t,
     ],
