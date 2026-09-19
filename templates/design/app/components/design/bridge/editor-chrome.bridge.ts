@@ -14409,6 +14409,386 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       : "y";
   }
 
+  // Grid placement is two-dimensional. A nearest-child line is not enough
+  // when the pointer is over an empty cell: it can point at a neighbour in a
+  // different row and the live preview then disagrees with the cell the user
+  // is holding over. Let the browser lay out a hidden placeholder at each
+  // structural slot instead of reconstructing tracks here. That keeps used
+  // sizes, implicit tracks, dense/column flow, and zoom transforms in the
+  // browser's own coordinate space.
+  function supportsGridPlaceholderProjection(
+    container: Element,
+    containerStyles: CSSStyleDeclaration,
+    children: Element[],
+    excluded?: Element[],
+  ): boolean {
+    if (
+      containerStyles.display !== "grid" &&
+      containerStyles.display !== "inline-grid"
+    ) {
+      return false;
+    }
+    if (containerStyles.transform && containerStyles.transform !== "none") {
+      return false;
+    }
+    var autoFlow = (containerStyles.gridAutoFlow || "row").split(/\s+/);
+    if (autoFlow[0] !== "row" && autoFlow[0] !== "column") return false;
+    if (autoFlow[1] === "dense" || !children.length) return false;
+    // CSS Grid places every direct child, including locked/hidden layers that
+    // the drag hit-test deliberately omits. Inspect the authored grid set at
+    // this boundary so a filtered child with an explicit slot or span cannot
+    // make the auto-placement shortcut appear safe.
+    var allChildren = (
+      Array.prototype.slice.call(container.children) as Element[]
+    ).filter(function (child) {
+      return (
+        child.nodeType === 1 &&
+        !isOverlayElement(child) &&
+        child.tagName.toLowerCase() !== "template" &&
+        !child.hasAttribute("data-agent-native-reflow-placeholder")
+      );
+    });
+    (excluded || []).forEach(function (child) {
+      if (allChildren.indexOf(child) === -1) allChildren.push(child);
+    });
+    // A filtered direct child still occupies an implicit grid slot. The
+    // projection loop only walks eligible children plus the dragged source,
+    // so retaining the shortcut with any other authored child would index
+    // every later slot against the wrong browser cell. Fall back to the
+    // ordinary insertion-line resolver until the structural set is complete.
+    for (
+      var authoredIndex = 0;
+      authoredIndex < allChildren.length;
+      authoredIndex += 1
+    ) {
+      var authoredChild = allChildren[authoredIndex];
+      if (
+        children.indexOf(authoredChild) === -1 &&
+        (excluded || []).indexOf(authoredChild) === -1
+      ) {
+        // Rendered x-for rows are real grid items even though the source
+        // resolver cannot use them as structural anchors. Keep the browser
+        // projection conservative when one is present instead of indexing a
+        // later authored slot as if the runtime row did not exist.
+        return false;
+      }
+    }
+    for (var i = 0; i < allChildren.length; i += 1) {
+      var childStyles = window.getComputedStyle(allChildren[i]);
+      if (
+        childStyles.gridColumnStart !== "auto" ||
+        childStyles.gridColumnEnd !== "auto" ||
+        childStyles.gridRowStart !== "auto" ||
+        childStyles.gridRowEnd !== "auto" ||
+        childStyles.order !== "0"
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  type GridProjectionSlot = {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  };
+
+  type GridProjectionCacheEntry = {
+    container: Element;
+    styleKey: string;
+    directChildren: Element[];
+    children: Element[];
+    excluded: Element[];
+    slots: GridProjectionSlot[];
+  };
+
+  // Measuring a temporary placeholder is necessary for grid parity, but doing
+  // one forced layout for every candidate slot on every pointer event makes a
+  // large grid visibly stutter. Cache the browser-measured slots for the
+  // current gesture and key them by the target's direct structure and layout
+  // styles. A new pointer gesture clears the cache, so content/layout changes
+  // between drags cannot reuse stale geometry.
+  var gridProjectionCaches: GridProjectionCacheEntry[] = [];
+
+  function clearGridProjectionCaches(): void {
+    gridProjectionCaches = [];
+  }
+
+  function sameGridProjectionElements(
+    left: Element[],
+    right: Element[],
+  ): boolean {
+    if (left.length !== right.length) return false;
+    for (var i = 0; i < left.length; i += 1) {
+      if (left[i] !== right[i]) return false;
+    }
+    return true;
+  }
+
+  function gridProjectionStyleKey(styles: CSSStyleDeclaration): string {
+    return [
+      styles.gridAutoFlow,
+      styles.gridTemplateColumns,
+      styles.gridTemplateRows,
+      styles.gridAutoColumns,
+      styles.gridAutoRows,
+      styles.columnGap,
+      styles.rowGap,
+      styles.justifyContent,
+      styles.alignContent,
+      styles.width,
+      styles.height,
+      styles.boxSizing,
+      styles.padding,
+      styles.border,
+    ].join("|");
+  }
+
+  function cachedGridProjection(
+    container: Element,
+    styleKey: string,
+    directChildren: Element[],
+    children: Element[],
+    excluded: Element[],
+  ): GridProjectionCacheEntry | null {
+    for (var i = 0; i < gridProjectionCaches.length; i += 1) {
+      var entry = gridProjectionCaches[i];
+      if (
+        entry.container === container &&
+        entry.styleKey === styleKey &&
+        sameGridProjectionElements(entry.directChildren, directChildren) &&
+        sameGridProjectionElements(entry.children, children) &&
+        sameGridProjectionElements(entry.excluded, excluded)
+      ) {
+        return entry;
+      }
+    }
+    return null;
+  }
+
+  function prepareGridProjectionPlaceholder(
+    placeholder: HTMLElement,
+    containerStyles: CSSStyleDeclaration,
+  ): void {
+    if (
+      containerStyles.display !== "grid" &&
+      containerStyles.display !== "inline-grid"
+    ) {
+      return;
+    }
+    placeholder.style.position = "static";
+    placeholder.style.left = "auto";
+    placeholder.style.top = "auto";
+    placeholder.style.right = "auto";
+    placeholder.style.bottom = "auto";
+    placeholder.style.gridArea = "auto";
+    placeholder.style.gridColumn = "auto";
+    placeholder.style.gridRow = "auto";
+    placeholder.style.order = "0";
+  }
+
+  function resetFlowDuplicateGridPlacement(duplicate: HTMLElement): void {
+    var parent = duplicate.parentElement;
+    if (!parent) return;
+    var parentStyles = window.getComputedStyle(parent);
+    if (
+      parentStyles.display !== "grid" &&
+      parentStyles.display !== "inline-grid"
+    ) {
+      return;
+    }
+    // A late Alt duplicate enters the source grid as a new auto-flow item.
+    // Carrying the source's authored slot would paint the clone over its
+    // source and make the eventual persisted insertion disagree with the
+    // held preview.
+    duplicate.style.gridArea = "auto";
+    duplicate.style.gridColumn = "auto";
+    duplicate.style.gridRow = "auto";
+    duplicate.style.order = "0";
+  }
+
+  function gridCellInsertionTarget(
+    container: Element,
+    clientX: number,
+    clientY: number,
+    children: Element[],
+    excluded: Element[],
+  ) {
+    var styles = window.getComputedStyle(container);
+    if (styles.display !== "grid" && styles.display !== "inline-grid") {
+      return null;
+    }
+    // A pointer over an authored grid child expresses an insertion between
+    // that child and its neighbor. Reserve the placeholder projection for
+    // actual empty cells and outer grid whitespace; otherwise the projected
+    // child rectangle paints a cell fill where the normal insertion line is
+    // the established drag affordance.
+    var hit = elementFromEditorPointIgnoring(clientX, clientY, excluded);
+    while (hit && hit.parentElement && hit.parentElement !== container) {
+      hit = hit.parentElement;
+    }
+    if (
+      hit &&
+      hit.parentElement === container &&
+      children.indexOf(hit) !== -1
+    ) {
+      return null;
+    }
+    if (
+      !supportsGridPlaceholderProjection(container, styles, children, excluded)
+    ) {
+      return null;
+    }
+    var autoFlow = (styles.gridAutoFlow || "row").split(/\s+/);
+
+    var prototype = excluded && excluded.length ? excluded[0] : null;
+    var placeholder = prototype
+      ? (prototype.cloneNode(true) as HTMLElement)
+      : (container.ownerDocument.createElement("div") as HTMLElement);
+    placeholder.removeAttribute("data-agent-native-node-id");
+    placeholder.setAttribute("data-agent-native-reflow-placeholder", "");
+    prepareGridProjectionPlaceholder(placeholder, styles);
+    placeholder.style.visibility = "hidden";
+    placeholder.style.pointerEvents = "none";
+    placeholder.style.transform = "none";
+    placeholder.style.transition = "none";
+
+    var originalChildren = Array.prototype.slice.call(
+      container.children,
+    ) as Element[];
+    var originalChildNodes = Array.prototype.slice.call(
+      container.childNodes,
+    ) as Node[];
+    var removed = originalChildren.filter(function (child) {
+      return excluded.indexOf(child) !== -1;
+    });
+    var directChildren = originalChildren.filter(function (child) {
+      return (
+        child.nodeType === 1 &&
+        !isOverlayElement(child) &&
+        child.tagName.toLowerCase() !== "template" &&
+        !child.hasAttribute("data-agent-native-reflow-placeholder")
+      );
+    });
+    var projectionStyleKey = gridProjectionStyleKey(styles);
+    var cachedProjection = cachedGridProjection(
+      container,
+      projectionStyleKey,
+      directChildren,
+      children,
+      excluded,
+    );
+    var best: {
+      slot: number;
+      rect: { left: number; top: number; width: number; height: number };
+      distance: number;
+    } | null = null;
+    var trailingCandidate: typeof best = null;
+    var occupiedBottom = -Infinity;
+    var occupiedRight = -Infinity;
+    var slots: GridProjectionSlot[] = cachedProjection
+      ? cachedProjection.slots
+      : [];
+    if (!cachedProjection) {
+      try {
+        removed.forEach(function (child) {
+          container.removeChild(child);
+        });
+        for (var slot = 0; slot <= children.length; slot += 1) {
+          var anchor = children[slot];
+          if (anchor && anchor.parentNode === container) {
+            container.insertBefore(placeholder, anchor);
+          } else {
+            container.appendChild(placeholder);
+          }
+          var measured = placeholder.getBoundingClientRect();
+          slots.push({
+            left: measured.left,
+            top: measured.top,
+            width: measured.width,
+            height: measured.height,
+          });
+          placeholder.remove();
+        }
+      } finally {
+        if (placeholder.parentNode)
+          placeholder.parentNode.removeChild(placeholder);
+        originalChildNodes.forEach(function (originalChildNode) {
+          container.appendChild(originalChildNode);
+        });
+      }
+      cachedProjection = {
+        container: container,
+        styleKey: projectionStyleKey,
+        directChildren: directChildren,
+        children: children.slice(),
+        excluded: excluded.slice(),
+        slots: slots,
+      };
+      gridProjectionCaches.push(cachedProjection);
+    }
+    for (var slotIndex = 0; slotIndex < slots.length; slotIndex += 1) {
+      var slotRect = slots[slotIndex];
+      var dx =
+        clientX < slotRect.left
+          ? slotRect.left - clientX
+          : clientX > slotRect.left + slotRect.width
+            ? clientX - (slotRect.left + slotRect.width)
+            : 0;
+      var dy =
+        clientY < slotRect.top
+          ? slotRect.top - clientY
+          : clientY > slotRect.top + slotRect.height
+            ? clientY - (slotRect.top + slotRect.height)
+            : 0;
+      var distance = Math.hypot(dx, dy);
+      var candidate = {
+        slot: slotIndex,
+        rect: {
+          left: slotRect.left,
+          top: slotRect.top,
+          width: slotRect.width,
+          height: slotRect.height,
+        },
+        distance: distance,
+      };
+      if (!best || distance < best.distance) best = candidate;
+      if (slotIndex < children.length) {
+        occupiedBottom = Math.max(
+          occupiedBottom,
+          slotRect.top + slotRect.height,
+        );
+        occupiedRight = Math.max(occupiedRight, slotRect.left + slotRect.width);
+      } else {
+        trailingCandidate = candidate;
+      }
+    }
+    if (!best) return null;
+    // A full grid leaves its next implicit row/column in the container's
+    // trailing whitespace. Euclidean distance otherwise favors the last
+    // visible cell along the perpendicular axis, so a bottom/right edge drop
+    // would preview that occupied cell instead of the new flow slot.
+    if (
+      trailingCandidate &&
+      ((autoFlow[0] === "row" && clientY > occupiedBottom) ||
+        (autoFlow[0] === "column" && clientX > occupiedRight))
+    ) {
+      best = trailingCandidate;
+    }
+    var slot = best.slot;
+    var anchor = children[slot] || children[children.length - 1];
+    return {
+      anchor: anchor,
+      placement: slot < children.length ? "before" : "after",
+      axis: autoFlow[0] === "column" ? "y" : "x",
+      dropMode: "flow-insert",
+      guideRect: best.rect,
+      guideMode: "grid-cell",
+    };
+  }
+
   // Resolves a between-children insertion inside `container` from the
   // pointer position: the nearest visible child (by flow-axis center, or
   // two-dimensional visual distance for wrapped flex and multi-track grid)
@@ -14452,6 +14832,14 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     });
     if (!children.length) return null;
     var containerStyles = window.getComputedStyle(container);
+    var gridCellTarget = gridCellInsertionTarget(
+      container,
+      clientX,
+      clientY,
+      children,
+      excluded,
+    );
+    if (gridCellTarget) return gridCellTarget;
     var wrappedFlexAxis = wrappedFlexMainAxis(container);
     var axis = wrappedFlexAxis || parentFlowAxis(container);
     var multiTrackGrid =
@@ -15023,6 +15411,41 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       // node whose parent happens to be body — must fall through to a plain
       // absolute placement instead of silently wrapping body in auto-layout.
       var parent = cursor.parentElement;
+      // An absolute layer dropped onto a direct child of an established
+      // auto-layout parent is joining that parent's flow. Resolve the sibling
+      // slot before the freeform-container probes below: generated preview
+      // wrappers and relatively positioned leaf cards can otherwise look like
+      // absolute containers and swallow the layer as an absolute child.
+      if (
+        parent &&
+        parent !== document.body &&
+        isAutoLayoutElement(parent) &&
+        cursor.getAttribute("data-an-primitive") !== "frame" &&
+        !isTextBearingLeaf(parent) &&
+        !isTemplateCloneElement(cursor)
+      ) {
+        var directChildSlot = nearestChildInsertionTarget(
+          parent,
+          clientX,
+          clientY,
+          dragged,
+        );
+        if (directChildSlot) return directChildSlot;
+        var directChildRect = cursor.getBoundingClientRect();
+        var directChildAxis = parentFlowAxis(parent);
+        var directChildPointer = directChildAxis === "x" ? clientX : clientY;
+        var directChildCenter =
+          directChildAxis === "x"
+            ? directChildRect.left + directChildRect.width / 2
+            : directChildRect.top + directChildRect.height / 2;
+        return {
+          anchor: cursor,
+          placement:
+            directChildPointer < directChildCenter ? "before" : "after",
+          axis: directChildAxis,
+          dropMode: "flow-insert",
+        };
+      }
       // Absolute-primitive-container target (a canvas rectangle marked
       // data-an-primitive="rectangle"/"rect"): this is a dedicated
       // free-placement container, not a Figma-style auto-layout frame — the
@@ -15106,6 +15529,8 @@ declare var __INITIAL_SOURCE_HEAD__: string;
             placement: betweenContainerChildren.placement,
             axis: betweenContainerChildren.axis,
             dropMode: "flow-insert",
+            guideRect: betweenContainerChildren.guideRect,
+            guideMode: betweenContainerChildren.guideMode,
           };
         }
         return {
@@ -15114,6 +15539,21 @@ declare var __INITIAL_SOURCE_HEAD__: string;
           axis: parentFlowAxis(cursor),
           dropMode: "flow-insert",
         };
+      }
+      if (
+        parent &&
+        parent !== document.body &&
+        parent.parentElement &&
+        parent.parentElement !== document.body &&
+        isAutoLayoutElement(parent.parentElement) &&
+        parent.getAttribute("data-an-primitive") !== "frame"
+      ) {
+        // A generated text wrapper inside a direct auto-layout child is still
+        // part of that sibling's hit area. Walk out to the direct child so a
+        // free layer re-enters the parent's flow instead of nesting into the
+        // wrapper's leaf card as an absolute child.
+        cursor = parent;
+        continue;
       }
       if (parent && parent !== document.body && isContainerDropTarget(parent)) {
         // Free element over a sibling in a non-auto-layout parent stays free:
@@ -15147,6 +15587,8 @@ declare var __INITIAL_SOURCE_HEAD__: string;
               placement: cloneFallback.placement,
               axis: cloneFallback.axis,
               dropMode: "flow-insert",
+              guideRect: cloneFallback.guideRect,
+              guideMode: cloneFallback.guideMode,
             };
           }
           return {
@@ -15299,7 +15741,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     // guide must match so it stays a visible bright line at any zoom.
     var line = 2 * chromeLineScale();
     var insideBorder = 2 * chromeLineScale();
-    var rect = target.anchor.getBoundingClientRect();
+    var rect = target.guideRect || target.anchor.getBoundingClientRect();
     insertionGuide.style.display = "block";
     insertionGuide.style.background = "var(--design-editor-accent-color)";
     insertionGuide.style.border = "0";
@@ -15317,6 +15759,34 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         insideBorder + "px solid var(--design-editor-accent-color)";
       insertionGuide.style.borderRadius = "2px";
       insertionGuide.style.boxShadow = "none";
+      return;
+    }
+    if (target.guideMode === "grid-cell") {
+      insertionGuide.style.boxSizing = "border-box";
+      insertionGuide.style.left = rect.left + "px";
+      insertionGuide.style.top = rect.top + "px";
+      insertionGuide.style.width = rect.width + "px";
+      insertionGuide.style.height = rect.height + "px";
+      insertionGuide.style.background =
+        "color-mix(in srgb, var(--design-editor-accent-color) 14%, transparent)";
+      insertionGuide.style.border =
+        insideBorder + "px solid var(--design-editor-accent-color)";
+      insertionGuide.style.borderRadius = "2px";
+      insertionGuide.style.boxShadow = "none";
+      return;
+    }
+    if (target.guideMode === "wrapped-slot") {
+      if (target.axis === "x") {
+        insertionGuide.style.left = rect.left - line / 2 + "px";
+        insertionGuide.style.top = rect.top + "px";
+        insertionGuide.style.width = line + "px";
+        insertionGuide.style.height = rect.height + "px";
+      } else {
+        insertionGuide.style.left = rect.left + "px";
+        insertionGuide.style.top = rect.top - line / 2 + "px";
+        insertionGuide.style.width = rect.width + "px";
+        insertionGuide.style.height = line + "px";
+      }
       return;
     }
     if (target.axis === "x") {
@@ -16919,6 +17389,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     e.preventDefault();
     e.stopPropagation();
     if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+    clearGridProjectionCaches();
     var moveGestureId = ++dragGestureSequence;
     // Real creation time of the mousedown that started this gesture, not the
     // moment this handler happened to run — see cancelActiveBridgeDragOrPendingCommit.
@@ -16945,6 +17416,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       duplicatedSourceNodeIdMap = resetRuntimeStableIds(clone);
       clone.setAttribute("data-agent-native-clone-root", "true");
       selectedEl.parentElement.insertBefore(clone, selectedEl.nextSibling);
+      resetFlowDuplicateGridPlacement(clone as HTMLElement);
       publishSourceDocumentProvenance(undefined, true);
       selectedEl = clone;
       duplicatedForDrag = true;
@@ -17085,7 +17557,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       var reorderGestureStartRect = dragGrabRect(reorderEl);
       var reorderLastTargetKey = null;
       var keepCurrentFlowParent = bridgeSpaceKeyPressed;
-      // Ctrl/Cmd overrides auto-layout drag resistance for the WHOLE
+      // Ctrl overrides auto-layout drag resistance for the WHOLE
       // gesture (unique-paths-5): captured once here, not re-read per move
       // tick, so releasing the modifier mid-drag can't hand the gesture to
       // the host's cross-screen tracking partway through. Held, this skips
@@ -17095,7 +17567,8 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       // board the moment the pointer crosses the screen's rendered edge,
       // stealing the gesture from the (already-correct) in-iframe free-move
       // path below before it can ever run.
-      var reorderIgnoresAutoLayout = Boolean(e.ctrlKey || e.metaKey);
+      var reorderIgnoresAutoLayout = Boolean(e.ctrlKey);
+      var reorderMetaFreePlacement = false;
       var currentTarget = flowMoveTargetForPoint(
         reorderEl,
         e.clientX,
@@ -17217,9 +17690,10 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         applyReorderLift(0, 0);
         positionOverlay(selectionOverlay, selectedEl);
       }
-      // Live sibling reflow, restricted to same-container simple-packed flex so
-      // a constant per-sibling shift always matches the real drop; ported from
-      // shared/drag-reflow.ts.
+      // Live sibling reflow. The preview is calculated by asking the browser
+      // for the actual layout after a temporary placeholder is inserted at
+      // the target slot. That keeps wrapped flex and grid geometry faithful to
+      // CSS instead of assuming every sibling moves by one main-axis gap.
       var reorderCommittedTarget: any = null;
       var reorderCommittedSlot: number | null = null;
       var reorderCommittedAt = 0;
@@ -17231,10 +17705,17 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         prevTransform: string;
         authoredTransform: string;
         prevTransition: string;
+        previewTransform: string;
+        previewTransition: string;
       }[] = [];
       var reflowKey: string | null = null;
-      var packedCacheContainer: Element | null = null;
-      var packedCacheResult = false;
+      var reflowGuideRect: {
+        left: number;
+        top: number;
+        width: number;
+        height: number;
+      } | null = null;
+      var reflowGuideMode: string | null = null;
       function reorderMainAxis(target): "x" | "y" {
         return target && target.axis === "y" ? "y" : "x";
       }
@@ -17253,42 +17734,6 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         if (ai < 0) return null;
         return { slot: target.placement === "before" ? ai : ai + 1 };
       }
-      function containerIsSimplePacked(container: Element): boolean {
-        if (packedCacheContainer === container) return packedCacheResult;
-        packedCacheContainer = container;
-        packedCacheResult = false;
-        var cs = window.getComputedStyle(container);
-        if (cs.display !== "flex" && cs.display !== "inline-flex") return false;
-        if (cs.flexDirection !== "row" && cs.flexDirection !== "column") {
-          return false;
-        }
-        if (cs.flexWrap !== "nowrap") return false;
-        var jc = cs.justifyContent;
-        if (
-          jc !== "flex-start" &&
-          jc !== "start" &&
-          jc !== "normal" &&
-          jc !== "left" &&
-          jc !== ""
-        ) {
-          return false;
-        }
-        var kids = container.children;
-        for (var i = 0; i < kids.length; i += 1) {
-          if (kids[i].nodeType !== 1) continue;
-          if (parseFloat(window.getComputedStyle(kids[i]).flexGrow) > 0) {
-            return false;
-          }
-        }
-        packedCacheResult = true;
-        return true;
-      }
-      function reorderMainGap(container: Element, axis: "x" | "y"): number {
-        var cs = window.getComputedStyle(container);
-        var raw = axis === "x" ? cs.columnGap || cs.gap : cs.rowGap || cs.gap;
-        var n = readPx(raw);
-        return Number.isFinite(n) && n > 0 ? n : 0;
-      }
       function clearReorderReflow(): void {
         reflowSiblings.forEach(function (s) {
           s.el.style.transform = s.prevTransform;
@@ -17296,6 +17741,126 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         });
         reflowSiblings = [];
         reflowKey = null;
+        reflowGuideRect = null;
+        reflowGuideMode = null;
+      }
+      function clearReorderReflowForHitTest(): void {
+        reflowSiblings.forEach(function (s) {
+          s.el.style.transform = s.prevTransform;
+          s.el.style.transition = s.prevTransition;
+        });
+      }
+      function restoreReorderReflowPreview(): void {
+        reflowSiblings.forEach(function (s) {
+          s.el.style.transition = s.previewTransition;
+          s.el.style.transform = s.previewTransform;
+        });
+      }
+      var reorderLastMoveEvent: any = null;
+      var reorderMoved = false;
+      function activateReorderControlOverride(): void {
+        if (reorderIgnoresAutoLayout) return;
+        reorderIgnoresAutoLayout = true;
+        reorderMetaFreePlacement = false;
+        crossScreenClaimedByHost = false;
+        postCrossScreenDrag("cancel");
+      }
+      function releaseReorderMetaOverride(point?: {
+        clientX?: number;
+        clientY?: number;
+      }): void {
+        if (!reorderMetaFreePlacement) return;
+        reorderMetaFreePlacement = false;
+        crossScreenClaimedByHost = false;
+        if (isGroupDrag || reorderIgnoresAutoLayout) return;
+        var lastPoint = point || reorderLastMoveEvent;
+        if (
+          !lastPoint ||
+          !Number.isFinite(lastPoint.clientX) ||
+          !Number.isFinite(lastPoint.clientY)
+        ) {
+          return;
+        }
+        postCrossScreenDrag(
+          "start",
+          reorderEl,
+          { clientX: lastPoint.clientX, clientY: lastPoint.clientY },
+          {
+            duplicate: duplicatedForDrag,
+            elementRect: reorderRect,
+            pointerOffset: reorderPointerOffset,
+            styleSnapshot: reorderStyleSnapshot,
+          },
+        );
+      }
+      function resetReorderModifierState(): void {
+        reorderMetaFreePlacement = false;
+        reorderIgnoresAutoLayout = false;
+      }
+      function activateLateReorderDuplicate(ev): void {
+        if (duplicatedForDrag || isGroupDrag || !reorderEl) return;
+        clearReorderLift();
+        clearReorderReflow();
+        var sourceEl = reorderEl;
+        var sourceRect = sourceEl.getBoundingClientRect();
+        var clone = sourceEl.cloneNode(true) as HTMLElement;
+        duplicatedSourceNodeIdMap = resetRuntimeStableIds(clone);
+        clone.setAttribute("data-agent-native-clone-root", "true");
+        if (sourceEl.parentElement) {
+          sourceEl.parentElement.insertBefore(clone, sourceEl.nextSibling);
+        }
+        resetFlowDuplicateGridPlacement(clone);
+        publishSourceDocumentProvenance(undefined, true);
+        duplicatedForDrag = true;
+        selectedEl = clone;
+        gestureEl = clone;
+        reorderEl = clone;
+        groupEls = [clone];
+        groupOthers = [];
+        isGroupDrag = false;
+        var insertedRect = clone.getBoundingClientRect();
+        duplicateGrabOffset = {
+          x: sourceRect.left - insertedRect.left,
+          y: sourceRect.top - insertedRect.top,
+        };
+        reorderOrigins = [
+          {
+            el: clone,
+            prevParent: clone.parentElement,
+            prevNextSibling: clone.nextSibling,
+            prevInlinePositionStyles: snapshotInlinePositionStyles(clone),
+          },
+        ];
+        reorderGroupStartRects = [dragGrabRect(clone)];
+        reorderGestureStartRect = dragGrabRect(clone);
+        reorderRect = dragGrabRect(clone);
+        reorderPointerOffset = {
+          x: reorderPointerStart.clientX - reorderRect.left,
+          y: reorderPointerStart.clientY - reorderRect.top,
+        };
+        reorderStyleSnapshot = collectPortableStyleSnapshot(clone);
+        reorderLastTargetKey = null;
+        crossScreenClaimedByHost = false;
+        postCrossScreenDrag("cancel");
+        postCrossScreenDrag(
+          "start",
+          reorderEl,
+          { clientX: ev?.clientX, clientY: ev?.clientY },
+          {
+            duplicate: true,
+            elementRect: {
+              left: reorderRect.left,
+              top: reorderRect.top,
+              width: reorderRect.width,
+              height: reorderRect.height,
+            },
+            pointerOffset: reorderPointerOffset,
+            styleSnapshot: reorderStyleSnapshot,
+          },
+        );
+        applyReorderLift(0, 0);
+        positionOverlay(selectionOverlay, selectedEl);
+        postElementSelect(selectedEl);
       }
       // Auto-layout children reorder into a slot on plain drag — they have no
       // free x/y without leaving the layout, which would collapse it. Ctrl
@@ -17316,6 +17881,39 @@ declare var __INITIAL_SOURCE_HEAD__: string;
           groupOthers,
           keepCurrentFlowParent,
           ctrlKey,
+        );
+      }
+      function hasMetaFlowTarget(target, cx, cy) {
+        var sourceParent = reorderEl.parentElement;
+        if (sourceParent && isAutoLayoutElement(sourceParent)) {
+          var sourceRect = sourceParent.getBoundingClientRect();
+          if (
+            cx >= sourceRect.left &&
+            cx <= sourceRect.right &&
+            cy >= sourceRect.top &&
+            cy <= sourceRect.bottom
+          ) {
+            return true;
+          }
+        }
+        if (!target || target.dropMode !== "flow-insert") {
+          return false;
+        }
+        var container = dropContainerForTarget(target);
+        if (
+          !container ||
+          container === document.body ||
+          container === document.documentElement ||
+          (!isAutoLayoutElement(container) && !target.needsAutoLayoutConversion)
+        ) {
+          return false;
+        }
+        var rect = container.getBoundingClientRect();
+        return (
+          cx >= rect.left &&
+          cx <= rect.right &&
+          cy >= rect.top &&
+          cy <= rect.bottom
         );
       }
       // Figma's "don't nest into a smaller container" guard (⌘/Ctrl overrides).
@@ -17434,10 +18032,17 @@ declare var __INITIAL_SOURCE_HEAD__: string;
           return;
         }
         var container = dropContainerForTarget(target);
+        var containerStyles = container
+          ? window.getComputedStyle(container)
+          : null;
         if (
           !container ||
           (reorderEl as HTMLElement).parentElement !== container ||
-          !containerIsSimplePacked(container)
+          !containerStyles ||
+          (containerStyles.display !== "flex" &&
+            containerStyles.display !== "inline-flex" &&
+            containerStyles.display !== "grid" &&
+            containerStyles.display !== "inline-grid")
         ) {
           clearReorderReflow();
           return;
@@ -17449,53 +18054,152 @@ declare var __INITIAL_SOURCE_HEAD__: string;
           clearReorderReflow();
           return;
         }
+        var gridProjectionSupported = supportsGridPlaceholderProjection(
+          container,
+          containerStyles,
+          real.filter(function (member) {
+            return member !== reorderEl;
+          }),
+          [reorderEl],
+        );
         var axis = reorderMainAxis(target);
         var key = axis + ":" + slotInfo.slot;
-        if (key === reflowKey) return;
+        if (key === reflowKey) {
+          // The target resolver returns a fresh object on every pointer event.
+          // Preserve the wrapped-slot projection that was computed when the
+          // same-slot fast path first ran so the guide does not fall back to
+          // the anchor's full card rect on subsequent events.
+          restoreReorderReflowPreview();
+          if (reflowGuideRect) target.guideRect = { ...reflowGuideRect };
+          if (reflowGuideMode) target.guideMode = reflowGuideMode;
+          return;
+        }
         clearReorderReflow();
         reflowKey = key;
-        var drect = (reorderEl as HTMLElement).getBoundingClientRect();
-        var slotMain =
-          (axis === "x" ? drect.width : drect.height) +
-          reorderMainGap(container, axis);
-        // Only siblings between origin and target shift, by ±slotMain — exact
-        // for a packed container regardless of each sibling's own size.
-        var offsets: number[] = new Array(real.length).fill(0);
-        if (slotInfo.slot > originIndex + 1) {
-          for (var a = originIndex + 1; a <= slotInfo.slot - 1; a += 1) {
-            offsets[a] = -slotMain;
-          }
-        } else if (slotInfo.slot < originIndex) {
-          for (var b = slotInfo.slot; b <= originIndex - 1; b += 1) {
-            offsets[b] = slotMain;
-          }
+        var originalNextSibling = reorderEl.nextSibling;
+        var placeholder = reorderEl.cloneNode(true) as HTMLElement;
+        placeholder.removeAttribute("data-agent-native-node-id");
+        placeholder.setAttribute("data-agent-native-reflow-placeholder", "");
+        placeholder.style.visibility = "hidden";
+        placeholder.style.pointerEvents = "none";
+        placeholder.style.transform = "none";
+        placeholder.style.transition = "none";
+        if (gridProjectionSupported) {
+          prepareGridProjectionPlaceholder(placeholder, containerStyles);
         }
-        for (var i = 0; i < real.length; i += 1) {
-          if (i === originIndex) continue;
-          var el = real[i] as HTMLElement;
-          var prevTransform = el.style.transform;
-          var authoredTransform = authoredTransformOf(el);
-          reflowSiblings.push({
-            el: el,
-            prevTransform: prevTransform,
-            authoredTransform: authoredTransform,
-            prevTransition: el.style.transition,
+        var projectedRects: {
+          el: Element;
+          left: number;
+          top: number;
+        }[] = [];
+        try {
+          reorderEl.parentElement!.removeChild(reorderEl);
+          if (target.placement === "inside") {
+            container.appendChild(placeholder);
+          } else if (target.placement === "before") {
+            container.insertBefore(placeholder, target.anchor);
+          } else {
+            container.insertBefore(placeholder, target.anchor.nextSibling);
+          }
+          real.forEach(function (member) {
+            if (member === reorderEl) return;
+            var projected = member.getBoundingClientRect();
+            projectedRects.push({
+              el: member,
+              left: projected.left,
+              top: projected.top,
+            });
           });
-          el.style.transition = "transform 140ms cubic-bezier(0.2, 0, 0, 1)";
-          var tx = axis === "x" ? offsets[i] : 0;
-          var ty = axis === "y" ? offsets[i] : 0;
-          // Translate FIRST (screen space) composed with the sibling's own
-          // transform so an authored rotate/scale survives the reflow shift.
-          el.style.transform =
-            "translate(" +
-            tx +
-            "px, " +
-            ty +
-            "px)" +
-            (authoredTransform ? " " + authoredTransform : "");
+          if (
+            containerStyles.flexWrap === "wrap" ||
+            containerStyles.flexWrap === "wrap-reverse"
+          ) {
+            var projectedGuide = placeholder.getBoundingClientRect();
+            reflowGuideRect = {
+              left: projectedGuide.left,
+              top: projectedGuide.top,
+              width: projectedGuide.width,
+              height: projectedGuide.height,
+            };
+            target.guideRect = { ...reflowGuideRect };
+            reflowGuideMode = "wrapped-slot";
+            target.guideMode = reflowGuideMode;
+          }
+          placeholder.remove();
+          if (
+            originalNextSibling &&
+            originalNextSibling.parentNode === container
+          ) {
+            container.insertBefore(reorderEl, originalNextSibling);
+          } else {
+            container.appendChild(reorderEl);
+          }
+          projectedRects.forEach(function (projected) {
+            var el = projected.el as HTMLElement;
+            var current = el.getBoundingClientRect();
+            var dx = projected.left - current.left;
+            var dy = projected.top - current.top;
+            if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+            var prevTransform = el.style.transform;
+            var authoredTransform = authoredTransformOf(el);
+            var previewTransition =
+              "transform 140ms cubic-bezier(0.2, 0, 0, 1)";
+            var previewTransform =
+              "translate(" +
+              dx +
+              "px, " +
+              dy +
+              "px)" +
+              (authoredTransform ? " " + authoredTransform : "");
+            reflowSiblings.push({
+              el: el,
+              prevTransform: prevTransform,
+              authoredTransform: authoredTransform,
+              prevTransition: el.style.transition,
+              previewTransform: previewTransform,
+              previewTransition: previewTransition,
+            });
+            el.style.transition = previewTransition;
+            // Translate FIRST (screen space) composed with the sibling's own
+            // transform so an authored rotate/scale survives the reflow shift.
+            el.style.transform = previewTransform;
+          });
+        } catch (error) {
+          // A layout read or DOM insertion can fail if the editor is tearing
+          // down the frame during a cancel. Restore all preview transforms
+          // before letting the gesture handler surface the error.
+          clearReorderReflow();
+          throw error;
+        } finally {
+          if (placeholder.parentNode)
+            placeholder.parentNode.removeChild(placeholder);
+          if ((reorderEl as HTMLElement).parentNode !== container) {
+            if (
+              originalNextSibling &&
+              originalNextSibling.parentNode === container
+            ) {
+              container.insertBefore(reorderEl, originalNextSibling);
+            } else {
+              container.appendChild(reorderEl);
+            }
+          }
         }
       }
       function onReorderMove(ev) {
+        reorderLastMoveEvent = ev;
+        if (!ev.metaKey) releaseReorderMetaOverride(ev);
+        if (
+          !reorderMoved &&
+          Math.hypot(
+            ev.clientX - reorderPointerStart.clientX,
+            ev.clientY - reorderPointerStart.clientY,
+          ) > 3
+        ) {
+          reorderMoved = true;
+        }
+        if (ev.altKey && reorderMoved && !duplicatedForDrag) {
+          activateLateReorderDuplicate(ev);
+        }
         var vw = window.innerWidth;
         var vh = window.innerHeight;
         var cx = ev.clientX;
@@ -17503,13 +18207,60 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         var dx = cx - reorderPointerStart.clientX;
         var dy = cy - reorderPointerStart.clientY;
         var outside = cx < 0 || cy < 0 || cx > vw || cy > vh;
+        if (ev.ctrlKey) activateReorderControlOverride();
+        var rawTarget = null;
+        // Meta stays in normal flow whenever the pointer resolves to a real
+        // flow target. Probe without the free-placement override first on
+        // every move so crossing a background gap on the way to a valid target
+        // does not permanently poison the rest of the gesture.
+        if (ev.metaKey && !isGroupDrag && !reorderIgnoresAutoLayout) {
+          clearReorderReflow();
+          var metaFlowTarget = outside
+            ? null
+            : resolveReorderOrFreeTarget(cx, cy, false);
+          if (hasMetaFlowTarget(metaFlowTarget, cx, cy)) {
+            if (reorderMetaFreePlacement) {
+              reorderMetaFreePlacement = false;
+              postCrossScreenDrag(
+                "start",
+                reorderEl,
+                {
+                  clientX: cx,
+                  clientY: cy,
+                },
+                {
+                  duplicate: duplicatedForDrag,
+                  elementRect: reorderRect,
+                  pointerOffset: reorderPointerOffset,
+                  styleSnapshot: reorderStyleSnapshot,
+                },
+              );
+            }
+            rawTarget = metaFlowTarget;
+          } else {
+            if (!reorderMetaFreePlacement) {
+              reorderMetaFreePlacement = true;
+              crossScreenClaimedByHost = false;
+              postCrossScreenDrag("cancel");
+            }
+            if (!outside) {
+              rawTarget = resolveReorderOrFreeTarget(cx, cy, true);
+              rawTarget = applyReorderSizeGuard(rawTarget, ev);
+            }
+          }
+        }
         // Always notify the host frame so it can track the cursor position,
         // render the ghost, and highlight the target screen. Group drags stay
         // in-iframe (the host's cross-screen drop moves a single element and
         // would tear the group apart), so they never arm the host. Same for
-        // a ctrl/cmd auto-layout-override drag (see reorderIgnoresAutoLayout
-        // above): the host's board-level listeners have no ctrl-awareness.
-        if (!isGroupDrag && !reorderIgnoresAutoLayout) {
+        // a ctrl/cmd auto-layout-override drag or a Meta free-placement tick
+        // (see the two gesture flags above): the host's board-level listeners
+        // have no modifier-aware target resolver.
+        if (
+          !isGroupDrag &&
+          !reorderIgnoresAutoLayout &&
+          !reorderMetaFreePlacement
+        ) {
           postCrossScreenDrag(
             "move",
             reorderEl,
@@ -17545,11 +18296,19 @@ declare var __INITIAL_SOURCE_HEAD__: string;
           // stabilized (hysteresis) and previewed with live sibling reflow when
           // liveReflowEnabled. stabilizeReorderTarget / applyReorderReflow are
           // no-ops (pass-through) when the flag is off.
-          var rawTarget = resolveReorderOrFreeTarget(
-            cx,
-            cy,
-            reorderIgnoresAutoLayout || Boolean(ev.ctrlKey || ev.metaKey),
-          );
+          // Resolve against the source layout, not transforms from the prior
+          // projected slot. The next call reapplies the fresh projection, so
+          // wrapped rows remain hit-testable while siblings animate.
+          clearReorderReflowForHitTest();
+          if (!rawTarget) {
+            rawTarget = resolveReorderOrFreeTarget(
+              cx,
+              cy,
+              reorderIgnoresAutoLayout ||
+                reorderMetaFreePlacement ||
+                Boolean(ev.ctrlKey),
+            );
+          }
           rawTarget = applyReorderSizeGuard(rawTarget, ev);
           currentTarget = stabilizeReorderTarget(
             rawTarget,
@@ -17557,7 +18316,6 @@ declare var __INITIAL_SOURCE_HEAD__: string;
             cy,
             ev.timeStamp,
           );
-          showInsertionGuideFor(currentTarget);
           var _dndKey = currentTarget
             ? getSelector(currentTarget.anchor) +
               "|" +
@@ -17571,6 +18329,9 @@ declare var __INITIAL_SOURCE_HEAD__: string;
           }
           applyReorderLift(dx, dy);
           applyReorderReflow(currentTarget, cx, cy);
+          // Paint after sibling projection so a marker anchored to a moved
+          // child follows its projected geometry instead of one frame behind.
+          showInsertionGuideFor(currentTarget);
           showTransformBadge(
             duplicatedForDrag
               ? "Duplicate layer"
@@ -17626,10 +18387,20 @@ declare var __INITIAL_SOURCE_HEAD__: string;
           positionOverlay(selectionOverlay, selectedEl);
           postElementSelect(selectedEl);
         }
+        resetReorderModifierState();
         suppressNextShieldClickBriefly();
         return true;
       }
       function onReorderKeyDown(ev) {
+        if (
+          ev.key === "Control" ||
+          ev.code === "ControlLeft" ||
+          ev.code === "ControlRight"
+        ) {
+          activateReorderControlOverride();
+          ev.preventDefault();
+          return;
+        }
         if (ev.code === "Space" || ev.key === " ") {
           keepCurrentFlowParent = true;
           ev.preventDefault();
@@ -17641,6 +18412,15 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         }
       }
       function onReorderKeyUp(ev) {
+        if (
+          ev.key === "Meta" ||
+          ev.code === "MetaLeft" ||
+          ev.code === "MetaRight"
+        ) {
+          releaseReorderMetaOverride();
+          ev.preventDefault();
+          return;
+        }
         if (ev.code !== "Space" && ev.key !== " ") return;
         // Deliberately NOT resetting keepCurrentFlowParent here. onReorderUp
         // re-resolves the drop target from the release point (see its own
@@ -17672,14 +18452,29 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         var vh = window.innerHeight;
         var cx = ev.clientX;
         var cy = ev.clientY;
+        var outside = cx < 0 || cy < 0 || cx > vw || cy > vh;
+        if (!ev.metaKey) releaseReorderMetaOverride(ev);
+        if (ev.ctrlKey) activateReorderControlOverride();
+        if (ev.metaKey && !reorderIgnoresAutoLayout && !isGroupDrag) {
+          var metaReleaseTarget = outside
+            ? null
+            : resolveReorderOrFreeTarget(cx, cy, false);
+          if (!hasMetaFlowTarget(metaReleaseTarget, cx, cy)) {
+            reorderMetaFreePlacement = true;
+            crossScreenClaimedByHost = false;
+            postCrossScreenDrag("cancel");
+          } else {
+            reorderMetaFreePlacement = false;
+          }
+        }
         var outsideOnDrop =
-          // A ctrl/cmd auto-layout-override drag never arms the host (see
-          // onReorderMove/reorderIgnoresAutoLayout above), so the numeric
-          // outside-the-iframe check below — which exists only to defer to
-          // the host's cross-screen drop — must not apply to it either, or
+          // A ctrl/cmd auto-layout-override or Meta free-placement drag never
+          // arms the host (see onReorderMove above), so the numeric
+          // outside-the-iframe check below must not apply to either path, or
           // the in-iframe commit below is skipped with nothing to take its
           // place.
           (!reorderIgnoresAutoLayout &&
+            !reorderMetaFreePlacement &&
             (cx < 0 || cy < 0 || cx > vw || cy > vh)) ||
           // Claimed by the host: committing here too would write the node
           // twice, from two different ideas of where it landed.
@@ -17687,8 +18482,13 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         // Post the end message so the host can finalize a cross-screen drop.
         // Group drags never armed the host (see onReorderMove), so posting
         // end here would trigger a bogus single-element cross-screen move.
-        // Same for a ctrl/cmd auto-layout-override drag (unique-paths-5).
-        if (!isGroupDrag && !reorderIgnoresAutoLayout) {
+        // Same for a ctrl/cmd auto-layout-override or Meta free-placement
+        // drag (unique-paths-5).
+        if (
+          !isGroupDrag &&
+          !reorderIgnoresAutoLayout &&
+          !reorderMetaFreePlacement
+        ) {
           postCrossScreenDrag(
             "end",
             reorderEl,
@@ -17718,6 +18518,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
             positionOverlay(selectionOverlay, selectedEl);
             postElementSelect(selectedEl);
           }
+          resetReorderModifierState();
           return;
         }
         // Resolve from the RELEASE point + release-time modifiers so a Ctrl or
@@ -17727,7 +18528,9 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         var finalRaw = resolveReorderOrFreeTarget(
           cx,
           cy,
-          reorderIgnoresAutoLayout || Boolean(ev?.ctrlKey || ev?.metaKey),
+          reorderIgnoresAutoLayout ||
+            reorderMetaFreePlacement ||
+            Boolean(ev?.ctrlKey),
         );
         currentTarget = liveReflowEnabled
           ? stabilizeReorderTarget(
@@ -17758,6 +18561,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
             positionOverlay(selectionOverlay, selectedEl);
             postElementSelect(selectedEl);
           }
+          resetReorderModifierState();
           return;
         }
         if (
@@ -17844,6 +18648,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
             });
           }
         }
+        resetReorderModifierState();
       }
       document.addEventListener(events.move, onReorderMove, true);
       document.addEventListener(events.up, onReorderUp, true);
@@ -18021,6 +18826,81 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       crossScreenDragMoveScheduled = true;
       window.requestAnimationFrame(flushCrossScreenDragMove);
     }
+    function activateLateDuplicate(ev): void {
+      if (duplicatedForDrag || isGroupDrag || !originalSelectedEl) return;
+      var source = originalSelectedEl as HTMLElement;
+      var sourceState = memberStates.filter(function (state) {
+        return state.el === source;
+      })[0];
+      if (!sourceState || !source.parentElement) return;
+
+      // The source may have followed the pointer for a few ticks before Alt
+      // arrived. Restore its authored position first so the optimistic clone
+      // starts at the held source rect and the original remains fixed.
+      var heldPosition = {
+        position: source.style.position,
+        left: source.style.left,
+        top: source.style.top,
+      };
+      source.style.position = sourceState.originalPosition;
+      source.style.left = sourceState.originalLeft;
+      source.style.top = sourceState.originalTop;
+      var grabbedRect = source.getBoundingClientRect();
+      var clone = source.cloneNode(true) as HTMLElement;
+      duplicatedSourceNodeIdMap = resetRuntimeStableIds(clone);
+      clone.setAttribute("data-agent-native-clone-root", "true");
+      source.parentElement.insertBefore(clone, source.nextSibling);
+      // Keep the clone at the source's current held position while the
+      // gesture switches ownership, then let the same move tick below apply
+      // the controller's full delta from the authored numeric origin once.
+      clone.style.position = heldPosition.position;
+      clone.style.left = heldPosition.left;
+      clone.style.top = heldPosition.top;
+      publishSourceDocumentProvenance(undefined, true);
+
+      selectedEl = clone;
+      gestureEl = clone;
+      dragEl = clone;
+      duplicatedForDrag = true;
+      groupEls = [clone];
+      groupOthers = [];
+      isGroupDrag = false;
+      var insertedRect = clone.getBoundingClientRect();
+      duplicateGrabOffset = {
+        x: grabbedRect.left - insertedRect.left,
+        y: grabbedRect.top - insertedRect.top,
+      };
+      var cloneState = {
+        el: clone,
+        originalPosition: clone.style.position,
+        originalLeft: clone.style.left,
+        originalTop: clone.style.top,
+        originLeft: 0,
+        originTop: 0,
+      };
+      ensurePositionable(clone);
+      var cloneStyles = window.getComputedStyle(clone);
+      cloneState.originLeft = readPx(clone.style.left || cloneStyles.left);
+      cloneState.originTop = readPx(clone.style.top || cloneStyles.top);
+      memberStates = [cloneState];
+      gestureState = cloneState;
+      originLeft = sourceState.originLeft;
+      originTop = sourceState.originTop;
+      cloneState.originLeft = originLeft;
+      cloneState.originTop = originTop;
+      dragElStartRect = dragGrabRect(clone);
+      dragElStartWidth = dragElStartRect.width;
+      dragElStartHeight = dragElStartRect.height;
+      dragElOffsetScaleX = ancestorScale(clone, "x");
+      dragElOffsetScaleY = ancestorScale(clone, "y");
+      snapCandidateRects = collectSnapCandidateRects(clone, []);
+      currentAutoLayoutTarget = null;
+      crossScreenClaimedByHost = false;
+      postCrossScreenDrag("cancel");
+      postCrossScreenDrag("start", clone, ev, { duplicate: true });
+      positionOverlay(selectionOverlay, selectedEl);
+      postElementSelect(selectedEl);
+    }
     function onMove(ev) {
       var controllerMove = bridgeMoveController.pointerMove(
         bridgeGesturePointer(ev),
@@ -18031,6 +18911,9 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         Math.hypot(ev.clientX - startX, ev.clientY - startY) > DRAG_THRESHOLD
       ) {
         moved = true;
+      }
+      if (ev.altKey && moved && !duplicatedForDrag) {
+        activateLateDuplicate(ev);
       }
       // The controller converts client deltas at the iframe boundary and
       // applies the live Shift dominant-axis constraint. Design-specific snap
@@ -19955,6 +20838,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
 
   function beginPotentialShieldDrag(e) {
     stopNativeInteraction(e);
+    clearGridProjectionCaches();
     // A new interaction starting is unambiguous proof the previous gesture is
     // over — a stale post-commit revert from it must never fire against
     // whatever this new one turns out to be.
@@ -20035,7 +20919,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     // where ctrl carries no auto-layout meaning) arms the host exactly as
     // before.
     var suppressCrossScreenStartForCtrlReorder =
-      Boolean(e.ctrlKey || e.metaKey) && isFlowReorderCandidate(dragTarget);
+      Boolean(e.ctrlKey) && isFlowReorderCandidate(dragTarget);
     if (!readOnly && !e.altKey && !suppressCrossScreenStartForCtrlReorder) {
       postCrossScreenDrag("start", dragTarget, e);
     }
