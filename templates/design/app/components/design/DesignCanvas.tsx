@@ -116,6 +116,7 @@ import {
   classifyBridgeRegistrationFailure,
   getDesignCanvasIframeSandbox,
   getDesignCanvasIframeAllow,
+  getLocalNetworkAccessPermissionState,
   getSnapshotRetryDelayMs,
   isPreviewTokenStaleStatus,
   resolveLiveEditPreviewUrl,
@@ -123,6 +124,7 @@ import {
   shouldFetchExternalSourceSnapshot,
   shouldUseIframeLoadReadyFallback,
   type BridgeRegistrationFailureKind,
+  type LocalNetworkAccessPermissionState,
   useBrowserOrigin,
 } from "./design-canvas/external-preview";
 import { isOsFileDragEvent } from "./design-canvas/file-drop";
@@ -1932,6 +1934,10 @@ export function DesignCanvas({
   ] = useState<string | null>(null);
   const [connectingLocalNetworkAccess, setConnectingLocalNetworkAccess] =
     useState(false);
+  const [
+    localNetworkAccessPermissionState,
+    setLocalNetworkAccessPermissionState,
+  ] = useState<LocalNetworkAccessPermissionState | null>(null);
   // Cache of the bridgeInstanceId returned by the client's LAST successful
   // /live-edit-bridge registration POST (see the registration effect below).
   // Compared against a later /health probe's bridgeInstanceId to tell "the
@@ -2123,6 +2129,19 @@ export function DesignCanvas({
   const usesLiveEditInjectedBridge =
     sourceType === "localhost" &&
     Boolean(bridgeUrl && effectivePreviewToken && rawExternalPreviewUrl);
+  useEffect(() => {
+    if (!usesLiveEditInjectedBridge) {
+      setLocalNetworkAccessPermissionState(null);
+      return;
+    }
+    let cancelled = false;
+    void getLocalNetworkAccessPermissionState().then((state) => {
+      if (!cancelled) setLocalNetworkAccessPermissionState(state);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [usesLiveEditInjectedBridge]);
   // Hoisted above usesLiveEditEditorBridge (rather than declared next to
   // externalPreviewUrl/usingRawFallbackPreview below, which reuse it) because
   // a failed registration's raw-URL fallback document has no injected editor
@@ -2263,6 +2282,11 @@ export function DesignCanvas({
   const waitingForEditableExternalSnapshot = false;
   const waitingForLiveEditBridge =
     usesLiveEditInjectedBridge && !liveEditBridgeRegistered;
+  const showProactiveLocalNetworkAccessPrompt =
+    usesLiveEditInjectedBridge &&
+    localNetworkAccessPermissionState === "prompt" &&
+    !liveEditBridgeRegistered &&
+    localNetworkAccessDismissedForKey !== liveEditBridgeKey;
   useLayoutEffect(() => {
     if (zoomPropRef.current === zoom) return;
     zoomPropRef.current = zoom;
@@ -6348,7 +6372,17 @@ export function DesignCanvas({
           </div>
         </div>
       ) : null}
+      {showProactiveLocalNetworkAccessPrompt ? (
+        <LocalNetworkAccessPrompt
+          kind={bridgeRegistrationFailureKind ?? "maybePermissionBlocked"}
+          connecting={connectingLocalNetworkAccess}
+          onConnect={handleConnectLocalNetworkAccess}
+          onDismiss={handleDismissLocalNetworkAccessPrompt}
+          proactive
+        />
+      ) : null}
       {bridgeRegistrationFailedForCurrentKey &&
+      !showProactiveLocalNetworkAccessPrompt &&
       localNetworkAccessDismissedForKey !== liveEditBridgeKey ? (
         // Deliberately NOT inside the blocking overlay below: usingRawFallback
         // Preview means the iframe right underneath is the real running dev

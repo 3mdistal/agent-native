@@ -6,7 +6,10 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getDesignCanvasIframeAllow } from "./design-canvas/external-preview";
+import {
+  getDesignCanvasIframeAllow,
+  getLocalNetworkAccessPermissionState,
+} from "./design-canvas/external-preview";
 import { DesignCanvas } from "./DesignCanvas";
 
 let container: HTMLDivElement;
@@ -277,6 +280,46 @@ describe("DesignCanvas authenticated localhost source hydration", () => {
       expect(iframe?.src).toBe("http://localhost:5173/account");
       expect(iframe?.getAttribute("allow")).toBe("local-network-access");
     });
+  });
+
+  it("asks for local-network permission before leaving the live editor read-only", async () => {
+    vi.stubGlobal("navigator", {
+      permissions: {
+        query: vi.fn().mockResolvedValue({ state: "prompt" }),
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.reject(new TypeError("Failed to fetch"))),
+    );
+
+    await act(async () => {
+      root.render(
+        <DesignCanvas
+          content="http://localhost:5173/account"
+          contentKey="screen-account"
+          screenId="screen-account"
+          sourceType="localhost"
+          bridgeUrl="http://127.0.0.1:7331"
+          previewToken="permission-preview-token"
+          zoom={100}
+          deviceFrame="none"
+          editMode
+          interactMode={false}
+          onElementSelect={() => {}}
+          onElementHover={() => {}}
+          tweakValues={{}}
+        />,
+      );
+    });
+
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("Connect your local screens");
+      expect(document.body.textContent).not.toContain(
+        "Can't reach your local dev server",
+      );
+    });
+    expect(await getLocalNetworkAccessPermissionState()).toBe("prompt");
   });
 
   it("mounts source verification in a separate hidden runtime without replacing the editable iframe", async () => {
