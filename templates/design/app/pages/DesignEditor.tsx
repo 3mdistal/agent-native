@@ -259,7 +259,10 @@ import {
 } from "@/components/design/DesignExtensionsPanel";
 import { DesignImportPanel } from "@/components/design/DesignImportPanel";
 import { componentInstanceHasLocalOverrides } from "@/components/design/edit-panel/component-section";
-import { rewriteSelectionFillStyles } from "@/components/design/edit-panel/document-colors";
+import {
+  rewriteSelectionFillStyles,
+  selectionColorTargets,
+} from "@/components/design/edit-panel/document-colors";
 import { sizeNeedsMeasurement } from "@/components/design/edit-panel/element-classification";
 import { inspectCodeDataForElement } from "@/components/design/edit-panel/inspect-code-source";
 import type { CapturedStyleTarget } from "@/components/design/edit-panel/style-change-types";
@@ -20579,22 +20582,40 @@ function DesignEditor() {
   );
 
   const selectionColorScopes = useMemo<SelectionColorScope[]>(() => {
+    const sourceIsInline = (fileId: string, content: string) =>
+      resolveOverviewScreenSourceType(
+        overviewScreens.find((screen) => screen.id === fileId),
+        designSourceType,
+      ) === "inline" &&
+      externalPreviewUrlForContent(getScreenContent(fileId)) === null &&
+      externalPreviewUrlForContent(content) === null;
+
     if (selectedLayerTargets.length > 0) {
-      return selectedLayerTargets.map((target) => ({
-        fileId: target.fileId,
-        content:
+      return selectedLayerTargets.flatMap((target) => {
+        const content =
           target.fileId === activeFile?.id
             ? activeContent
-            : getScreenContent(target.fileId),
-        sourceId: bridgeSourceIdForCodeLayerNode(target.node),
-        selector: target.node.selector,
-      }));
+            : getScreenContent(target.fileId);
+        return sourceIsInline(target.fileId, content)
+          ? [
+              {
+                fileId: target.fileId,
+                content,
+                source: codeLayerSourceForScreen(target.fileId),
+                sourceId: bridgeSourceIdForCodeLayerNode(target.node),
+                selector: target.node.selector,
+              },
+            ]
+          : [];
+      });
     }
     if (selectedElement && activeFile?.id) {
+      if (!sourceIsInline(activeFile.id, activeContent)) return [];
       return [
         {
           fileId: activeFile.id,
           content: activeContent,
+          source: codeLayerSourceForScreen(activeFile.id),
           sourceId: selectedElement.sourceId,
           selector: selectedElement.selector,
         },
@@ -20603,15 +20624,25 @@ function DesignEditor() {
     if (viewMode !== "overview") return [];
     return overviewSelectedScreenIds.flatMap((screenId) => {
       const content = getProjectionContentForScreen(screenId);
-      return content && externalPreviewUrlForContent(content) === null
-        ? [{ fileId: screenId, content, wholeDocument: true }]
+      return content && sourceIsInline(screenId, content)
+        ? [
+            {
+              fileId: screenId,
+              content,
+              source: codeLayerSourceForScreen(screenId),
+              wholeDocument: true,
+            },
+          ]
         : [];
     });
   }, [
     activeContent,
+    codeLayerSourceForScreen,
+    designSourceType,
     activeFile?.id,
     getProjectionContentForScreen,
     getScreenContent,
+    overviewScreens,
     overviewSelectedScreenIds,
     selectedElement,
     selectedLayerTargets,
@@ -20704,6 +20735,12 @@ function DesignEditor() {
         open,
       );
     },
+    [getFreshSelectionColorScopes],
+  );
+
+  const canSelectSelectionColorTarget = useCallback(
+    (color: string) =>
+      selectionColorTargets(getFreshSelectionColorScopes(), color).length > 0,
     [getFreshSelectionColorScopes],
   );
 
@@ -20818,6 +20855,114 @@ function DesignEditor() {
       canEditDesign,
       getFreshSelectionColorScopes,
       t,
+    ],
+  );
+
+  const handleSelectionColorTarget = useCallback(
+    (color: string) => {
+      const targets = selectionColorTargets(
+        getFreshSelectionColorScopes(),
+        color,
+      );
+      if (targets.length === 0) return;
+
+      recordSelectionHistoryAroundChange(() => {
+        const nextLayerIds: string[] = [];
+        const nextScreenIds: string[] = [];
+        const addUnique = (ids: string[], id: string) => {
+          if (!ids.includes(id)) ids.push(id);
+        };
+        const ownerForTarget = (target: (typeof targets)[number]) =>
+          codeLayerOwnerByNodeId.get(target.nodeId) ??
+          Array.from(codeLayerOwnerByNodeId.values()).find(
+            (candidate) =>
+              candidate.fileId === target.fileId &&
+              candidate.node.tag === target.tag &&
+              candidate.node.selector === target.selector,
+          );
+
+        for (const target of targets) {
+          if (target.tag === "html" || target.tag === "body") {
+            addUnique(nextScreenIds, target.fileId);
+          } else {
+            addUnique(nextLayerIds, target.nodeId);
+          }
+          const owner = ownerForTarget(target);
+          if (owner) {
+            addUnique(nextLayerIds, owner.node.id);
+            addUnique(nextScreenIds, owner.fileId);
+          }
+        }
+
+        if (viewModeRef.current === "overview") {
+          const nextActiveFileId = nextScreenIds[0] ?? targets[0]?.fileId;
+          if (nextActiveFileId) setActiveFileId(nextActiveFileId);
+          setOverviewSelectedScreenIds(nextScreenIds);
+          setSelectedLayerIdsState(
+            nextScreenIds.length > 0
+              ? [...nextScreenIds, ...nextLayerIds]
+              : nextLayerIds,
+          );
+        } else {
+          const fileId = targets[0]?.fileId;
+          if (fileId) setActiveFileId(fileId);
+          setOverviewSelectedScreenIds([]);
+          setSelectedLayerIdsState(nextLayerIds);
+        }
+
+        const lastLayerTarget = [...targets]
+          .reverse()
+          .find((target) => target.tag !== "html" && target.tag !== "body");
+        const lastOwner = lastLayerTarget
+          ? ownerForTarget(lastLayerTarget)
+          : null;
+        const lastRootTarget = [...targets]
+          .reverse()
+          .find((target) => target.tag === "html" || target.tag === "body");
+        const selectedOwner =
+          lastOwner ?? (lastRootTarget ? ownerForTarget(lastRootTarget) : null);
+        if (selectedOwner) {
+          setSelectedElement(
+            elementInfoForOwnedCodeLayerNode({
+              info: selectedElement,
+              node: selectedOwner.node,
+              ownerFileId: selectedOwner.fileId,
+            }),
+          );
+        } else if (lastRootTarget) {
+          // A source/runtime projection can briefly disagree on node ids while
+          // a live snapshot is settling. Keep the current single-screen
+          // selection rather than turning a body-only locate into deselection.
+          setSelectedElement((current) => current);
+        } else {
+          setSelectedElement(null);
+        }
+        setActiveTool("move");
+        setMode("edit");
+        setExpandedLayerIds((current) => {
+          const currentIds = new Set(current);
+          const next = new Set(currentIds);
+          for (const target of targets) {
+            const owner = ownerForTarget(target);
+            if (!owner) continue;
+            next.add(owner.fileId);
+            collectCodeLayerAncestors(owner.tree, owner.node.id).forEach(
+              (ancestorId) => next.add(ancestorId),
+            );
+          }
+          return next.size === currentIds.size ? current : Array.from(next);
+        });
+        if (viewModeRef.current === "overview") {
+          window.requestAnimationFrame(() => handleZoomToSelectionFit());
+        }
+      });
+    },
+    [
+      codeLayerOwnerByNodeId,
+      getFreshSelectionColorScopes,
+      handleZoomToSelectionFit,
+      recordSelectionHistoryAroundChange,
+      selectedElement,
     ],
   );
 
@@ -24550,6 +24695,8 @@ function DesignEditor() {
       ? handleSelectedScreenStylesChange
       : undefined,
     selectionColorScopes,
+    onSelectionColorTarget: handleSelectionColorTarget,
+    canSelectSelectionColorTarget,
     onSelectionColorChange: canEditDesign
       ? handleSelectionColorChange
       : undefined,
