@@ -6212,6 +6212,8 @@ export function DesignCanvas({
           style={{
             background: iframeBackgroundColor,
             backgroundColor: iframeBackgroundColor,
+            pointerEvents:
+              usingRawFallbackPreview && !interactMode ? "none" : undefined,
             ...SCALED_IFRAME_PAINT_RETENTION_STYLE,
             ...getIframePaintRetentionStyle({
               viewportWidth:
