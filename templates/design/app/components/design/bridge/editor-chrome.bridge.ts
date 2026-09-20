@@ -20174,6 +20174,11 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         );
         showConstraintGuides(dragEl);
       }
+      // Reorder gestures already paint the modifier cue, but drawn/root
+      // frames use this free path and otherwise leave held Option silent.
+      if (duplicatedForDrag) {
+        showTransformBadge("Duplicate layer", ev.clientX, ev.clientY);
+      }
       refreshOverlays();
     }
     function restoreSourceDragPosition(): void {

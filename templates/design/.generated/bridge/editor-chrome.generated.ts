@@ -14177,6 +14177,9 @@ export const editorChromeBridgeScript: string = `"use strict";
           );
           showConstraintGuides(dragEl);
         }
+        if (duplicatedForDrag) {
+          showTransformBadge("Duplicate layer", ev.clientX, ev.clientY);
+        }
         refreshOverlays();
       }
       function restoreSourceDragPosition() {
