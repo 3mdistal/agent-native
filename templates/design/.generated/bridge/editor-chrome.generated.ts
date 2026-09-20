@@ -4635,6 +4635,7 @@ export const editorChromeBridgeScript: string = `"use strict";
     var activeDragCancel = null;
     var activeDragStartedAt = null;
     var bridgeSpaceKeyPressed = false;
+    var bridgeIgnoreAutoLayoutKeyPressed = false;
     var bridgeSpaceKeyConsumedByDrag = false;
     var activeCrossScreenStyleSnapshot = void 0;
     var activeCrossScreenDragIdentity = null;
@@ -7660,11 +7661,14 @@ export const editorChromeBridgeScript: string = `"use strict";
     }
     function isApplePlatformBridge() {
       var nav = navigator;
-      var platform = nav.userAgentData && nav.userAgentData.platform || nav.platform || "";
+      var platform = nav.platform || nav.userAgentData && nav.userAgentData.platform || "";
       return /Mac|iPhone|iPad|iPod/i.test(platform);
     }
     function isPlatformPrimaryChord(e) {
       return isApplePlatformBridge() ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+    }
+    function isIgnoreAutoLayoutChord(e) {
+      return isApplePlatformBridge() ? Boolean(e.ctrlKey && !e.metaKey) : bridgeIgnoreAutoLayoutKeyPressed || String(e && e.key).toLowerCase() === "s";
     }
     function isShowShortcutsChord(e) {
       if (!(e.metaKey || e.ctrlKey) || !e.shiftKey || e.altKey) return false;
@@ -10371,9 +10375,16 @@ export const editorChromeBridgeScript: string = `"use strict";
     function isOutsideIframeViewport(clientX, clientY) {
       return clientX < 0 || clientY < 0 || clientX > window.innerWidth || clientY > window.innerHeight;
     }
+    function eventEpochMilliseconds(ev) {
+      if (typeof ev?.timeStamp !== "number" || !Number.isFinite(ev.timeStamp)) {
+        return void 0;
+      }
+      return ev.timeStamp >= 1e12 ? ev.timeStamp : performance.timeOrigin + ev.timeStamp;
+    }
     function postCrossScreenDrag(phase, el, ev, options) {
       dndLog("post:cross-screen", { phase, el: getSelector(el ?? null) });
       if (phase === "cancel") {
+        bridgeIgnoreAutoLayoutKeyPressed = false;
         activeCrossScreenStyleSnapshot = void 0;
         activeCrossScreenDragIdentity = null;
         window.parent.postMessage(
@@ -10427,12 +10438,15 @@ export const editorChromeBridgeScript: string = `"use strict";
           // host must not have to infer capture-failed from a value shape
           // that could change; see collectPortableStyleSnapshot's doc.
           styleSnapshotCaptureFailed: activeCrossScreenStyleSnapshot === null,
+          modifiers: options?.modifiers,
           duplicate: options?.duplicate === true ? true : void 0,
-          sourceCloneHtml: options?.duplicate && el ? el.outerHTML : void 0
+          sourceCloneHtml: options?.duplicate && el ? el.outerHTML : void 0,
+          releasedAt: phase === "end" ? eventEpochMilliseconds(ev) : void 0
         },
         "*"
       );
       if (phase === "end") {
+        bridgeIgnoreAutoLayoutKeyPressed = false;
         activeCrossScreenStyleSnapshot = void 0;
         activeCrossScreenDragIdentity = null;
       }
@@ -10972,7 +10986,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         dropMode: "flow-insert"
       };
     }
-    function flowMoveTargetForPoint(el, clientX, clientY, excludeEls, keepCurrentParent, ignoreTargetAutoLayout) {
+    function flowMoveTargetForPoint(el, clientX, clientY, excludeEls, keepCurrentParent, ignoreTargetAutoLayout, forceNestedAutoLayout = false) {
       if (!el || !el.parentElement) return null;
       var currentParent = el.parentElement;
       var dragged = [el].concat(excludeEls || []);
@@ -11014,6 +11028,29 @@ export const editorChromeBridgeScript: string = `"use strict";
         };
       }
       var target = reorderTargetForPoint(el, clientX, clientY, excludeEls);
+      if ((forceNestedAutoLayout || ignoreTargetAutoLayout) && !pointerOutsideCurrentParent) {
+        var nestedHit = elementFromEditorPoint(clientX, clientY);
+        while (nestedHit && nestedHit.parentElement !== currentParent && nestedHit !== el && !el.contains(nestedHit)) {
+          if (isOverlayElement(nestedHit) || isLayerInteractionBlocked(nestedHit)) {
+            nestedHit = null;
+            break;
+          }
+          nestedHit = nestedHit.parentElement;
+        }
+        if (nestedHit && nestedHit !== el && !el.contains(nestedHit) && nestedHit !== currentParent && isAutoLayoutElement(nestedHit) && !isOverlayElement(nestedHit) && !isLayerInteractionBlocked(nestedHit) && nestedHit.parentElement === currentParent && isContainerDropTarget(nestedHit)) {
+          target = nearestChildInsertionTarget(
+            nestedHit,
+            clientX,
+            clientY,
+            dragged
+          ) || {
+            anchor: nestedHit,
+            placement: "inside",
+            axis: parentFlowAxis(nestedHit),
+            dropMode: "flow-insert"
+          };
+        }
+      }
       var container = dropContainerForTarget(target);
       if (ignoreTargetAutoLayout && container && container !== document.body && isAutoLayoutElement(container)) {
         return {
@@ -11070,7 +11107,7 @@ export const editorChromeBridgeScript: string = `"use strict";
       });
       return hit;
     }
-    function autoLayoutInsertionTargetForPoint(el, clientX, clientY, excludeEls) {
+    function autoLayoutInsertionTargetForPoint(el, clientX, clientY, excludeEls, forceNestedAutoLayout = false) {
       var dragged = [el].concat(excludeEls || []);
       function isDraggedOrInsideDragged(node) {
         for (var i = 0; i < dragged.length; i += 1) {
@@ -11104,7 +11141,16 @@ export const editorChromeBridgeScript: string = `"use strict";
           continue;
         }
         var parent = cursor.parentElement;
-        if (parent && parent !== document.body && isAutoLayoutElement(parent) && cursor.getAttribute("data-an-primitive") !== "frame" && !isTextBearingLeaf(parent) && !isTemplateCloneElement(cursor)) {
+        if (parent === document.body && isAutoLayoutElement(parent) && cursor !== el && !isDraggedOrInsideDragged(cursor) && !isTemplateCloneElement(cursor)) {
+          var rootChildSlot = nearestChildInsertionTarget(
+            parent,
+            clientX,
+            clientY,
+            dragged
+          );
+          if (rootChildSlot) return rootChildSlot;
+        }
+        if (parent && parent !== document.body && isAutoLayoutElement(parent) && cursor.getAttribute("data-an-primitive") !== "frame" && !isTextBearingLeaf(parent) && !forceNestedAutoLayout && !isTemplateCloneElement(cursor)) {
           var directChildSlot = nearestChildInsertionTarget(
             parent,
             clientX,
@@ -11132,7 +11178,7 @@ export const editorChromeBridgeScript: string = `"use strict";
             dropMode: "absolute-container"
           };
         }
-        if (cursor !== document.body && isContainerDropTarget(cursor) && !(parent && parent !== document.body && isAutoLayoutElement(parent) && cursor.getAttribute("data-an-primitive") !== "frame")) {
+        if (cursor !== document.body && isContainerDropTarget(cursor) && !(!forceNestedAutoLayout && parent && parent !== document.body && isAutoLayoutElement(parent) && cursor.getAttribute("data-an-primitive") !== "frame")) {
           if (!isAutoLayoutElement(cursor)) {
             if (cursor === el.parentElement) return null;
             return {
@@ -12303,7 +12349,7 @@ export const editorChromeBridgeScript: string = `"use strict";
       if (e.stopImmediatePropagation) e.stopImmediatePropagation();
       clearGridProjectionCaches();
       var moveGestureId = ++dragGestureSequence;
-      var gestureStartedAt = performance.timeOrigin + e.timeStamp;
+      var gestureStartedAt = eventEpochMilliseconds(e) ?? Date.now();
       var events = dragEventNames(e);
       var originalSelectedEl = selectedEl;
       var duplicatedForDrag = false;
@@ -12394,7 +12440,14 @@ export const editorChromeBridgeScript: string = `"use strict";
         return;
       }
       if (isFlowReorderCandidate(gestureEl)) {
-        let authoredTransformOf2 = function(el) {
+        let reorderCrossScreenModifiers2 = function(ev) {
+          return {
+            metaKey: !!ev?.metaKey,
+            ctrlKey: !!ev?.ctrlKey,
+            ignoreAutoLayout: ev ? isIgnoreAutoLayoutChord(ev) : reorderIgnoresAutoLayout,
+            forceNestedAutoLayout: ev ? isPlatformPrimaryChord(ev) : false
+          };
+        }, authoredTransformOf2 = function(el) {
           if (el.style.transform) return el.style.transform;
           var computed = window.getComputedStyle(el).transform;
           return computed && computed !== "none" ? computed : "";
@@ -12495,7 +12548,8 @@ export const editorChromeBridgeScript: string = `"use strict";
               duplicate: duplicatedForDrag,
               elementRect: reorderRect,
               pointerOffset: reorderPointerOffset,
-              styleSnapshot: reorderStyleSnapshot
+              styleSnapshot: reorderStyleSnapshot,
+              modifiers: reorderCrossScreenModifiers2(lastPoint)
             }
           );
         }, resetReorderModifierState2 = function() {
@@ -12565,7 +12619,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           applyReorderLift2(0, 0);
           positionOverlay(selectionOverlay, selectedEl);
           postElementSelect(selectedEl);
-        }, resolveReorderOrFreeTarget2 = function(cx, cy, ctrlKey) {
+        }, resolveReorderOrFreeTarget2 = function(cx, cy, ignoreTargetAutoLayout, forceNestedAutoLayout) {
           if (bridgeSpaceKeyPressed) keepCurrentFlowParent = true;
           return flowMoveTargetForPoint(
             reorderEl,
@@ -12573,7 +12627,8 @@ export const editorChromeBridgeScript: string = `"use strict";
             cy,
             groupOthers,
             keepCurrentFlowParent,
-            ctrlKey
+            ignoreTargetAutoLayout,
+            forceNestedAutoLayout
           );
         }, hasMetaFlowTarget2 = function(target, cx, cy) {
           var sourceParent = reorderEl.parentElement;
@@ -12596,7 +12651,9 @@ export const editorChromeBridgeScript: string = `"use strict";
           if (!liveReflowEnabled || !target || target.placement !== "inside") {
             return target;
           }
-          if (ev && (ev.metaKey || ev.ctrlKey)) return target;
+          if (ev && (isIgnoreAutoLayoutChord(ev) || isPlatformPrimaryChord(ev))) {
+            return target;
+          }
           var container = dropContainerForTarget(target);
           if (!container || container === reorderEl || container === document.body || container === document.documentElement) {
             return target;
@@ -12805,11 +12862,16 @@ export const editorChromeBridgeScript: string = `"use strict";
           var dx = cx - reorderPointerStart.clientX;
           var dy = cy - reorderPointerStart.clientY;
           var outside = cx < 0 || cy < 0 || cx > vw || cy > vh;
-          if (ev.ctrlKey) activateReorderControlOverride2();
+          if (isIgnoreAutoLayoutChord(ev)) activateReorderControlOverride2();
           var rawTarget = null;
           if (ev.metaKey && !isGroupDrag && !reorderIgnoresAutoLayout) {
             clearReorderReflow2();
-            var metaFlowTarget = outside ? null : resolveReorderOrFreeTarget2(cx, cy, false);
+            var metaFlowTarget = outside ? null : resolveReorderOrFreeTarget2(
+              cx,
+              cy,
+              false,
+              isPlatformPrimaryChord(ev)
+            );
             if (hasMetaFlowTarget2(metaFlowTarget, cx, cy)) {
               if (reorderMetaFreePlacement) {
                 reorderMetaFreePlacement = false;
@@ -12824,7 +12886,8 @@ export const editorChromeBridgeScript: string = `"use strict";
                     duplicate: duplicatedForDrag,
                     elementRect: reorderRect,
                     pointerOffset: reorderPointerOffset,
-                    styleSnapshot: reorderStyleSnapshot
+                    styleSnapshot: reorderStyleSnapshot,
+                    modifiers: reorderCrossScreenModifiers2(ev)
                   }
                 );
               }
@@ -12836,7 +12899,12 @@ export const editorChromeBridgeScript: string = `"use strict";
                 postCrossScreenDrag("cancel");
               }
               if (!outside) {
-                rawTarget = resolveReorderOrFreeTarget2(cx, cy, true);
+                rawTarget = resolveReorderOrFreeTarget2(
+                  cx,
+                  cy,
+                  true,
+                  isPlatformPrimaryChord(ev)
+                );
                 rawTarget = applyReorderSizeGuard2(rawTarget, ev);
               }
             }
@@ -12850,7 +12918,8 @@ export const editorChromeBridgeScript: string = `"use strict";
                 duplicate: duplicatedForDrag,
                 elementRect: reorderRect,
                 pointerOffset: reorderPointerOffset,
-                styleSnapshot: reorderStyleSnapshot
+                styleSnapshot: reorderStyleSnapshot,
+                modifiers: reorderCrossScreenModifiers2(ev)
               }
             );
           }
@@ -12869,7 +12938,8 @@ export const editorChromeBridgeScript: string = `"use strict";
               rawTarget = resolveReorderOrFreeTarget2(
                 cx,
                 cy,
-                reorderIgnoresAutoLayout || reorderMetaFreePlacement || Boolean(ev.ctrlKey)
+                reorderIgnoresAutoLayout || reorderMetaFreePlacement || isIgnoreAutoLayoutChord(ev),
+                isPlatformPrimaryChord(ev)
               );
             }
             rawTarget = applyReorderSizeGuard2(rawTarget, ev);
@@ -12963,9 +13033,14 @@ export const editorChromeBridgeScript: string = `"use strict";
           var cy = ev.clientY;
           var outside = cx < 0 || cy < 0 || cx > vw || cy > vh;
           if (!ev.metaKey) releaseReorderMetaOverride2(ev);
-          if (ev.ctrlKey) activateReorderControlOverride2();
+          if (isIgnoreAutoLayoutChord(ev)) activateReorderControlOverride2();
           if (ev.metaKey && !reorderIgnoresAutoLayout && !isGroupDrag) {
-            var metaReleaseTarget = outside ? null : resolveReorderOrFreeTarget2(cx, cy, false);
+            var metaReleaseTarget = outside ? null : resolveReorderOrFreeTarget2(
+              cx,
+              cy,
+              false,
+              isPlatformPrimaryChord(ev)
+            );
             if (!hasMetaFlowTarget2(metaReleaseTarget, cx, cy)) {
               reorderMetaFreePlacement = true;
               crossScreenClaimedByHost = false;
@@ -12993,7 +13068,8 @@ export const editorChromeBridgeScript: string = `"use strict";
                 duplicate: duplicatedForDrag,
                 elementRect: reorderRect,
                 pointerOffset: reorderPointerOffset,
-                styleSnapshot: reorderStyleSnapshot
+                styleSnapshot: reorderStyleSnapshot,
+                modifiers: reorderCrossScreenModifiers2(ev)
               }
             );
           }
@@ -13011,7 +13087,8 @@ export const editorChromeBridgeScript: string = `"use strict";
           var finalRaw = resolveReorderOrFreeTarget2(
             cx,
             cy,
-            reorderIgnoresAutoLayout || reorderMetaFreePlacement || Boolean(ev?.ctrlKey)
+            reorderIgnoresAutoLayout || reorderMetaFreePlacement || isIgnoreAutoLayoutChord(ev),
+            isPlatformPrimaryChord(ev)
           );
           currentTarget = liveReflowEnabled ? stabilizeReorderTarget2(
             applyReorderSizeGuard2(finalRaw, ev),
@@ -13098,7 +13175,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           }
           resetReorderModifierState2();
         };
-        var authoredTransformOf = authoredTransformOf2, applyReorderLift = applyReorderLift2, clearReorderLift = clearReorderLift2, reorderMainAxis = reorderMainAxis2, reorderRealChildren = reorderRealChildren2, reorderSlotForTarget = reorderSlotForTarget2, clearReorderReflow = clearReorderReflow2, clearReorderReflowForHitTest = clearReorderReflowForHitTest2, restoreReorderReflowPreview = restoreReorderReflowPreview2, activateReorderControlOverride = activateReorderControlOverride2, releaseReorderMetaOverride = releaseReorderMetaOverride2, resetReorderModifierState = resetReorderModifierState2, activateLateReorderDuplicate = activateLateReorderDuplicate2, resolveReorderOrFreeTarget = resolveReorderOrFreeTarget2, hasMetaFlowTarget = hasMetaFlowTarget2, applyReorderSizeGuard = applyReorderSizeGuard2, stabilizeReorderTarget = stabilizeReorderTarget2, applyReorderReflow = applyReorderReflow2, onReorderMove = onReorderMove2, cleanupReorderDrag = cleanupReorderDrag2, onReorderVisibilityChange = onReorderVisibilityChange2, onReorderEscape = onReorderEscape2, onReorderKeyDown = onReorderKeyDown2, onReorderKeyUp = onReorderKeyUp2, onReorderUp = onReorderUp2;
+        var reorderCrossScreenModifiers = reorderCrossScreenModifiers2, authoredTransformOf = authoredTransformOf2, applyReorderLift = applyReorderLift2, clearReorderLift = clearReorderLift2, reorderMainAxis = reorderMainAxis2, reorderRealChildren = reorderRealChildren2, reorderSlotForTarget = reorderSlotForTarget2, clearReorderReflow = clearReorderReflow2, clearReorderReflowForHitTest = clearReorderReflowForHitTest2, restoreReorderReflowPreview = restoreReorderReflowPreview2, activateReorderControlOverride = activateReorderControlOverride2, releaseReorderMetaOverride = releaseReorderMetaOverride2, resetReorderModifierState = resetReorderModifierState2, activateLateReorderDuplicate = activateLateReorderDuplicate2, resolveReorderOrFreeTarget = resolveReorderOrFreeTarget2, hasMetaFlowTarget = hasMetaFlowTarget2, applyReorderSizeGuard = applyReorderSizeGuard2, stabilizeReorderTarget = stabilizeReorderTarget2, applyReorderReflow = applyReorderReflow2, onReorderMove = onReorderMove2, cleanupReorderDrag = cleanupReorderDrag2, onReorderVisibilityChange = onReorderVisibilityChange2, onReorderEscape = onReorderEscape2, onReorderKeyDown = onReorderKeyDown2, onReorderKeyUp = onReorderKeyUp2, onReorderUp = onReorderUp2;
         var reorderEl = gestureEl;
         var reorderGroupStartRects = groupEls.map(function(member) {
           return dragGrabRect(member);
@@ -13114,7 +13191,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         var reorderGestureStartRect = dragGrabRect(reorderEl);
         var reorderLastTargetKey = null;
         var keepCurrentFlowParent = bridgeSpaceKeyPressed;
-        var reorderIgnoresAutoLayout = Boolean(e.ctrlKey);
+        var reorderIgnoresAutoLayout = isIgnoreAutoLayoutChord(e);
         var reorderMetaFreePlacement = false;
         var currentTarget = flowMoveTargetForPoint(
           reorderEl,
@@ -13122,7 +13199,8 @@ export const editorChromeBridgeScript: string = `"use strict";
           e.clientY,
           groupOthers,
           keepCurrentFlowParent,
-          reorderIgnoresAutoLayout
+          reorderIgnoresAutoLayout,
+          isPlatformPrimaryChord(e)
         );
         showInsertionGuideFor(currentTarget);
         dndLog("start:reorder", {
@@ -13149,7 +13227,8 @@ export const editorChromeBridgeScript: string = `"use strict";
               height: reorderRect.height
             },
             pointerOffset: reorderPointerOffset,
-            styleSnapshot: reorderStyleSnapshot
+            styleSnapshot: reorderStyleSnapshot,
+            modifiers: reorderCrossScreenModifiers2(e)
           });
         }
         var reorderLiftedMembers = [];
@@ -13250,6 +13329,34 @@ export const editorChromeBridgeScript: string = `"use strict";
       var dragElStartRect = dragEl.getBoundingClientRect();
       var dragElStartWidth = dragElStartRect.width;
       var dragElStartHeight = dragElStartRect.height;
+      function applyFreeDropSizeGuard(target, ev) {
+        if (!target || target.placement !== "inside" || target.dropMode !== "flow-insert") {
+          return target;
+        }
+        if (ev && (isIgnoreAutoLayoutChord(ev) || isPlatformPrimaryChord(ev))) {
+          return target;
+        }
+        var container = dropContainerForTarget(target);
+        if (!container || container === dragEl || container === document.body || container === document.documentElement || !isAutoLayoutElement(container)) {
+          return target;
+        }
+        var crect = container.getBoundingClientRect();
+        if (crect.width >= dragElStartRect.width && crect.height >= dragElStartRect.height) {
+          return target;
+        }
+        var parent = container.parentElement;
+        if (!parent) return null;
+        var pcs = window.getComputedStyle(parent);
+        var pAxis = pcs.flexDirection === "column" || pcs.flexDirection === "column-reverse" ? "y" : "x";
+        var center = pAxis === "x" ? crect.left + crect.width / 2 : crect.top + crect.height / 2;
+        var pointer = pAxis === "x" ? ev ? ev.clientX : center : ev ? ev.clientY : center;
+        return {
+          anchor: container,
+          placement: pointer < center ? "before" : "after",
+          axis: pAxis,
+          dropMode: "flow-insert"
+        };
+      }
       function ancestorScale(el, axis) {
         var host = el && el.offsetParent;
         if (!host) return 1;
@@ -13264,7 +13371,13 @@ export const editorChromeBridgeScript: string = `"use strict";
       var dragElOffsetScaleY = ancestorScale(dragEl, "y");
       if (!isGroupDrag) {
         postCrossScreenDrag("start", dragEl, pointerStartParam || e, {
-          duplicate: duplicatedForDrag
+          duplicate: duplicatedForDrag,
+          modifiers: {
+            metaKey: !!e.metaKey,
+            ctrlKey: !!e.ctrlKey,
+            ignoreAutoLayout: isIgnoreAutoLayoutChord(e),
+            forceNestedAutoLayout: isPlatformPrimaryChord(e)
+          }
         });
       }
       var crossScreenDragMoveScheduled = false;
@@ -13275,14 +13388,24 @@ export const editorChromeBridgeScript: string = `"use strict";
         crossScreenDragMovePendingEv = null;
         if (pendingEv) {
           postCrossScreenDrag("move", dragEl, pendingEv, {
-            duplicate: duplicatedForDrag
+            duplicate: duplicatedForDrag,
+            modifiers: {
+              metaKey: pendingEv.metaKey,
+              ctrlKey: pendingEv.ctrlKey,
+              ignoreAutoLayout: pendingEv.ignoreAutoLayout,
+              forceNestedAutoLayout: pendingEv.forceNestedAutoLayout
+            }
           });
         }
       }
       function scheduleCrossScreenDragMove(ev) {
         crossScreenDragMovePendingEv = {
           clientX: ev.clientX,
-          clientY: ev.clientY
+          clientY: ev.clientY,
+          metaKey: !!ev.metaKey,
+          ctrlKey: !!ev.ctrlKey,
+          ignoreAutoLayout: isIgnoreAutoLayoutChord(ev),
+          forceNestedAutoLayout: isPlatformPrimaryChord(ev)
         };
         if (crossScreenDragMoveScheduled) return;
         crossScreenDragMoveScheduled = true;
@@ -13370,7 +13493,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         var rawDy = controllerMove.gesture.canvasDelta.y;
         var nextLeft = originLeft + rawDx;
         var nextTop = originTop + rawDy;
-        var snapBypass = Boolean(ev.metaKey || ev.ctrlKey);
+        var snapBypass = isIgnoreAutoLayoutChord(ev) || isPlatformPrimaryChord(ev);
         var snapResult = !snapBypass && !duplicatedForDrag ? computeMoveSnapOffset(
           {
             // snapCandidateRects are client space; nextLeft/nextTop are
@@ -13417,13 +13540,18 @@ export const editorChromeBridgeScript: string = `"use strict";
             dragEl,
             ev.clientX,
             ev.clientY,
-            groupOthers
+            groupOthers,
+            isPlatformPrimaryChord(ev)
           ) : null;
-          if (currentAutoLayoutTarget && (ev.ctrlKey || ev.metaKey)) {
+          if (currentAutoLayoutTarget && isIgnoreAutoLayoutChord(ev)) {
             currentAutoLayoutTarget = ignoreAutoLayoutForDropTarget(
               currentAutoLayoutTarget
             );
           }
+          currentAutoLayoutTarget = applyFreeDropSizeGuard(
+            currentAutoLayoutTarget,
+            ev
+          );
           if (currentAutoLayoutTarget) {
             showInsertionGuideFor(currentAutoLayoutTarget);
           } else {
@@ -13528,7 +13656,13 @@ export const editorChromeBridgeScript: string = `"use strict";
         var outsideOnDrop = ev ? isOutsideIframeViewport(ev.clientX, ev.clientY) || crossScreenClaimedByHost : false;
         if (ev && !isGroupDrag && (outsideOnDrop || designCanvasBoardSurface)) {
           postCrossScreenDrag("end", dragEl, ev, {
-            duplicate: duplicatedForDrag
+            duplicate: duplicatedForDrag,
+            modifiers: {
+              metaKey: !!ev.metaKey,
+              ctrlKey: !!ev.ctrlKey,
+              ignoreAutoLayout: isIgnoreAutoLayoutChord(ev),
+              forceNestedAutoLayout: isPlatformPrimaryChord(ev)
+            }
           });
         }
         if (ev && !isGroupDrag && outsideOnDrop) {
@@ -13547,13 +13681,18 @@ export const editorChromeBridgeScript: string = `"use strict";
             dragEl,
             ev.clientX,
             ev.clientY,
-            groupOthers
+            groupOthers,
+            isPlatformPrimaryChord(ev)
           );
-          if (finalAutoLayoutTarget && (ev.ctrlKey || ev.metaKey)) {
+          if (finalAutoLayoutTarget && isIgnoreAutoLayoutChord(ev)) {
             finalAutoLayoutTarget = ignoreAutoLayoutForDropTarget(
               finalAutoLayoutTarget
             );
           }
+          finalAutoLayoutTarget = applyFreeDropSizeGuard(
+            finalAutoLayoutTarget,
+            ev
+          );
           if (finalAutoLayoutTarget) {
             currentAutoLayoutTarget = finalAutoLayoutTarget;
           }
@@ -14884,7 +15023,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         } catch (_err) {
         }
       }
-      var suppressCrossScreenStartForCtrlReorder = Boolean(e.ctrlKey) && isFlowReorderCandidate(dragTarget);
+      var suppressCrossScreenStartForCtrlReorder = isIgnoreAutoLayoutChord(e) && isFlowReorderCandidate(dragTarget);
       if (!readOnly && !e.altKey && !suppressCrossScreenStartForCtrlReorder) {
         postCrossScreenDrag("start", dragTarget, e);
       }
@@ -15055,6 +15194,9 @@ export const editorChromeBridgeScript: string = `"use strict";
     document.addEventListener(
       "keydown",
       function(e) {
+        if (!isApplePlatformBridge() && String(e.key).toLowerCase() === "s") {
+          bridgeIgnoreAutoLayoutKeyPressed = true;
+        }
         if (e.key === " " && e.code === "Space" && !activeTextEditEl && !isEditorTypingTarget(e.target)) {
           bridgeSpaceKeyPressed = true;
           if (activeDragCancel) {
@@ -15160,6 +15302,9 @@ export const editorChromeBridgeScript: string = `"use strict";
     document.addEventListener(
       "keyup",
       function(e) {
+        if (!isApplePlatformBridge() && String(e.key).toLowerCase() === "s") {
+          bridgeIgnoreAutoLayoutKeyPressed = false;
+        }
         if (e.key !== " " || e.code !== "Space") return;
         bridgeSpaceKeyPressed = false;
         if (bridgeSpaceKeyConsumedByDrag) {
@@ -15176,6 +15321,13 @@ export const editorChromeBridgeScript: string = `"use strict";
       },
       true
     );
+    window.addEventListener("blur", function() {
+      window.setTimeout(function() {
+        if (!activeDragCancel) {
+          bridgeIgnoreAutoLayoutKeyPressed = false;
+        }
+      }, 0);
+    });
     document.addEventListener(
       "pointerdown",
       function(e) {
