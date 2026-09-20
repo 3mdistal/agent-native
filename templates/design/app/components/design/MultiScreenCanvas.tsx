@@ -590,6 +590,7 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
   onReviewPendingScreen,
   interactMode = false,
   readOnly = false,
+  editableScreenIds,
   activeScreenHasHoveredChild = false,
   hoveredChildScreenId,
   directlyHoveredScreenId,
@@ -10813,6 +10814,7 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
                 screen.id === hoveredChildScreenId
               }
               groupSelected={hasGroupSelection}
+              contentEditable={editableScreenIds?.has(screen.id) === true}
               handlesEnabled={!hasGroupSelection && !readOnly}
               readOnly={readOnly}
               penActive={penActive}
@@ -12319,6 +12321,7 @@ interface ScreenProps {
   isFileDragOver: boolean;
   hasHoveredChild: boolean;
   groupSelected: boolean;
+  contentEditable: boolean;
   handlesEnabled: boolean;
   penActive: boolean;
   creationToolActive: boolean;
@@ -12403,6 +12406,7 @@ const Screen = memo(function Screen({
   isFileDragOver,
   hasHoveredChild,
   groupSelected,
+  contentEditable,
   handlesEnabled,
   penActive,
   creationToolActive,
@@ -12478,9 +12482,7 @@ const Screen = memo(function Screen({
   // its live DOM does, and that DOM is the only thing there is to select.
   const screenContentInteractive =
     Boolean(screenContent) &&
-    (isSelected ||
-      isRunningAppSourceType(metadata.source) ||
-      hasScreenChildLayers(screen.content)) &&
+    (isSelected || hasScreenChildLayers(screen.content) || contentEditable) &&
     !locked &&
     !penActive &&
     !creationToolActive &&
@@ -13088,6 +13090,7 @@ function areScreenPropsEqual(prev: ScreenProps, next: ScreenProps) {
     prev.isFileDragOver === next.isFileDragOver &&
     prev.hasHoveredChild === next.hasHoveredChild &&
     prev.groupSelected === next.groupSelected &&
+    prev.contentEditable === next.contentEditable &&
     prev.readOnly === next.readOnly &&
     prev.handlesEnabled === next.handlesEnabled &&
     prev.penActive === next.penActive &&

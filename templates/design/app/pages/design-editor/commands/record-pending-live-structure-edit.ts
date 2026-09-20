@@ -32,6 +32,7 @@ import type { DesignFile } from "@/pages/design-editor/types";
 
 export interface RecordPendingLiveStructureEditArgs {
   canEditDesign: boolean;
+  canEditLiveScreens?: ReadonlySet<string>;
   cancelPendingStructureVerification: (
     nextStatus?: PendingStructureVerificationStatus,
   ) => void;
@@ -69,6 +70,7 @@ export type PendingLiveStructureEditRequest = Parameters<
 export function preparePendingLiveStructureEdit(
   {
     canEditDesign,
+    canEditLiveScreens,
     files,
     localhostConnectionRootPathByIdRef,
     overviewScreens,
@@ -76,6 +78,7 @@ export function preparePendingLiveStructureEdit(
   }: Pick<
     RecordPendingLiveStructureEditArgs,
     | "canEditDesign"
+    | "canEditLiveScreens"
     | "files"
     | "localhostConnectionRootPathByIdRef"
     | "overviewScreens"
@@ -121,8 +124,7 @@ export function preparePendingLiveStructureEdit(
     removed?: true;
   },
 ): PendingLiveStructureEdit | undefined {
-  if (!canEditDesign) return undefined;
-
+  if (!canEditDesign && !canEditLiveScreens?.has(screenId)) return undefined;
   const screen = files.find((file) => file.id === screenId);
   const overviewScreen = overviewScreens.find(
     (candidate) => candidate.id === screenId,
@@ -288,6 +290,7 @@ export function commitPendingLiveStructureEdits(
 export function runRecordPendingLiveStructureEdit(
   {
     canEditDesign,
+    canEditLiveScreens,
     cancelPendingStructureVerification,
     files,
     localhostConnectionRootPathByIdRef,
@@ -349,6 +352,7 @@ export function runRecordPendingLiveStructureEdit(
   const nextEdit = preparePendingLiveStructureEdit(
     {
       canEditDesign,
+      canEditLiveScreens,
       files,
       localhostConnectionRootPathByIdRef,
       overviewScreens,

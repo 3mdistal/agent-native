@@ -55,6 +55,7 @@ export interface VisualStructureChangeArgs {
     },
   ) => ApplyLocalContentUpdateResult;
   canEditDesign: boolean;
+  canEditLiveScreen?: boolean;
   getFreshActiveContent: () => string;
   recordPendingLiveStructureEdit: (
     screenId: string,
@@ -108,6 +109,7 @@ export function runVisualStructureChange(
     activeFile,
     applyLocalContentUpdate,
     canEditDesign,
+    canEditLiveScreen,
     getFreshActiveContent,
     recordPendingLiveStructureEdit,
     setSelectedElement,
@@ -162,7 +164,7 @@ export function runVisualStructureChange(
     dropMode: details?.dropMode,
     source: activeCanvasSourceType,
   });
-  if (!canEditDesign) return false;
+  if (!canEditDesign && !canEditLiveScreen) return false;
   if (!activeFile) return false;
   if (isRunningAppSourceType(activeCanvasSourceType)) {
     recordPendingLiveStructureEdit(
