@@ -576,6 +576,7 @@ import {
   codeLayerSourceNodeIdAttrs,
   codeLayerNodeLooksLikeComponent,
   codeLayerSelectorAliases,
+  codeLayerSelectorMatches,
   codeLayerTreeToPanelNodes,
   collectCodeLayerAncestors,
   collectEffectiveCodeLayerState,
@@ -15306,8 +15307,43 @@ function DesignEditor() {
       sourceCloneHtml?: string;
       styleSnapshot?: PortableStyleSnapshot;
       styleSnapshotCaptureFailed?: boolean;
-    }) =>
-      runCrossScreenElementDrop(
+    }) => {
+      const movedSourceId =
+        arg0.sourceProvenance?.uniqueNodeId?.trim() ||
+        arg0.sourceNodeId?.trim() ||
+        undefined;
+      const movedSourceSelector = arg0.sourceSelector.trim() || undefined;
+      const sourceOwners = Array.from(
+        codeLayerOwnerByNodeIdRef.current.entries(),
+      ).filter(([, owner]) => owner.fileId === arg0.sourceScreenId);
+      const sourceIdMatches = movedSourceId
+        ? sourceOwners.filter(
+            ([, owner]) =>
+              bridgeSourceIdForCodeLayerNode(owner.node).trim() ===
+              movedSourceId,
+          )
+        : [];
+      const selectorMatches = movedSourceSelector
+        ? sourceOwners.filter(([, owner]) =>
+            codeLayerSelectorMatches(owner.node, movedSourceSelector),
+          )
+        : [];
+      const movedSourceMatches =
+        sourceIdMatches.length === 1
+          ? sourceIdMatches
+          : selectorMatches.length === 1
+            ? selectorMatches
+            : [];
+      const movedSourceSelection = {
+        movedSourceId,
+        sourceIdMatches,
+        movedSourceOwner: movedSourceMatches[0]?.[1],
+        movedSourceLayerIds: new Set(
+          movedSourceMatches.map(([layerId]) => layerId),
+        ),
+      };
+
+      return runCrossScreenElementDrop(
         {
           applyFileContentUpdate,
           boardFileId,
@@ -15318,20 +15354,50 @@ function DesignEditor() {
           contentHistorySelectionAfterRef,
           designSourceType,
           fileSaveOperationRevisionRef,
-          getCurrentSelectionFingerprint: () =>
-            JSON.stringify({
+          getCurrentSelectionFingerprint: () => {
+            const selectedElement = selectedElementRef.current;
+            const selectedElementSourceScreenId =
+              selectedElement?.sourceLayerIdentity?.screenId?.trim() ||
+              undefined;
+            const selectedElementBelongsToSource =
+              selectedElementSourceScreenId !== undefined &&
+              selectedElementSourceScreenId === arg0.sourceScreenId;
+            // Removing the source can legitimately clear its pre-drop
+            // selection before the two saves settle.
+            const selectedMovedSource =
+              selectedElement !== null &&
+              selectedElementBelongsToSource &&
+              movedSourceSelection.movedSourceOwner !== undefined &&
+              (movedSourceSelection.sourceIdMatches.length === 1
+                ? selectedElement.sourceId?.trim() === movedSourceId
+                : codeLayerSelectorMatches(
+                    movedSourceSelection.movedSourceOwner.node,
+                    selectedElement.selector,
+                  ));
+            const selectedLayerIds = selectedLayerIdsStateRef.current.filter(
+              (layerId) => {
+                const owner = codeLayerOwnerByNodeIdRef.current.get(layerId);
+                if (owner) {
+                  return !movedSourceSelection.movedSourceLayerIds.has(layerId);
+                }
+                return !selectedMovedSource;
+              },
+            );
+            return JSON.stringify({
               activeFileId: activeFileIdRef.current,
-              selectedLayerIds: selectedLayerIdsStateRef.current,
+              selectedLayerIds,
               overviewSelectedScreenIds: overviewSelectedScreenIdsRef.current,
-              selectedElement: selectedElementRef.current
-                ? {
-                    id: selectedElementRef.current.id ?? null,
-                    selector: selectedElementRef.current.selector ?? null,
-                    sourceId: selectedElementRef.current.sourceId ?? null,
-                  }
-                : null,
+              selectedElement:
+                selectedElement && !selectedMovedSource
+                  ? {
+                      id: selectedElement.id ?? null,
+                      selector: selectedElement.selector ?? null,
+                      sourceId: selectedElement.sourceId ?? null,
+                    }
+                  : null,
               viewMode: viewModeRef.current,
-            }),
+            });
+          },
           getScreenContent,
           id,
           overviewScreens,
@@ -15350,7 +15416,8 @@ function DesignEditor() {
           viewModeRef,
         },
         arg0,
-      ),
+      );
+    },
     [
       applyFileContentUpdate,
       boardFileId,
