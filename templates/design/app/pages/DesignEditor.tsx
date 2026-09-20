@@ -381,6 +381,7 @@ import { TokensPanel } from "@/components/design/TokensPanel";
 import type {
   CanvasLayerHitCandidate,
   ElementInfo,
+  GridGroupStructureMove,
   ElementSelectionIntent,
   DeviceFrameType,
   PortableStyleSnapshot,
@@ -739,7 +740,11 @@ import { runTweakPromptSubmit } from "./design-editor/commands/tweak-prompt-subm
 import { runUndo } from "./design-editor/commands/undo";
 import { runUngroupSelection } from "./design-editor/commands/ungroup-selection";
 import { runVisualDuplicateChange } from "./design-editor/commands/visual-duplicate-change";
-import { runVisualStructureChange } from "./design-editor/commands/visual-structure-change";
+import {
+  planVisualGridGroupStructureChange,
+  resolveGridGroupLinkedComponentTarget,
+  runVisualStructureChange,
+} from "./design-editor/commands/visual-structure-change";
 import { runWriteFrameGeometrySnapshot } from "./design-editor/commands/write-frame-geometry-snapshot";
 import { getCreatedScreenNavigationPlan } from "./design-editor/created-screen-navigation";
 import { designPrecedentDirectives } from "./design-editor/creative-context-precedent";
@@ -8377,6 +8382,22 @@ function DesignEditor() {
         forceFlowPositionOverride?: boolean;
         sourceRect?: { x: number; y: number; width: number; height: number };
         anchorRect?: { x: number; y: number; width: number; height: number };
+        gridPlacement?: {
+          column: number;
+          columnEnd: number;
+          row: number;
+          rowEnd: number;
+        };
+        gridDisplacements?: Array<{
+          sourceId?: string;
+          selector?: string;
+          placement: {
+            column: number;
+            columnEnd: number;
+            row: number;
+            rowEnd: number;
+          };
+        }>;
         /** Markup this change introduced; the subject does not exist in the
          * screen's source yet, so it must be added rather than relocated. */
         insertedHtml?: string;
@@ -12862,6 +12883,22 @@ function DesignEditor() {
         forceFlowPositionOverride?: boolean;
         sourceRect?: { x: number; y: number; width: number; height: number };
         anchorRect?: { x: number; y: number; width: number; height: number };
+        gridPlacement?: {
+          column: number;
+          columnEnd: number;
+          row: number;
+          rowEnd: number;
+        };
+        gridDisplacements?: Array<{
+          sourceId?: string;
+          selector?: string;
+          placement: {
+            column: number;
+            columnEnd: number;
+            row: number;
+            rowEnd: number;
+          };
+        }>;
         /** Markup this change introduced; the subject does not exist in the
          * screen's source yet, so it must be added rather than relocated. */
         insertedHtml?: string;
@@ -13179,6 +13216,60 @@ function DesignEditor() {
       recordPendingLiveStructureEdit,
       applyLinkedComponentEdit,
       t,
+    ],
+  );
+
+  const handleScreenGridGroupChange = useCallback(
+    (screenId: string, moves: GridGroupStructureMove[]) => {
+      const screen = overviewScreens.find(
+        (candidate) => candidate.id === screenId,
+      );
+      const sourceType =
+        normalizeDesignSourceType(screen?.sourceType) ?? designSourceType;
+      if (isRunningAppSourceType(sourceType)) return false;
+      const screenFile = files.find((file) => file.id === screenId);
+      if (!screenFile || !canEditDesign) return false;
+      const content = getScreenContent(screenId);
+      const linked = resolveGridGroupLinkedComponentTarget(
+        content,
+        screenId,
+        moves,
+      );
+      if (linked.status === "mixed") return false;
+      const nextContent = planVisualGridGroupStructureChange(
+        screenFile,
+        content,
+        moves,
+        t,
+        linked.status === "linked",
+      );
+      if (nextContent === null) return false;
+      if (linked.status === "linked") {
+        applyLinkedComponentEdit(linked.fileId, linked.nodeId, {
+          kind: "structure",
+          before: content,
+          after: nextContent,
+          selectionNodeIds: moves.map((move) => move.sourceId),
+        });
+        setActiveFileId(screenId);
+        return true;
+      }
+      const published = applyFileContentUpdate(screenId, nextContent, {
+        skipPreview: true,
+      });
+      if (published.status !== "accepted") return false;
+      setActiveFileId(screenId);
+      return true;
+    },
+    [
+      overviewScreens,
+      designSourceType,
+      files,
+      canEditDesign,
+      getScreenContent,
+      t,
+      applyFileContentUpdate,
+      applyLinkedComponentEdit,
     ],
   );
 
@@ -23109,6 +23200,10 @@ function DesignEditor() {
               info,
               details,
             );
+          }}
+          onVisualGridGroupChange={(moves) => {
+            activateResponsiveScope();
+            return handleScreenGridGroupChange(screen.id, moves);
           }}
           onVisualDuplicateChange={(selector, cloneHtml, info, details) => {
             activateResponsiveScope();
