@@ -46,7 +46,6 @@ import {
 } from "@agent-native/core/client/hooks";
 import {
   getBuilderParentOrigin,
-  getEmbedAuthToken,
   isEmbedAuthActive,
 } from "@agent-native/core/client/host";
 import { useT } from "@agent-native/core/client/i18n";
@@ -1159,41 +1158,6 @@ function readRenderedLayerInfo(
   return null;
 }
 
-function hasActiveVisualEditEmbedToken(
-  token: string | null,
-  pathname: string,
-): boolean {
-  if (typeof window === "undefined" || !token) return false;
-  const [encodedPayload] = token.split(".", 1);
-  if (!encodedPayload) return false;
-
-  try {
-    const base64 = encodedPayload.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64.padEnd(
-      base64.length + ((4 - (base64.length % 4)) % 4),
-      "=",
-    );
-    const binary = window.atob(padded);
-    const bytes = Uint8Array.from(binary, (character) =>
-      character.charCodeAt(0),
-    );
-    const claims = JSON.parse(new TextDecoder().decode(bytes)) as {
-      exp?: unknown;
-      targetPath?: unknown;
-    };
-    if (typeof claims.exp !== "number" || claims.exp <= Date.now() / 1000) {
-      return false;
-    }
-    if (typeof claims.targetPath !== "string") return false;
-    return (
-      new URL(claims.targetPath, window.location.origin).pathname === pathname
-    );
-  } catch {
-    // coercion-ok: malformed embed tokens are treated as absent and reissued.
-    return false;
-  }
-}
-
 // ── Route wrapper — remounts editor state per design id ──────────────────────
 /**
  * React Router reuses the same route component when only `:id` changes. Key
@@ -1271,49 +1235,6 @@ function DesignEditor() {
   // Design page and put our own chrome and agent inside Builder's.
   const embedded = shellMode || isEmbedAuthActive();
   const isVisualEditSurface = location.pathname.startsWith("/visual-edit/");
-  const hasActiveVisualEditAccess = hasActiveVisualEditEmbedToken(
-    getEmbedAuthToken(),
-    location.pathname,
-  );
-  const visualEditAccessAttemptRef = useRef<string | null>(null);
-  useEffect(() => {
-    // `embedded=1` is also a presentation marker. It can survive after the
-    // one-time capability token was stripped or lost in a private browser
-    // context, so it must not suppress the signed-out visual-edit bootstrap.
-    if (!isVisualEditSurface || !id || !sessionResolved || shellMode) return;
-    if (hasActiveVisualEditAccess) {
-      // The embed auth bootstrap strips the one-time token from the URL after
-      // storing it. Validate that stored capability before suppressing the
-      // public route bootstrap so expired or copied links renew access.
-      visualEditAccessAttemptRef.current = id;
-      return;
-    }
-    if (visualEditAccessAttemptRef.current === id) return;
-
-    visualEditAccessAttemptRef.current = id;
-    void callAction<{ startUrl?: string }>("issue-visual-edit-access", {
-      designId: id,
-    })
-      .then((result) => {
-        if (!result?.startUrl) {
-          throw new Error("Visual-edit access did not return a start URL.");
-        }
-        window.location.replace(
-          new URL(result.startUrl, window.location.href).toString(),
-        );
-      })
-      .catch(() => {
-        if (visualEditAccessAttemptRef.current === id) {
-          visualEditAccessAttemptRef.current = null;
-        }
-      });
-  }, [
-    hasActiveVisualEditAccess,
-    id,
-    isVisualEditSurface,
-    sessionResolved,
-    shellMode,
-  ]);
   const embedChromeRequested = isEmbedChromeRequested();
   // The shell keeps our rails and hands the host only the chat, so it must not
   // depend on `embedChrome` surviving in the URL Builder builds.
@@ -3830,6 +3751,8 @@ function DesignEditor() {
 
   const {
     data: designResult,
+    error: designQueryError,
+    isError: designQueryFailed,
     isLoading: designLoading,
     refetch: refetchDesign,
   } = useActionQuery<DesignData | string>(
@@ -3837,7 +3760,13 @@ function DesignEditor() {
     { id: id! },
     {
       enabled: !shellMode,
-      refetchInterval: pendingGenerationActive || generating ? 1000 : false,
+      refetchInterval: isVisualEditSurface
+        ? pendingGenerationActive || generating
+          ? 1000
+          : 30_000
+        : pendingGenerationActive || generating
+          ? 1000
+          : false,
     },
   );
   const {
@@ -3927,7 +3856,19 @@ function DesignEditor() {
   const designAccessRole = design?.accessRole;
   const canShareDesign =
     designAccessRole === "owner" || designAccessRole === "admin";
-  const canEditDesign = canShareDesign || designAccessRole === "editor";
+  const designQueryErrorStatus =
+    designQueryError && typeof designQueryError === "object"
+      ? (designQueryError as { status?: unknown }).status
+      : undefined;
+  const designQueryAuthFailed =
+    designQueryErrorStatus === 401 || designQueryErrorStatus === 403;
+  const visualEditAccessLost =
+    isVisualEditSurface &&
+    designQueryFailed &&
+    (designResult === undefined || designQueryAuthFailed);
+  const canEditDesign = !visualEditAccessLost
+    ? canShareDesign || designAccessRole === "editor"
+    : false;
   const creativeContextLab = useCreativeContextLabState();
   const creativeContextEnabled = creativeContextLab.enabled;
   const tweaksEnabled = useLab(DESIGN_TWEAKS.key);
@@ -3938,6 +3879,122 @@ function DesignEditor() {
       designAccessRole === "editor" ||
       designAccessRole === "commenter");
   const canRenderAuthenticatedShare = isSignedIn || canEditDesign;
+  const visualEditAccessAttemptRef = useRef<string | null>(null);
+  const visualEditCanEditRef = useRef<boolean | null>(null);
+  const visualEditAccessRequestRef = useRef(0);
+  const visualEditBootstrapRetryCountRef = useRef(0);
+  const [visualEditBootstrapRetryTick, setVisualEditBootstrapRetryTick] =
+    useState(0);
+  const [visualEditBootstrapFailed, setVisualEditBootstrapFailed] =
+    useState(false);
+
+  useEffect(() => {
+    const previousCanEdit = visualEditCanEditRef.current;
+    visualEditCanEditRef.current = canEditDesign;
+    let active = true;
+    let retryTimeout: number | undefined;
+
+    // Wait for the server-backed design result. It is the authority for both
+    // signed-in editor access and the scoped visual-edit capability ticket.
+    if (
+      !isVisualEditSurface ||
+      !id ||
+      !sessionResolved ||
+      shellMode ||
+      (designResult === undefined && !designQueryFailed)
+    ) {
+      return () => {
+        active = false;
+      };
+    }
+    if (designQueryFailed && designResult === undefined) {
+      visualEditAccessAttemptRef.current = null;
+      setVisualEditBootstrapFailed(true);
+      return () => {
+        active = false;
+      };
+    }
+    if (canEditDesign) {
+      visualEditAccessAttemptRef.current = null;
+      visualEditBootstrapRetryCountRef.current = 0;
+      setVisualEditBootstrapFailed(false);
+      visualEditAccessRequestRef.current += 1;
+      return () => {
+        active = false;
+      };
+    }
+    if (
+      previousCanEdit === false &&
+      visualEditAccessAttemptRef.current !== null
+    ) {
+      return () => {
+        active = false;
+      };
+    }
+
+    visualEditAccessAttemptRef.current = id;
+    const requestId = ++visualEditAccessRequestRef.current;
+    setVisualEditBootstrapFailed(false);
+    void callAction<{ startUrl?: string }>("issue-visual-edit-access", {
+      designId: id,
+    })
+      .then((result) => {
+        if (!active || visualEditAccessRequestRef.current !== requestId) {
+          return;
+        }
+        if (!result?.startUrl) {
+          throw new Error("Visual-edit access did not return a start URL.");
+        }
+        window.location.replace(
+          new URL(result.startUrl, window.location.href).toString(),
+        );
+      })
+      .catch(() => {
+        if (
+          active &&
+          visualEditAccessRequestRef.current === requestId &&
+          visualEditAccessAttemptRef.current === id
+        ) {
+          visualEditAccessAttemptRef.current = null;
+          setVisualEditBootstrapFailed(true);
+          if (visualEditBootstrapRetryCountRef.current < 1) {
+            visualEditBootstrapRetryCountRef.current += 1;
+            retryTimeout = window.setTimeout(() => {
+              if (
+                active &&
+                visualEditAccessRequestRef.current === requestId &&
+                visualEditAccessAttemptRef.current === null
+              ) {
+                setVisualEditBootstrapRetryTick((tick) => tick + 1);
+              }
+            }, 1000);
+          }
+        }
+      });
+    return () => {
+      active = false;
+      if (retryTimeout !== undefined) {
+        window.clearTimeout(retryTimeout);
+      }
+      if (visualEditAccessRequestRef.current === requestId) {
+        visualEditAccessRequestRef.current += 1;
+        if (visualEditAccessAttemptRef.current === id) {
+          visualEditAccessAttemptRef.current = null;
+        }
+      }
+    };
+  }, [
+    canEditDesign,
+    designQueryFailed,
+    designResult,
+    id,
+    isVisualEditSurface,
+    sessionResolved,
+    shellMode,
+    visualEditBootstrapRetryTick,
+  ]);
+  const showVisualEditAccessFailureBanner =
+    isVisualEditSurface && visualEditBootstrapFailed;
 
   const reviewResult = useReviewComments(
     {
@@ -25734,20 +25791,22 @@ function DesignEditor() {
                       }}
                     />
                   )}
-                  {/* Figma-style notice for viewers/commenters who can't edit
-                      this design. Only shown once accessRole has resolved. */}
-                  {!isVisualEditSurface &&
-                    (designAccessRole === "viewer" ||
-                      designAccessRole === "commenter") && (
-                      <ReadOnlyDesignBanner
-                        pinMode={pinMode}
-                        onCommentPin={
-                          !hostOwnsChrome && canCommentDesign
-                            ? handlePinToolToggle
-                            : undefined
-                        }
-                      />
-                    )}
+                  {/* Hide the read-only notice only during a visual-edit
+                      capability bootstrap. Failed authorization stays visible
+                      so private or unavailable designs have a recovery path. */}
+                  {(showVisualEditAccessFailureBanner ||
+                    (!isVisualEditSurface &&
+                      (designAccessRole === "viewer" ||
+                        designAccessRole === "commenter"))) && (
+                    <ReadOnlyDesignBanner
+                      pinMode={pinMode}
+                      onCommentPin={
+                        !hostOwnsChrome && canCommentDesign
+                          ? handlePinToolToggle
+                          : undefined
+                      }
+                    />
+                  )}
                   {/* Full-app building status/controls. Renders only for
                       designs backed by a fusion app (see readFusionApp) and
                       only while the flag is on — the fusion actions the
