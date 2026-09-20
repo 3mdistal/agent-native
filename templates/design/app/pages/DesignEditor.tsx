@@ -3879,123 +3879,6 @@ function DesignEditor() {
       designAccessRole === "editor" ||
       designAccessRole === "commenter");
   const canRenderAuthenticatedShare = isSignedIn || canEditDesign;
-  const visualEditAccessAttemptRef = useRef<string | null>(null);
-  const visualEditCanEditRef = useRef<boolean | null>(null);
-  const visualEditAccessRequestRef = useRef(0);
-  const visualEditBootstrapRetryCountRef = useRef(0);
-  const [visualEditBootstrapRetryTick, setVisualEditBootstrapRetryTick] =
-    useState(0);
-  const [visualEditBootstrapFailed, setVisualEditBootstrapFailed] =
-    useState(false);
-
-  useEffect(() => {
-    const previousCanEdit = visualEditCanEditRef.current;
-    visualEditCanEditRef.current = canEditDesign;
-    let active = true;
-    let retryTimeout: number | undefined;
-
-    // Wait for the server-backed design result. It is the authority for both
-    // signed-in editor access and the scoped visual-edit capability ticket.
-    if (
-      !isVisualEditSurface ||
-      !id ||
-      !sessionResolved ||
-      shellMode ||
-      (designResult === undefined && !designQueryFailed)
-    ) {
-      return () => {
-        active = false;
-      };
-    }
-    if (designQueryFailed && designResult === undefined) {
-      visualEditAccessAttemptRef.current = null;
-      setVisualEditBootstrapFailed(true);
-      return () => {
-        active = false;
-      };
-    }
-    if (canEditDesign) {
-      visualEditAccessAttemptRef.current = null;
-      visualEditBootstrapRetryCountRef.current = 0;
-      setVisualEditBootstrapFailed(false);
-      visualEditAccessRequestRef.current += 1;
-      return () => {
-        active = false;
-      };
-    }
-    if (
-      previousCanEdit === false &&
-      visualEditAccessAttemptRef.current !== null
-    ) {
-      return () => {
-        active = false;
-      };
-    }
-
-    visualEditAccessAttemptRef.current = id;
-    const requestId = ++visualEditAccessRequestRef.current;
-    setVisualEditBootstrapFailed(false);
-    void callAction<{ startUrl?: string }>("issue-visual-edit-access", {
-      designId: id,
-    })
-      .then((result) => {
-        if (!active || visualEditAccessRequestRef.current !== requestId) {
-          return;
-        }
-        if (!result?.startUrl) {
-          throw new Error("Visual-edit access did not return a start URL.");
-        }
-        window.location.replace(
-          new URL(result.startUrl, window.location.href).toString(),
-        );
-      })
-      .catch(() => {
-        if (
-          active &&
-          visualEditAccessRequestRef.current === requestId &&
-          visualEditAccessAttemptRef.current === id
-        ) {
-          visualEditAccessAttemptRef.current = null;
-          setVisualEditBootstrapFailed(true);
-          if (visualEditBootstrapRetryCountRef.current < 1) {
-            visualEditBootstrapRetryCountRef.current += 1;
-            retryTimeout = window.setTimeout(() => {
-              if (
-                active &&
-                visualEditAccessRequestRef.current === requestId &&
-                visualEditAccessAttemptRef.current === null
-              ) {
-                setVisualEditBootstrapRetryTick((tick) => tick + 1);
-              }
-            }, 1000);
-          }
-        }
-      });
-    return () => {
-      active = false;
-      if (retryTimeout !== undefined) {
-        window.clearTimeout(retryTimeout);
-      }
-      if (visualEditAccessRequestRef.current === requestId) {
-        visualEditAccessRequestRef.current += 1;
-        if (visualEditAccessAttemptRef.current === id) {
-          visualEditAccessAttemptRef.current = null;
-        }
-      }
-    };
-  }, [
-    canEditDesign,
-    designQueryFailed,
-    designResult,
-    id,
-    isVisualEditSurface,
-    sessionResolved,
-    shellMode,
-    visualEditBootstrapRetryTick,
-  ]);
-  const showVisualEditAccessFailureBanner =
-    isVisualEditSurface && visualEditBootstrapFailed;
-
   const reviewResult = useReviewComments(
     {
       resourceType: "design",
@@ -25784,13 +25667,10 @@ function DesignEditor() {
                       }}
                     />
                   )}
-                  {/* Hide the read-only notice only during a visual-edit
-                      capability bootstrap. Failed authorization stays visible
-                      so private or unavailable designs have a recovery path. */}
-                  {(showVisualEditAccessFailureBanner ||
-                    (!isVisualEditSurface &&
-                      (designAccessRole === "viewer" ||
-                        designAccessRole === "commenter"))) && (
+                  {/* Figma-style notice for viewers/commenters who can't edit
+                      this design. Only shown once accessRole has resolved. */}
+                  {(designAccessRole === "viewer" ||
+                    designAccessRole === "commenter") && (
                     <ReadOnlyDesignBanner
                       pinMode={pinMode}
                       onCommentPin={
