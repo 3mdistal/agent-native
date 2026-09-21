@@ -27619,6 +27619,16 @@ function DesignEditor() {
                         }
                         deviceFrame={deviceFrame}
                         sourceType={activeCanvasSourceType}
+                        previewUrlOverride={
+                          activeCanvasSourceType === "localhost"
+                            ? previewUrlAtLiveRoute(
+                                activeScreenPreviewUrl ?? undefined,
+                                liveRoutePathsByScreenIdRef.current[
+                                  activeFile.id
+                                ],
+                              )
+                            : undefined
+                        }
                         bridgeUrl={activeScreenBridgeUrl}
                         connectionId={activeOverviewScreen?.connectionId}
                         previewToken={activeScreenPreviewToken}

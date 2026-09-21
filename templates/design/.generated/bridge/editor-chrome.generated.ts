@@ -907,6 +907,7 @@ export const editorChromeBridgeScript: string = `"use strict";
   (function() {
     var readOnly = __READ_ONLY__;
     var textEditingEnabledFlag = __TEXT_EDITING_ENABLED__;
+    var interactionMode = false;
     var designCanvasScreenId = __DESIGN_CANVAS_SCREEN_ID__ || "";
     var designCanvasBoardSurface = !!__DESIGN_CANVAS_BOARD_SURFACE__;
     var designCanvasContentOffsetX = Number(__DESIGN_CANVAS_CONTENT_OFFSET_X__) || 0;
@@ -7707,6 +7708,7 @@ export const editorChromeBridgeScript: string = `"use strict";
       return null;
     }
     function stopNativeInteraction(e) {
+      if (interactionMode) return;
       if (e.cancelable) e.preventDefault();
       e.stopPropagation();
       if (e.stopImmediatePropagation) e.stopImmediatePropagation();
@@ -10759,6 +10761,9 @@ export const editorChromeBridgeScript: string = `"use strict";
         return "y";
       }
       if (cs.display === "grid" || cs.display === "inline-grid") {
+        if ((cs.gridAutoFlow || "row").split(/\\s+/)[0] === "column") {
+          return "y";
+        }
         var cols = (cs.gridTemplateColumns || "").split(" ").filter(Boolean).length;
         return cols > 1 ? "x" : "y";
       }
@@ -16065,6 +16070,7 @@ export const editorChromeBridgeScript: string = `"use strict";
     document.addEventListener(
       "pointerdown",
       function(e) {
+        if (interactionMode) return;
         if (isOverlayElement(e.target)) return;
         if (e.button === 0) beginPotentialShieldDrag(e);
       },
@@ -16073,6 +16079,7 @@ export const editorChromeBridgeScript: string = `"use strict";
     document.addEventListener(
       "mousedown",
       function(e) {
+        if (interactionMode) return;
         if (isOverlayElement(e.target)) return;
         if (e.button === 0) beginPotentialShieldDrag(e);
       },
@@ -16088,6 +16095,7 @@ export const editorChromeBridgeScript: string = `"use strict";
       }
     );
     function stopBlockedLayerInteraction(e) {
+      if (interactionMode) return;
       if (isOverlayElement(e.target)) return;
       var target = e.target && e.target.nodeType === 1 ? e.target : null;
       if (!target || !isLayerInteractionBlocked(target)) return;
@@ -16113,6 +16121,7 @@ export const editorChromeBridgeScript: string = `"use strict";
     document.addEventListener(
       "contextmenu",
       function(e) {
+        if (interactionMode) return;
         if (isOverlayElement(e.target)) return;
         openContextMenuAtEvent(e);
       },
@@ -16142,6 +16151,7 @@ export const editorChromeBridgeScript: string = `"use strict";
     document.addEventListener(
       "keydown",
       function(e) {
+        if (interactionMode) return;
         if (!isApplePlatformBridge() && String(e.key).toLowerCase() === "s") {
           bridgeIgnoreAutoLayoutKeyPressed = true;
         }
@@ -16895,6 +16905,7 @@ export const editorChromeBridgeScript: string = `"use strict";
     document.addEventListener(
       "dblclick",
       function(e) {
+        if (interactionMode) return;
         if (isOverlayElement(e.target)) return;
         beginTextEditingFromEvent(e);
       },
@@ -16937,7 +16948,7 @@ export const editorChromeBridgeScript: string = `"use strict";
       true
     );
     function handleShieldPointerMove(e) {
-      if (readOnly) return;
+      if (readOnly || interactionMode) return;
       stopNativeInteraction(e);
       lastHoverClientPoint = { x: e.clientX, y: e.clientY };
       hoveredEl = resolveHoverTarget(
@@ -17141,6 +17152,25 @@ export const editorChromeBridgeScript: string = `"use strict";
         } else {
           setSelectionOverlayResizeChromeVisible(true);
           shieldOverlay.style.pointerEvents = "auto";
+        }
+        return;
+      }
+      if (e.data.type === "set-interaction-mode") {
+        var nextInteractionMode = e.data.interact === true;
+        if (interactionMode === nextInteractionMode) return;
+        interactionMode = nextInteractionMode;
+        if (interactionMode) {
+          clearPendingShieldDrag();
+          cancelActiveBridgeDrag();
+          if (activeTextEditEl) activeTextEditEl.blur();
+          setSelectionOverlayResizeChromeVisible(false);
+          highlightOverlay.style.display = "none";
+          marqueeSelectionOverlay.style.display = "none";
+          shieldOverlay.style.pointerEvents = "none";
+        } else {
+          setSelectionOverlayResizeChromeVisible(!readOnly);
+          shieldOverlay.style.pointerEvents = "auto";
+          scheduleRuntimeLayerSnapshot();
         }
         return;
       }
@@ -18177,7 +18207,7 @@ export const editorChromeBridgeScript: string = `"use strict";
       return isOverlayElement(target) || isEditorTypingTarget(target) || !!activeDragCancel;
     }
     function interceptNativeInteractionNet(e) {
-      if (readOnly) return;
+      if (readOnly || interactionMode) return;
       var target = e.target && e.target.nodeType === 1 ? e.target : null;
       if (isNativeInteractionNetExempt(target)) return;
       stopNativeInteraction(e);

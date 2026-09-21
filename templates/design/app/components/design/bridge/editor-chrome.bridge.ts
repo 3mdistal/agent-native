@@ -50,6 +50,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
 (function () {
   var readOnly = __READ_ONLY__;
   var textEditingEnabledFlag = __TEXT_EDITING_ENABLED__;
+  var interactionMode = false;
   var designCanvasScreenId = __DESIGN_CANVAS_SCREEN_ID__ || "";
   var designCanvasBoardSurface = !!__DESIGN_CANVAS_BOARD_SURFACE__;
   var designCanvasContentOffsetX =
@@ -10336,6 +10337,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   }
 
   function stopNativeInteraction(e: Event): void {
+    if (interactionMode) return;
     // A fling's wheel events are not cancelable; cancelling one logs a browser
     // Intervention per event and scrolls anyway.
     if (e.cancelable) e.preventDefault();
@@ -14724,6 +14726,9 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       return "y";
     }
     if (cs.display === "grid" || cs.display === "inline-grid") {
+      if ((cs.gridAutoFlow || "row").split(/\s+/)[0] === "column") {
+        return "y";
+      }
       var cols = (cs.gridTemplateColumns || "")
         .split(" ")
         .filter(Boolean).length;
@@ -22685,6 +22690,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   document.addEventListener(
     "pointerdown",
     function (e) {
+      if (interactionMode) return;
       if (isOverlayElement(e.target)) return;
       if (e.button === 0) beginPotentialShieldDrag(e);
     },
@@ -22693,6 +22699,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   document.addEventListener(
     "mousedown",
     function (e) {
+      if (interactionMode) return;
       if (isOverlayElement(e.target)) return;
       if (e.button === 0) beginPotentialShieldDrag(e);
     },
@@ -22710,6 +22717,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   );
 
   function stopBlockedLayerInteraction(e) {
+    if (interactionMode) return;
     if (isOverlayElement(e.target)) return;
     var target = e.target && e.target.nodeType === 1 ? e.target : null;
     if (!target || !isLayerInteractionBlocked(target)) return;
@@ -22737,6 +22745,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   document.addEventListener(
     "contextmenu",
     function (e) {
+      if (interactionMode) return;
       if (isOverlayElement(e.target)) return;
       openContextMenuAtEvent(e);
     },
@@ -22770,6 +22779,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   document.addEventListener(
     "keydown",
     function (e) {
+      if (interactionMode) return;
       if (!isApplePlatformBridge() && String(e.key).toLowerCase() === "s") {
         bridgeIgnoreAutoLayoutKeyPressed = true;
       }
@@ -23938,6 +23948,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   document.addEventListener(
     "dblclick",
     function (e) {
+      if (interactionMode) return;
       if (isOverlayElement(e.target)) return;
       beginTextEditingFromEvent(e);
     },
@@ -23992,7 +24003,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     true,
   );
   function handleShieldPointerMove(e) {
-    if (readOnly) return;
+    if (readOnly || interactionMode) return;
     stopNativeInteraction(e);
     lastHoverClientPoint = { x: e.clientX, y: e.clientY };
     hoveredEl = resolveHoverTarget(
@@ -24270,6 +24281,27 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       } else {
         setSelectionOverlayResizeChromeVisible(true);
         shieldOverlay.style.pointerEvents = "auto";
+      }
+      return;
+    }
+    // Interact changes pointer ownership in-place. The editor chrome stays
+    // installed so returning to Edit can restore selection without a reload.
+    if (e.data.type === "set-interaction-mode") {
+      var nextInteractionMode = e.data.interact === true;
+      if (interactionMode === nextInteractionMode) return;
+      interactionMode = nextInteractionMode;
+      if (interactionMode) {
+        clearPendingShieldDrag();
+        cancelActiveBridgeDrag();
+        if (activeTextEditEl) activeTextEditEl.blur();
+        setSelectionOverlayResizeChromeVisible(false);
+        highlightOverlay.style.display = "none";
+        marqueeSelectionOverlay.style.display = "none";
+        shieldOverlay.style.pointerEvents = "none";
+      } else {
+        setSelectionOverlayResizeChromeVisible(!readOnly);
+        shieldOverlay.style.pointerEvents = "auto";
+        scheduleRuntimeLayerSnapshot();
       }
       return;
     }
@@ -25781,7 +25813,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   }
 
   function interceptNativeInteractionNet(e: Event): void {
-    if (readOnly) return;
+    if (readOnly || interactionMode) return;
     var target =
       e.target && (e.target as Element).nodeType === 1
         ? (e.target as Element)
