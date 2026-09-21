@@ -12564,6 +12564,11 @@ function DesignEditor() {
         pendingUndoGestureId?: string;
       } = {},
     ) => {
+      const routePath =
+        options.routePath ??
+        (isRunningAppSourceType(activeCanvasSourceType)
+          ? liveRoutePathsByScreenIdRef.current[activeFile?.id ?? ""]
+          : undefined);
       runCommitVisualStyles(
         {
           activeBreakpointUpperBoundPx,
@@ -12606,7 +12611,7 @@ function DesignEditor() {
         },
         selector,
         styles,
-        options,
+        routePath ? { ...options, routePath } : options,
       );
       invalidateRenderedElementInfo();
     },
@@ -12904,7 +12909,15 @@ function DesignEditor() {
 
   const commitInteractionStateStyles = useCallback(
     (state: InteractionState, styles: Record<string, string>): boolean => {
-      if (!canEditDesign || !activeFile?.id || !selectedElement?.sourceId) {
+      const canEditInteractionState =
+        canEditDesign ||
+        (isRunningAppSourceType(activeCanvasSourceType) &&
+          canEditActiveVisualScreen);
+      if (
+        !canEditInteractionState ||
+        !activeFile?.id ||
+        !selectedElement?.sourceId
+      ) {
         return false;
       }
       const entries = Object.entries(styles).filter(
@@ -12935,7 +12948,10 @@ function DesignEditor() {
           selectedCanvasSelector ?? selectedElement.selector ?? "",
           Object.fromEntries(entries),
           selectedElement,
-          { interactionState: state },
+          {
+            interactionState: state,
+            routePath: liveRoutePathsByScreenIdRef.current[activeFile.id],
+          },
         );
         previewInteractionStateStyles(state, Object.fromEntries(entries));
         return true;
@@ -12968,6 +12984,7 @@ function DesignEditor() {
       activeBreakpointUpperBoundPx,
       activeFile?.id,
       applyFileContentUpdate,
+      canEditActiveVisualScreen,
       canEditDesign,
       getFreshActiveContent,
       previewInteractionStateStyles,
@@ -13298,6 +13315,7 @@ function DesignEditor() {
                 originalStyles,
                 pendingUndoGestureId,
                 preserveSelection,
+                routePath: liveRoutePathsByScreenIdRef.current[screenId],
               },
             );
           },
@@ -14707,6 +14725,7 @@ function DesignEditor() {
         applyFileContentUpdate,
         applyLocalContentUpdate,
         canEditDesign,
+        canEditLiveScreen: canEditActiveVisualScreen,
         files,
         getFreshActiveContent,
         getScreenContent,
@@ -14734,6 +14753,7 @@ function DesignEditor() {
       applyFileContentUpdate,
       applyLocalContentUpdate,
       canEditDesign,
+      canEditActiveVisualScreen,
       files,
       getFreshActiveContent,
       getScreenContent,
@@ -16567,7 +16587,7 @@ function DesignEditor() {
   }, [selectedElement]);
 
   const handlePasteProps = useCallback(() => {
-    if (!canEditDesign) return;
+    if (!canEditActiveVisualScreen) return;
     if (!selectedElement?.selector || !copiedStylePropsRef.current) return;
     const styles = Object.fromEntries(
       Object.entries(copiedStylePropsRef.current).filter(([, value]) =>
@@ -16575,7 +16595,7 @@ function DesignEditor() {
       ),
     );
     handleStylesChange(styles);
-  }, [canEditDesign, handleStylesChange, selectedElement]);
+  }, [canEditActiveVisualScreen, handleStylesChange, selectedElement]);
 
   // Item 2d — "Copy animation" (Figma-parity, Copy/Paste-as submenu): snapshot
   // the selected node's motion tracks as a clip, detached from its node id
@@ -16866,6 +16886,8 @@ function DesignEditor() {
           boardFileId,
           boardFrameGeometry,
           canEditDesign,
+          canEditLiveScreen: canEditActiveVisualScreen,
+          isRunningAppSource: isRunningAppSourceType(activeCanvasSourceType),
           commitVisualStyles,
           designDataJsonRef,
           editorPreferences,
@@ -16893,6 +16915,7 @@ function DesignEditor() {
       boardFileId,
       boardFrameGeometry,
       canEditDesign,
+      canEditActiveVisualScreen,
       commitVisualStyles,
       editorPreferences.nudge,
       files,
@@ -18490,9 +18513,11 @@ function DesignEditor() {
     onCut: canEditDesign ? handleCutSelection : undefined,
     onPasteOver: canEditDesign ? handlePasteOverSelection : undefined,
     onPasteToReplace: canEditDesign ? handlePasteToReplace : undefined,
-    onCopyProps: canEditDesign ? handleCopyProps : undefined,
-    onPasteProps: canEditDesign ? handlePasteProps : undefined,
-    onDuplicate: canEditDesign ? handleDuplicateSelection : undefined,
+    onCopyProps: canEditActiveVisualScreen ? handleCopyProps : undefined,
+    onPasteProps: canEditActiveVisualScreen ? handlePasteProps : undefined,
+    onDuplicate: canEditActiveVisualScreen
+      ? handleDuplicateSelection
+      : undefined,
     // Routes screen-vs-element itself; selecting a screen in the layers panel
     // never reaches MultiScreenCanvas' capture-phase Delete.
     onDelete:
@@ -26586,7 +26611,7 @@ function DesignEditor() {
             }
             // Figma: Duplicate requires a selection, matching canDelete.
             canDuplicate={Boolean(
-              canEditDesign &&
+              canEditActiveVisualScreen &&
               (selectedElement || selectedScreenIds.length > 0),
             )}
             canDelete={Boolean(
@@ -26615,7 +26640,9 @@ function DesignEditor() {
             }
             canCopyProps={Boolean(selectedElement)}
             canPasteProps={
-              canEditDesign && hasPropsClipboard && Boolean(selectedElement)
+              canEditActiveVisualScreen &&
+              hasPropsClipboard &&
+              Boolean(selectedElement)
             }
             canCopyAnimation={
               Boolean(selectedElement) && selectedElementHasMotionTrack

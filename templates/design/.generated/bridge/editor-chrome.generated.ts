@@ -905,10 +905,26 @@ export const editorChromeBridgeScript: string = `"use strict";
 
   // app/components/design/bridge/editor-chrome.bridge.ts
   (function() {
+    var readOnly = __READ_ONLY__;
+    var textEditingEnabledFlag = __TEXT_EDITING_ENABLED__;
+    var designCanvasScreenId = __DESIGN_CANVAS_SCREEN_ID__ || "";
+    var designCanvasBoardSurface = !!__DESIGN_CANVAS_BOARD_SURFACE__;
+    var designCanvasContentOffsetX = Number(__DESIGN_CANVAS_CONTENT_OFFSET_X__) || 0;
+    var designCanvasContentOffsetY = Number(__DESIGN_CANVAS_CONTENT_OFFSET_Y__) || 0;
     var previousEditorChromeBridge = window.__anEditorChromeBridge;
     var previousEditorChromeHost = window.__anEditorChromeBridgeHost || (previousEditorChromeBridge && typeof previousEditorChromeBridge === "object" ? previousEditorChromeBridge.host : null);
     var previousEditorChromeBridgeInstance = window.__anEditorChromeBridgeInstance;
     if (previousEditorChromeBridgeInstance && typeof previousEditorChromeBridgeInstance.repair === "function") {
+      if (typeof previousEditorChromeBridgeInstance.updateConfig === "function") {
+        previousEditorChromeBridgeInstance.updateConfig({
+          readOnly,
+          textEditingEnabled: textEditingEnabledFlag,
+          screenId: designCanvasScreenId,
+          boardSurface: designCanvasBoardSurface,
+          contentOffsetX: designCanvasContentOffsetX,
+          contentOffsetY: designCanvasContentOffsetY
+        });
+      }
       previousEditorChromeBridgeInstance.repair();
       return;
     }
@@ -934,6 +950,7 @@ export const editorChromeBridgeScript: string = `"use strict";
     }
     function ensureEditorChromeHost() {
       if (editorChromeHost && editorChromeHost.isConnected && editorChromeHost.parentNode === document.documentElement) {
+        syncEditorChromeHostStyle(editorChromeHost);
         window.__anEditorChromeBridgeHost = editorChromeHost;
         return editorChromeHost;
       }
@@ -943,10 +960,17 @@ export const editorChromeBridgeScript: string = `"use strict";
         "true"
       );
       editorChromeHost.setAttribute("aria-hidden", "true");
-      editorChromeHost.style.cssText = "position:fixed;inset:0;z-index:2147483000;pointer-events:none;overflow:visible;";
+      syncEditorChromeHostStyle(editorChromeHost);
       (document.documentElement || document.body).appendChild(editorChromeHost);
       window.__anEditorChromeBridgeHost = editorChromeHost;
       return editorChromeHost;
+    }
+    function syncEditorChromeHostStyle(host) {
+      host.style.position = "fixed";
+      host.style.inset = "0px";
+      host.style.zIndex = readOnly ? "2147483000" : "2147483647";
+      host.style.pointerEvents = "none";
+      host.style.overflow = "visible";
     }
     function appendEditorChromeNode(node) {
       if (editorChromeNodes.indexOf(node) === -1) {
@@ -1000,14 +1024,8 @@ export const editorChromeBridgeScript: string = `"use strict";
     ensureEditorChromeHost();
     window.__anEditorChromeBridge = true;
     window.__anEditorChromeBridgeHost = editorChromeHost;
-    var readOnly = __READ_ONLY__;
     var gridGroupBatchingEnabled = false;
-    var textEditingEnabledFlag = __TEXT_EDITING_ENABLED__;
     var textEditingEnabled = !readOnly && textEditingEnabledFlag;
-    var designCanvasScreenId = __DESIGN_CANVAS_SCREEN_ID__ || "";
-    var designCanvasBoardSurface = !!__DESIGN_CANVAS_BOARD_SURFACE__;
-    var designCanvasContentOffsetX = Number(__DESIGN_CANVAS_CONTENT_OFFSET_X__) || 0;
-    var designCanvasContentOffsetY = Number(__DESIGN_CANVAS_CONTENT_OFFSET_Y__) || 0;
     var runtimeLayerSnapshotEnabled = !!__RUNTIME_LAYER_SNAPSHOT_ENABLED__;
     var liveReflowEnabled = (function() {
       try {
@@ -18235,6 +18253,45 @@ export const editorChromeBridgeScript: string = `"use strict";
       repair: function() {
         observeEditorChromeHost();
         repairEditorChromeHost();
+      },
+      updateConfig: function(next) {
+        if (!next || typeof next !== "object") return;
+        var nextReadOnly = typeof next.readOnly === "boolean" ? next.readOnly : readOnly;
+        var nextTextEditingEnabledFlag = typeof next.textEditingEnabled === "boolean" ? next.textEditingEnabled : textEditingEnabledFlag;
+        var wasTextEditingEnabled = textEditingEnabled;
+        if (readOnly !== nextReadOnly) {
+          readOnly = nextReadOnly;
+          textEditingEnabled = !readOnly && nextTextEditingEnabledFlag;
+          if (readOnly) {
+            if (activeTextEditEl) activeTextEditEl.blur();
+            clearPendingShieldDrag();
+            cancelActiveBridgeDrag();
+            setSelectionOverlayResizeChromeVisible(false);
+            shieldOverlay.style.pointerEvents = "auto";
+          } else {
+            setSelectionOverlayResizeChromeVisible(true);
+            shieldOverlay.style.pointerEvents = "auto";
+          }
+        } else {
+          textEditingEnabled = !readOnly && nextTextEditingEnabledFlag;
+        }
+        textEditingEnabledFlag = nextTextEditingEnabledFlag;
+        if (!textEditingEnabled && wasTextEditingEnabled && activeTextEditEl) {
+          activeTextEditEl.blur();
+        }
+        if (typeof next.screenId === "string") {
+          designCanvasScreenId = next.screenId;
+        }
+        if (typeof next.boardSurface === "boolean") {
+          designCanvasBoardSurface = next.boardSurface;
+        }
+        if (Number.isFinite(next.contentOffsetX)) {
+          designCanvasContentOffsetX = next.contentOffsetX;
+        }
+        if (Number.isFinite(next.contentOffsetY)) {
+          designCanvasContentOffsetY = next.contentOffsetY;
+        }
+        if (editorChromeHost) syncEditorChromeHostStyle(editorChromeHost);
       }
     };
     observeEditorChromeHost();
