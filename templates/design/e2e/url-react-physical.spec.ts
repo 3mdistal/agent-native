@@ -11,6 +11,8 @@ import {
 } from "@agent-native/core/testing";
 import { expect, test } from "@playwright/test";
 
+import { expandAllLayers, installBridge } from "./helpers";
+
 async function freePort(): Promise<number> {
   return await new Promise((resolve, reject) => {
     const server = http.createServer();
@@ -32,6 +34,12 @@ test("React URL-backed drag/drop emits semantic handoff and survives coding-agen
   request,
 }, workerInfo) => {
   const baseURL = workerInfo.project.use.baseURL as string;
+  const componentDetailsRequests: string[] = [];
+  page.on("request", (request) => {
+    if (request.url().includes("/actions/get-component-details")) {
+      componentDetailsRequests.push(request.url());
+    }
+  });
   fs.mkdirSync(path.join(process.cwd(), ".tmp"), { recursive: true });
   const rootPath = fs.mkdtempSync(
     path.join(process.cwd(), ".tmp", "url-react-"),
@@ -39,15 +47,15 @@ test("React URL-backed drag/drop emits semantic handoff and survives coding-agen
   fs.mkdirSync(path.join(rootPath, "src"));
   fs.writeFileSync(
     path.join(rootPath, "index.html"),
-    '<div id="root"></div><script type="module" src="/src/main.tsx"></script>',
+    '<!doctype html><html><head><title>React URL physical proof</title></head><body><main id="root"></main><script type="module" src="/src/main.tsx"></script></body></html>',
   );
   fs.writeFileSync(
     path.join(rootPath, "src/main.tsx"),
-    'import { createRoot } from "react-dom/client"; import { App } from "./App"; createRoot(document.getElementById("root")!).render(<App />);',
+    'import { hydrateRoot } from "react-dom/client"; import { BrowserRouter } from "react-router"; import { App } from "./App"; hydrateRoot(document, <BrowserRouter><App /></BrowserRouter>);',
   );
   fs.writeFileSync(
     path.join(rootPath, "src/App.tsx"),
-    `import { useState } from "react";\nconst initialCards = [{ id: "v1", label: "V1" }, { id: "v2", label: "V2" }, { id: "v3", label: "V3" }];\nexport function App() { const [cards] = useState(initialCards); return <main style={{ padding: 24, width: 720 }}><div id="flow" data-source-id="flow-root" data-agent-native-node-id="flow-root" style={{ display: "flex", flexDirection: "column", gap: 16, border: "2px solid #334155", padding: 16, width: 640 }}>{cards.map((card) => <div key={card.id} id={card.id} data-source-id={card.id} data-agent-native-node-id={card.id} style={{ height: 64, border: "2px solid #0f766e", padding: 12 }}>{card.label}</div>)}</div></main>; }`,
+    `import { useState } from "react"; import { useLocation, useNavigate } from "react-router";\nconst initialCards = [{ id: "v1", label: "V1" }, { id: "v2", label: "V2" }, { id: "v3", label: "V3" }];\nexport function App() { const [cards] = useState(initialCards); const location = useLocation(); const navigate = useNavigate(); return <html><head><title>React URL physical proof</title></head><body><main id="root" style={{ padding: 24, width: 720 }}><button type="button" onClick={() => navigate("/next")}>Go to next route</button><p data-route-label>{location.pathname === "/next" ? "Next route" : "Home route"}</p><div id="flow" data-source-id="flow-root" data-agent-native-node-id="flow-root" style={{ display: "flex", flexDirection: "column", gap: 16, border: "2px solid #334155", padding: 16, width: 640 }}>{cards.map((card) => <div key={card.id} id={card.id} data-source-id={card.id} data-agent-native-node-id={card.id} style={{ height: 64, border: "2px solid #0f766e", padding: 12 }}>{card.label}</div>)}</div></main></body></html>; }`,
   );
   const targetPort = await freePort();
   const targetUrl = `http://127.0.0.1:${targetPort}`; // e2e-harness-ignore: allocated live Vite port
@@ -168,8 +176,76 @@ test("React URL-backed drag/drop emits semantic handoff and survives coding-agen
       .first()
       .contentFrame();
     await frame.locator('[data-agent-native-node-id="flow-root"]').waitFor();
-    const order = () =>
-      frame
+    await expect(
+      frame.locator('[data-agent-native-edit-overlay="shield"]'),
+    ).toBeAttached();
+    await expect(
+      frame.locator("script[data-agent-native-editor-chrome-bridge]"),
+    ).toHaveAttribute("type", "module");
+    await expandAllLayers(page);
+    await installBridge(page);
+    await page.evaluate(() => ((window as any).__bridge = []));
+    const waitForAnySelection = async () => {
+      const handle = await page.waitForFunction(
+        () =>
+          [...((window as any).__bridge ?? [])]
+            .reverse()
+            .find((message: any) => message.type === "element-select") ?? null,
+        undefined,
+        { timeout: 15_000 },
+      );
+      return await handle.jsonValue();
+    };
+    const waitForSelection = async (nodeId: string) => {
+      const handle = await page.waitForFunction(
+        (id) =>
+          [...((window as any).__bridge ?? [])]
+            .reverse()
+            .find(
+              (message: any) =>
+                message.type === "element-select" &&
+                message.payload?.selector?.includes(
+                  `[data-agent-native-node-id="${id}"]`,
+                ),
+            ) ?? null,
+        nodeId,
+        { timeout: 15_000 },
+      );
+      return await handle.jsonValue();
+    };
+    const clickTarget = frame.locator('[data-agent-native-node-id="v1"]');
+    const clickBox = await clickTarget.boundingBox();
+    if (!clickBox) throw new Error("missing React selection geometry");
+    await page.mouse.click(
+      clickBox.x + clickBox.width / 2,
+      clickBox.y + clickBox.height / 2,
+    );
+    const firstSelection = await waitForAnySelection();
+    expect(firstSelection.payload.selector).toBeTruthy();
+    expect(firstSelection.payload.sourceId).toBeTruthy();
+    await page.evaluate(() => ((window as any).__bridge = []));
+    await page.keyboard.down(
+      process.platform === "darwin" ? "Meta" : "Control",
+    );
+    try {
+      await page.mouse.click(
+        clickBox.x + clickBox.width / 2,
+        clickBox.y + clickBox.height / 2,
+      );
+    } finally {
+      await page.keyboard.up(
+        process.platform === "darwin" ? "Meta" : "Control",
+      );
+    }
+    const selected = await waitForSelection("v1");
+    expect(selected.payload.sourceId).toBe("v1");
+    await expect(
+      page.locator('[role="treeitem"][aria-selected="true"]').filter({
+        hasText: "V1",
+      }),
+    ).toBeVisible();
+    const order = (previewFrame = frame) =>
+      previewFrame
         .locator(
           '[data-agent-native-node-id="flow-root"] > [data-agent-native-node-id]',
         )
@@ -249,6 +325,7 @@ test("React URL-backed drag/drop emits semantic handoff and survives coding-agen
     await expect(page.locator("[data-design-editor]")).toBeVisible({
       timeout: 30_000,
     });
+    await installBridge(page);
     const reloaded = page
       .locator("iframe[data-design-preview-iframe]")
       .first()
@@ -256,7 +333,68 @@ test("React URL-backed drag/drop emits semantic handoff and survives coding-agen
     await expect(reloaded.getByText("V1 updated", { exact: true })).toBeVisible(
       { timeout: 15_000 },
     );
-    expect(await order()).toEqual(["v2", "v3", "v1"]);
+    await expect
+      .poll(() => order(reloaded), { timeout: 15_000 })
+      .toEqual(["v2", "v3", "v1"]);
+
+    // React Router/framework hydration can replace the whole document body
+    // after the iframe first boots. The editor host lives outside that tree;
+    // prove a real physical click still selects after a document-level route
+    // render rather than trusting the initial bridge handshake.
+    const reloadedFrame = await page
+      .locator("iframe[data-design-preview-iframe]")
+      .first()
+      .elementHandle()
+      .then((iframe) => iframe?.contentFrame());
+    if (!reloadedFrame) throw new Error("missing reloaded React frame");
+    await reloadedFrame.evaluate(() => {
+      window.history.pushState({}, "", "/next");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await expect(reloaded.locator("[data-route-label]")).toHaveText(
+      "Next route",
+    );
+    await reloaded.locator("body").evaluate(() => {
+      document
+        .querySelector("[data-agent-native-editor-chrome-host]")
+        ?.remove();
+      const bridgeScript = document.querySelector(
+        "script[data-agent-native-editor-chrome-bridge]",
+      );
+      if (!bridgeScript) throw new Error("missing editor bridge script");
+      document.head.appendChild(bridgeScript.cloneNode(true));
+    });
+    await expect(
+      reloaded.locator('[data-agent-native-edit-overlay="shield"]'),
+    ).toBeAttached();
+    await page.evaluate(() => ((window as any).__bridge = []));
+    const healedTarget = reloaded.locator('[data-agent-native-node-id="v1"]');
+    const healedBox = await healedTarget.boundingBox();
+    if (!healedBox)
+      throw new Error("missing post-hydration selection geometry");
+    const healedModifier = process.platform === "darwin" ? "Meta" : "Control";
+    await page.keyboard.down(healedModifier);
+    try {
+      await page.mouse.click(
+        healedBox.x + healedBox.width / 2,
+        healedBox.y + healedBox.height / 2,
+      );
+    } finally {
+      await page.keyboard.up(healedModifier);
+    }
+    const healedSelection = await waitForSelection("v1");
+    expect(healedSelection.payload.sourceId).toBe("v1");
+    expect(
+      await page.evaluate(
+        () =>
+          ((window as any).__bridge ?? []).filter(
+            (message: any) =>
+              message.type === "element-select" &&
+              message.intent?.source === "pointer",
+          ).length,
+      ),
+    ).toBe(1);
+    expect(componentDetailsRequests).toEqual([]);
   } finally {
     await bridge?.server.close();
     vite?.kill();
