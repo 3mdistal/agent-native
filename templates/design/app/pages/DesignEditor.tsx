@@ -250,7 +250,10 @@ import {
   recordDesignPerformance,
   trace,
 } from "@/components/design/design-trace";
-import { DesignCanvas } from "@/components/design/DesignCanvas";
+import {
+  DesignCanvas,
+  type EditorDragStateChange,
+} from "@/components/design/DesignCanvas";
 import { DesignEditorSkeleton } from "@/components/design/DesignEditorSkeleton";
 import {
   AssetLibraryPanel,
@@ -577,6 +580,7 @@ import {
   codeLayerNodeLooksLikeComponent,
   codeLayerSelectorAliases,
   codeLayerSelectorMatches,
+  previewCodeLayerTreeMove,
   codeLayerTreeToPanelNodes,
   collectCodeLayerAncestors,
   collectEffectiveCodeLayerState,
@@ -799,6 +803,7 @@ import {
   OVERVIEW_ZOOM_THRESHOLD,
   STORED_RUN_LIVENESS_GRACE_MS,
 } from "./design-editor/editor-constants";
+import { shouldAcceptEditorDragStateEvent } from "./design-editor/editor-drag-state";
 import {
   buildSignInHrefForComment,
   buildSignInHrefForDesignIntent,
@@ -7309,6 +7314,19 @@ function DesignEditor() {
   const canvasBackgroundRef = useRef<string | null>(null);
   const { resolvedTheme } = useTheme();
   const activeEditorDragRef = useRef(false);
+  const activeEditorDragScreenIdRef = useRef<string | null>(null);
+  const activeEditorDragIdRef = useRef<string | null>(null);
+  const retiredEditorDragIdsRef = useRef(new Set<string>());
+  const retiredEditorDragScreenIdsRef = useRef(new Set<string>());
+  const latestEditorDragEventAtRef = useRef(new Map<string, number>());
+  type LayerStructurePreview = {
+    sourceId: string;
+    anchorId: string;
+    placement: "before" | "after" | "inside";
+    insert: boolean;
+  };
+  const [layerStructurePreviewByFileId, setLayerStructurePreviewByFileId] =
+    useState<Record<string, LayerStructurePreview>>({});
 
   // Live handle to the active DesignCanvas preview iframe. DesignCanvas owns the
   // <iframe> internally (tagged data-design-preview-iframe) and does not forward
@@ -7336,9 +7354,124 @@ function DesignEditor() {
     [activeFile?.id],
   );
 
-  const handleEditorDragStateChange = useCallback((active: boolean) => {
-    activeEditorDragRef.current = active;
-  }, []);
+  const handleEditorDragStateChange = useCallback(
+    (state: EditorDragStateChange) => {
+      const dragId = state.dragId;
+      const activeDragId = activeEditorDragIdRef.current;
+      const previousScreenId = activeEditorDragScreenIdRef.current;
+      if (
+        !shouldAcceptEditorDragStateEvent(state, {
+          dragId: activeDragId,
+          retiredDragIds: retiredEditorDragIdsRef.current,
+          retiredScreenIds: retiredEditorDragScreenIdsRef.current,
+          latestEventAt: dragId
+            ? latestEditorDragEventAtRef.current.get(dragId)
+            : undefined,
+        })
+      )
+        return;
+      if (dragId && typeof state.eventAt === "number") {
+        latestEditorDragEventAtRef.current.set(dragId, state.eventAt);
+        if (latestEditorDragEventAtRef.current.size > 32) {
+          const oldest = latestEditorDragEventAtRef.current.keys().next().value;
+          if (oldest) latestEditorDragEventAtRef.current.delete(oldest);
+        }
+      }
+      const screenId = state.screenId;
+      const retiredScreenClear =
+        state.active &&
+        dragId === activeDragId &&
+        screenId &&
+        retiredEditorDragScreenIdsRef.current.has(screenId) &&
+        state.preview?.phase === "clear";
+      if (state.active && dragId && activeDragId && dragId !== activeDragId) {
+        retiredEditorDragIdsRef.current.add(activeDragId);
+        retiredEditorDragScreenIdsRef.current.clear();
+        if (retiredEditorDragIdsRef.current.size > 32) {
+          const oldest = retiredEditorDragIdsRef.current.values().next().value;
+          if (oldest) retiredEditorDragIdsRef.current.delete(oldest);
+        }
+      }
+      if (
+        state.active &&
+        dragId &&
+        dragId === activeDragId &&
+        previousScreenId &&
+        screenId &&
+        previousScreenId !== screenId
+      ) {
+        retiredEditorDragScreenIdsRef.current.add(previousScreenId);
+      }
+      if (state.active && dragId) activeEditorDragIdRef.current = dragId;
+      if (!state.active) activeEditorDragIdRef.current = null;
+      if (!state.active) retiredEditorDragScreenIdsRef.current.clear();
+      if (retiredScreenClear && screenId) {
+        setLayerStructurePreviewByFileId((current) => {
+          if (!current[screenId]) return current;
+          const next = { ...current };
+          delete next[screenId];
+          return next;
+        });
+        return;
+      }
+      activeEditorDragRef.current = state.active;
+      activeEditorDragScreenIdRef.current = state.active
+        ? (screenId ?? null)
+        : null;
+      const screenChanged =
+        previousScreenId && previousScreenId !== (screenId ?? null);
+      if (!screenId) {
+        if (!previousScreenId) return;
+        setLayerStructurePreviewByFileId((current) => {
+          if (!current[previousScreenId]) return current;
+          const next = { ...current };
+          delete next[previousScreenId];
+          return next;
+        });
+        return;
+      }
+      setLayerStructurePreviewByFileId((current) => {
+        const preview = state.preview;
+        const next = screenChanged ? { ...current } : current;
+        if (screenChanged) delete next[previousScreenId];
+        if (
+          !state.active ||
+          preview?.phase === "clear" ||
+          !preview?.sourceId ||
+          !preview.anchorId ||
+          !preview.placement
+        ) {
+          if (!next[screenId]) return next;
+          const cleared = { ...next };
+          delete cleared[screenId];
+          return cleared;
+        }
+        return {
+          ...next,
+          [screenId]: {
+            sourceId: preview.sourceId,
+            anchorId: preview.anchorId,
+            placement: preview.placement,
+            insert: preview.insert !== false,
+          },
+        };
+      });
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const dragScreenId = activeEditorDragScreenIdRef.current;
+    if (!dragScreenId || dragScreenId === activeFile?.id) return;
+    activeEditorDragScreenIdRef.current = null;
+    activeEditorDragRef.current = false;
+    setLayerStructurePreviewByFileId((current) => {
+      if (!current[dragScreenId]) return current;
+      const next = { ...current };
+      delete next[dragScreenId];
+      return next;
+    });
+  }, [activeFile?.id]);
 
   const cancelActiveEditorDrag = useCallback(() => {
     if (!activeEditorDragRef.current) return false;
@@ -19238,6 +19371,7 @@ function DesignEditor() {
     sourceContent: string;
     sourceNodeIdAttrs: ReadonlySet<string>;
     runtimeOnly: boolean;
+    structurePreviewKey: string;
     tree: CodeLayerTreeNode[];
     nodeById: Map<string, CodeLayerNode>;
   };
@@ -19251,6 +19385,10 @@ function DesignEditor() {
     const models = files.map((file): CodeLayerFileModel => {
       const sourceContent = getScreenContent(file.id);
       const cached = cache.get(file.id);
+      const structurePreview = layerStructurePreviewByFileId[file.id];
+      const structurePreviewKey = structurePreview
+        ? `${structurePreview.sourceId}:${structurePreview.anchorId}:${structurePreview.placement}:${structurePreview.insert}`
+        : "";
       const sourceNodeIdAttrs =
         cached?.sourceContent === sourceContent
           ? cached.sourceNodeIdAttrs
@@ -19285,15 +19423,37 @@ function DesignEditor() {
         cached.projection === projection &&
         cached.sourceProjection === sourceProjection &&
         cached.sourceContent === sourceContent &&
-        cached.runtimeOnly === useRuntimeProjection
+        cached.runtimeOnly === useRuntimeProjection &&
+        cached.structurePreviewKey === structurePreviewKey
       ) {
         return cached;
       }
-      const tree = useRuntimeProjection
+      const baseTree = useRuntimeProjection
         ? buildCodeLayerTree(projection)
         : file.id === activeFile?.id
           ? activeCodeLayerTree
           : buildCodeLayerTree(projection);
+      const tree = structurePreview
+        ? (() => {
+            const sourceNode = resolveCodeLayerNodeFromBridge(
+              projection,
+              undefined,
+              structurePreview.sourceId,
+            );
+            const anchorNode = resolveCodeLayerNodeFromBridge(
+              projection,
+              undefined,
+              structurePreview.anchorId,
+            );
+            return sourceNode && anchorNode
+              ? (previewCodeLayerTreeMove(baseTree, {
+                  ...structurePreview,
+                  sourceId: sourceNode.id,
+                  anchorId: anchorNode.id,
+                }) ?? baseTree)
+              : baseTree;
+          })()
+        : baseTree;
       const model: CodeLayerFileModel = {
         fileId: file.id,
         projection,
@@ -19301,6 +19461,7 @@ function DesignEditor() {
         sourceContent,
         sourceNodeIdAttrs,
         runtimeOnly: useRuntimeProjection,
+        structurePreviewKey,
         tree,
         nodeById: new Map(projection.nodes.map((node) => [node.id, node])),
       };
@@ -19341,6 +19502,7 @@ function DesignEditor() {
     getScreenContent,
     overviewScreenById,
     runtimeLayerSnapshotsById,
+    layerStructurePreviewByFileId,
   ]);
   const codeLayerModelByFileId = useMemo(
     () => new Map(codeLayerModelsByFile.map((model) => [model.fileId, model])),

@@ -4657,6 +4657,8 @@ export const editorChromeBridgeScript: string = `"use strict";
     var spacingOverlayRenderKey = "";
     var activeDragCancel = null;
     var activeDragStartedAt = null;
+    var editorDragIdCounter = 0;
+    var activeEditorDragId = "";
     var bridgeSpaceKeyPressed = false;
     var bridgeIgnoreAutoLayoutKeyPressed = false;
     var bridgeSpaceKeyConsumedByDrag = false;
@@ -4683,13 +4685,43 @@ export const editorChromeBridgeScript: string = `"use strict";
       hideSpacingOverlay();
       hideMeasurements();
     }
-    function postEditorDragState(active) {
+    function postEditorDragState(active, preview) {
       window.parent.postMessage(
-        { type: "agent-native:editor-drag-state", active },
+        {
+          type: "agent-native:editor-drag-state",
+          active,
+          screenId: designCanvasScreenId,
+          dragId: activeEditorDragId || void 0,
+          eventAt: typeof performance !== "undefined" && typeof performance.timeOrigin === "number" && typeof performance.now === "function" ? performance.timeOrigin + performance.now() : Date.now(),
+          preview
+        },
         "*"
       );
     }
+    function postLayerStructurePreview(el, target) {
+      if (!target) {
+        postEditorDragState(true, { phase: "clear" });
+        return;
+      }
+      var anchor = target && (target.persistenceAnchor || target.anchor);
+      var placement = target && (target.persistencePlacement || target.placement);
+      var sourceId = getSourceId(el);
+      var anchorId = getSourceId(anchor);
+      if (!sourceId || !anchorId || placement !== "before" && placement !== "after" && placement !== "inside") {
+        postEditorDragState(true, { phase: "clear" });
+        return;
+      }
+      postEditorDragState(true, {
+        phase: "preview",
+        sourceId,
+        anchorId,
+        placement,
+        insert: true
+      });
+    }
     function setActiveDragCancel(cancel, startedAt) {
+      editorDragIdCounter += 1;
+      activeEditorDragId = Date.now().toString(36) + "-" + editorDragIdCounter + "-" + Math.random().toString(36).slice(2);
       activeDragCancel = cancel;
       activeDragStartedAt = typeof startedAt === "number" ? startedAt : Date.now();
       postEditorDragState(true);
@@ -4700,12 +4732,14 @@ export const editorChromeBridgeScript: string = `"use strict";
       activeDragCancel = null;
       activeDragStartedAt = null;
       postEditorDragState(false);
+      activeEditorDragId = "";
     }
     function cancelActiveBridgeDrag() {
       var cancel = activeDragCancel;
       if (!cancel) return false;
       activeDragCancel = null;
       postEditorDragState(false);
+      activeEditorDragId = "";
       return cancel();
     }
     var MOVE_CANCEL_RACE_GRACE_MS = 200;
@@ -13601,6 +13635,7 @@ export const editorChromeBridgeScript: string = `"use strict";
             hideInsertionGuide();
             clearReorderLift2();
             clearReorderReflow2();
+            postEditorDragState(true, { phase: "clear" });
             showTransformBadge(
               duplicatedForDrag ? "Duplicate layer" : "Move layer",
               cx,
@@ -13627,6 +13662,7 @@ export const editorChromeBridgeScript: string = `"use strict";
             if (_dndKey !== reorderLastTargetKey) {
               reorderLastTargetKey = _dndKey;
               dndLog("target", dndTarget(currentTarget));
+              postLayerStructurePreview(reorderEl, currentTarget);
             }
             applyReorderLift2(dx, dy);
             applyReorderReflow2(currentTarget, cx, cy);
@@ -13883,6 +13919,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           reorderIgnoresAutoLayout,
           isPlatformPrimaryChord(e)
         );
+        postLayerStructurePreview(reorderEl, currentTarget);
         showInsertionGuideFor(currentTarget);
         dndLog("start:reorder", {
           el: getSelector(reorderEl),

@@ -5791,6 +5791,8 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   // so a delayed cancel meant for an earlier gesture can be told apart from
   // one meant for whatever is active now — see cancelActiveBridgeDragOrPendingCommit.
   var activeDragStartedAt: number | null = null;
+  var editorDragIdCounter = 0;
+  var activeEditorDragId = "";
   var bridgeSpaceKeyPressed = false;
   var bridgeIgnoreAutoLayoutKeyPressed = false;
   var bridgeSpaceKeyConsumedByDrag = false;
@@ -5835,11 +5837,60 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     hideMeasurements();
   }
 
-  function postEditorDragState(active: boolean): void {
+  function postEditorDragState(
+    active: boolean,
+    preview?: {
+      phase: "preview" | "clear";
+      sourceId?: string;
+      anchorId?: string;
+      placement?: "before" | "after" | "inside";
+      insert?: boolean;
+    },
+  ): void {
     (window.parent as Window).postMessage(
-      { type: "agent-native:editor-drag-state", active },
+      {
+        type: "agent-native:editor-drag-state",
+        active,
+        screenId: designCanvasScreenId,
+        dragId: activeEditorDragId || undefined,
+        eventAt:
+          typeof performance !== "undefined" &&
+          typeof performance.timeOrigin === "number" &&
+          typeof performance.now === "function"
+            ? performance.timeOrigin + performance.now()
+            : Date.now(),
+        preview,
+      },
       "*",
     );
+  }
+
+  function postLayerStructurePreview(el, target): void {
+    if (!target) {
+      postEditorDragState(true, { phase: "clear" });
+      return;
+    }
+    var anchor = target && (target.persistenceAnchor || target.anchor);
+    var placement = target && (target.persistencePlacement || target.placement);
+    var sourceId = getSourceId(el);
+    var anchorId = getSourceId(anchor);
+    if (
+      !sourceId ||
+      !anchorId ||
+      (placement !== "before" &&
+        placement !== "after" &&
+        placement !== "inside")
+    ) {
+      postEditorDragState(true, { phase: "clear" });
+      return;
+    }
+    postEditorDragState(true, {
+      phase: "preview",
+      sourceId,
+      anchorId,
+      placement,
+      insert: true,
+    });
   }
 
   // `startedAt` should be performance.timeOrigin + <the originating pointer
@@ -5852,6 +5903,13 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     cancel: () => boolean,
     startedAt?: number,
   ): void {
+    editorDragIdCounter += 1;
+    activeEditorDragId =
+      Date.now().toString(36) +
+      "-" +
+      editorDragIdCounter +
+      "-" +
+      Math.random().toString(36).slice(2);
     activeDragCancel = cancel;
     activeDragStartedAt =
       typeof startedAt === "number" ? startedAt : Date.now();
@@ -5864,6 +5922,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     activeDragCancel = null;
     activeDragStartedAt = null;
     postEditorDragState(false);
+    activeEditorDragId = "";
   }
 
   function cancelActiveBridgeDrag(): boolean {
@@ -5871,6 +5930,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     if (!cancel) return false;
     activeDragCancel = null;
     postEditorDragState(false);
+    activeEditorDragId = "";
     return cancel();
   }
 
@@ -18562,6 +18622,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         reorderIgnoresAutoLayout,
         isPlatformPrimaryChord(e),
       );
+      postLayerStructurePreview(reorderEl, currentTarget);
       showInsertionGuideFor(currentTarget);
       dndLog("start:reorder", {
         el: getSelector(reorderEl),
@@ -19419,6 +19480,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
           hideInsertionGuide();
           clearReorderLift();
           clearReorderReflow();
+          postEditorDragState(true, { phase: "clear" });
           showTransformBadge(
             duplicatedForDrag ? "Duplicate layer" : "Move layer",
             cx,
@@ -19465,6 +19527,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
           if (_dndKey !== reorderLastTargetKey) {
             reorderLastTargetKey = _dndKey;
             dndLog("target", dndTarget(currentTarget));
+            postLayerStructurePreview(reorderEl, currentTarget);
           }
           applyReorderLift(dx, dy);
           applyReorderReflow(currentTarget, cx, cy);
