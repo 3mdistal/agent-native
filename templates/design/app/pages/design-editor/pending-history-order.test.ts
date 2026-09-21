@@ -172,35 +172,25 @@ describe("pending live history order", () => {
     const redoArgs = {
       ...undoArgs,
       setPendingTextRevertRequest: vi.fn(),
+      setPendingVisualStyleBaselineResetRequest: vi.fn(),
       setPendingVisualStyleRevertRequest: vi.fn(),
+      replayPendingVisualStyleRuntime: vi.fn(),
     } as any;
     runRedo(redoArgs);
-    expect(redoArgs.setPendingVisualStyleRevertRequest).toHaveBeenNthCalledWith(
+    expect(redoArgs.replayPendingVisualStyleRuntime).toHaveBeenNthCalledWith(
       1,
-      expect.objectContaining({
-        patches: [
-          expect.objectContaining({ styles: { borderRadius: "24px" } }),
-        ],
-      }),
+      [expect.objectContaining({ styles: { borderRadius: "24px" } })],
     );
 
     runRedo(redoArgs);
-    expect(redoArgs.setPendingVisualStyleRevertRequest).toHaveBeenNthCalledWith(
+    expect(redoArgs.replayPendingVisualStyleRuntime).toHaveBeenNthCalledWith(
       2,
-      expect.objectContaining({
-        patches: [
-          expect.objectContaining({ styles: { borderRadius: "48px" } }),
-        ],
-      }),
+      [expect.objectContaining({ styles: { borderRadius: "48px" } })],
     );
     runRedo(redoArgs);
-    expect(redoArgs.setPendingVisualStyleRevertRequest).toHaveBeenNthCalledWith(
+    expect(redoArgs.replayPendingVisualStyleRuntime).toHaveBeenNthCalledWith(
       3,
-      expect.objectContaining({
-        patches: [
-          expect.objectContaining({ styles: { backgroundColor: "blue" } }),
-        ],
-      }),
+      [expect.objectContaining({ styles: { backgroundColor: "blue" } })],
     );
     runRedo(redoArgs);
     expect(redoArgs.setPendingTextRevertRequest).toHaveBeenCalledTimes(1);
@@ -211,5 +201,25 @@ describe("pending live history order", () => {
       "pending-live",
     ]);
     expect(redoOrderRef.current).toEqual([]);
+
+    const fallbackBaselineReset = vi.fn();
+    redoArgs.replayPendingVisualStyleRuntime = undefined;
+    redoArgs.setPendingVisualStyleBaselineResetRequest = fallbackBaselineReset;
+    redoArgs.pendingVisualStyleRedoStackRef.current = [
+      { edit: radius24Edit, revertStyles: { borderRadius: "0px" } },
+    ];
+    redoArgs.redoOrderRef.current = ["pending-style"];
+    runRedo(redoArgs);
+    expect(fallbackBaselineReset).toHaveBeenCalledWith(expect.any(Number));
+
+    const emptyFallbackRevert = vi.fn();
+    redoArgs.setPendingVisualStyleRevertRequest = emptyFallbackRevert;
+    redoArgs.pendingVisualStyleRedoStackRef.current = [
+      { edit: { ...radius24Edit, styles: {} }, revertStyles: {} },
+    ];
+    redoArgs.redoOrderRef.current = ["pending-style"];
+    runRedo(redoArgs);
+    expect(emptyFallbackRevert).not.toHaveBeenCalled();
+    expect(fallbackBaselineReset).toHaveBeenCalledTimes(1);
   });
 });
