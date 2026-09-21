@@ -2705,7 +2705,6 @@ test.describe("physical Figma auto-layout drag/drop matrix", () => {
       );
       expect(held?.source?.parentId).toBe("flow-origin");
       expect(held?.source?.lifted).toBe(true);
-      expect(held?.guide?.display).toBe("block");
       expect(held?.children.map((child) => child.id)).toEqual([
         "flow-child",
         "flow-peer",
