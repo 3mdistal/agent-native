@@ -11649,14 +11649,32 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     }
   }
 
-  function removeRuntimeTarget(selector, selectorCandidates, requestId?) {
+  function removeRuntimeTarget(
+    selector,
+    selectorCandidates,
+    requestId?,
+    transactionId?,
+  ) {
     var target = findRuntimeTarget(selector, selectorCandidates);
     if (
       !target ||
       target === document.body ||
       target === document.documentElement
-    )
+    ) {
+      if (typeof requestId === "string" && requestId) {
+        (window.parent as Window).postMessage(
+          {
+            type: "runtime-element-delete-rejected",
+            requestId: requestId,
+            transactionId: transactionId,
+            routePath: window.location.pathname + window.location.search,
+            reason: "target-unresolved",
+          },
+          "*",
+        );
+      }
       return false;
+    }
     // A requestId means the host queued this deletion as a pending live edit
     // and may undo it. Register it in the same pending-move table the drag
     // path uses so the existing visual-structure-ack channel can put the node
@@ -11676,6 +11694,20 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     }
     if (target.parentElement) target.parentElement.removeChild(target);
     publishSourceDocumentProvenance(undefined, true);
+    if (typeof requestId === "string" && requestId) {
+      (window.parent as Window).postMessage(
+        {
+          type: "runtime-element-deleted",
+          requestId: requestId,
+          transactionId: transactionId,
+          routePath: window.location.pathname + window.location.search,
+          selector: getSelector(target),
+          sourceId: getSourceId(target),
+          payload: getElementInfo(target),
+        },
+        "*",
+      );
+    }
     // T23: the removed subtree may contain the active text-edit element —
     // its blur/keydown listeners are gone with it, so exit the session
     // through the canonical cleanup instead of leaking it.
@@ -17175,6 +17207,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       type: "visual-structure-change",
       requestId: requestId,
       transactionId: transactionId,
+      routePath: window.location.pathname + window.location.search,
       selector: getSelector(el),
       sourceId: getSourceId(el),
       anchorSelector: getSelector(messageAnchor),
@@ -24860,7 +24893,29 @@ declare var __INITIAL_SOURCE_HEAD__: string;
             type: "runtime-structure-insert-rejected",
             screenId: designCanvasScreenId,
             requestId: insertRequestId,
+            transactionId:
+              typeof e.data.transactionId === "string"
+                ? e.data.transactionId
+                : undefined,
+            routePath: window.location.pathname + window.location.search,
             reason: reason,
+          },
+          "*",
+        );
+      };
+      var acknowledgeInsert = function (element: Element): void {
+        (window.parent as Window).postMessage(
+          {
+            type: "runtime-structure-insert-applied",
+            screenId: designCanvasScreenId,
+            requestId: String(insertRequestId),
+            transactionId:
+              typeof e.data.transactionId === "string"
+                ? e.data.transactionId
+                : undefined,
+            routePath: window.location.pathname + window.location.search,
+            selector: getSelector(element),
+            sourceId: getSourceId(element),
           },
           "*",
         );
@@ -24969,6 +25024,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
             insertTarget,
             reinsertOrigin,
           );
+          acknowledgeInsert(existingInsertEl);
         }
         return;
       }
@@ -25006,6 +25062,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         );
         replaceParent.removeChild(insertAnchor);
         refreshOverlays();
+        acknowledgeInsert(parsedInsertEl);
         return;
       }
       // The host bakes flow/absolute positioning into the markup before it
@@ -25029,7 +25086,14 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         insertTarget,
         { inserted: true },
         parsedInsertEl.outerHTML,
+        undefined,
+        undefined,
+        undefined,
+        typeof e.data.transactionId === "string"
+          ? e.data.transactionId
+          : undefined,
       );
+      acknowledgeInsert(parsedInsertEl);
       return;
     }
     if (e.data.type === "visual-structure-ack") {
@@ -25197,6 +25261,44 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         e.data.selector,
         e.data.selectorCandidates,
         e.data.requestId,
+        e.data.transactionId,
+      );
+      return;
+    }
+    if (e.data.type === "runtime-structure-rollback-insert") {
+      var rollbackRequestId = String(e.data.requestId || "");
+      var rollbackTarget = findUniqueRuntimeStructureTarget(
+        String(e.data.selector || ""),
+        typeof e.data.sourceId === "string" ? e.data.sourceId : "",
+      );
+      if (
+        !rollbackRequestId ||
+        !rollbackTarget ||
+        !rollbackTarget.parentElement
+      ) {
+        (window.parent as Window).postMessage(
+          {
+            type: "runtime-structure-rollback-result",
+            requestId: rollbackRequestId,
+            transactionId: e.data.transactionId,
+            applied: false,
+            reason: "target-unresolved",
+          },
+          "*",
+        );
+        return;
+      }
+      rollbackTarget.parentElement.removeChild(rollbackTarget);
+      publishSourceDocumentProvenance(undefined, true);
+      refreshOverlays();
+      (window.parent as Window).postMessage(
+        {
+          type: "runtime-structure-rollback-result",
+          requestId: rollbackRequestId,
+          transactionId: e.data.transactionId,
+          applied: true,
+        },
+        "*",
       );
       return;
     }
@@ -25217,6 +25319,58 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       claimContentAsSource(textTarget);
       publishSourceDocumentProvenance(undefined, true);
       refreshOverlays();
+      return;
+    }
+    if (e.data.type === "request-runtime-layer-snapshot") {
+      postRuntimeLayerSnapshot();
+      return;
+    }
+    if (e.data.type === "runtime-layer-rename") {
+      if (readOnly) return;
+      var renameName =
+        typeof e.data.name === "string" ? e.data.name.trim().slice(0, 200) : "";
+      if (!renameName) return;
+      var renameCandidates = Array.isArray(e.data.selectorCandidates)
+        ? e.data.selectorCandidates
+        : [];
+      if (
+        e.data.selector &&
+        renameCandidates.indexOf(String(e.data.selector)) === -1
+      ) {
+        renameCandidates.push(String(e.data.selector));
+      }
+      if (typeof e.data.sourceId === "string" && e.data.sourceId) {
+        renameCandidates.push(
+          '[data-agent-native-node-id="' +
+            String(e.data.sourceId).replace(/"/g, '\\"') +
+            '"]',
+        );
+      }
+      var renameTarget = findRuntimeTarget(
+        String(e.data.selector || ""),
+        renameCandidates,
+      );
+      if (!renameTarget) return;
+      var previousLayerName =
+        renameTarget.getAttribute("data-agent-native-layer-name") || "";
+      renameTarget.setAttribute("data-agent-native-layer-name", renameName);
+      claimContentAsSource(renameTarget);
+      publishSourceDocumentProvenance(undefined, true);
+      postRuntimeLayerSnapshot();
+      refreshOverlays();
+      (window.parent as Window).postMessage(
+        {
+          type: "runtime-layer-name-applied",
+          requestId: Number(e.data.requestId),
+          routePath: window.location.pathname + window.location.search,
+          selector: getSelector(renameTarget),
+          sourceId:
+            typeof e.data.sourceId === "string" ? e.data.sourceId : undefined,
+          name: renameName,
+          previousName: previousLayerName,
+        },
+        "*",
+      );
       return;
     }
     if (e.data.type !== "style-change") return;
@@ -25595,7 +25749,10 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   // reloading — is simply lost; replayIframeEditorState only replays
   // steady-state selection/hover/tweak/motion state, not one-shot commands.
   (window.parent as Window).postMessage(
-    { type: "agent-native:editor-chrome-ready" },
+    {
+      type: "agent-native:editor-chrome-ready",
+      routePath: window.location.pathname + window.location.search,
+    },
     "*",
   );
 })();

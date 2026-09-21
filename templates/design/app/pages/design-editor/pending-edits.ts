@@ -79,6 +79,7 @@ export function runtimeStructureNodeSignature(args: {
 
 export interface PendingVisualStyleEdit {
   screenId: string;
+  routePath?: string;
   filename: string;
   screenName: string;
   selector: string;
@@ -134,7 +135,7 @@ export interface PendingVisualStyleEdit {
 }
 
 function pendingLiveEditSubjectKey(edit: PendingLiveNonStyleEdit): string {
-  return `${edit.screenId}:${edit.sourceId?.trim() || edit.selector.trim()}`;
+  return `${edit.screenId}:${edit.routePath ?? ""}:${edit.sourceId?.trim() || edit.selector.trim()}`;
 }
 
 export function mergePendingLiveNonStyleEdits(
@@ -206,6 +207,29 @@ export function mergePendingLiveNonStyleEdits(
       };
       continue;
     }
+    if (edit.kind === "layer-name") {
+      const index = merged.findIndex(
+        (candidate) =>
+          candidate.kind === "layer-name" &&
+          pendingLiveEditSubjectKey(candidate) ===
+            pendingLiveEditSubjectKey(edit),
+      );
+      if (index === -1) {
+        merged.push(edit);
+        continue;
+      }
+      const previous = merged[index] as PendingLiveLayerNameEdit;
+      if (previous.originalName === edit.name) {
+        merged.splice(index, 1);
+        continue;
+      }
+      merged[index] = {
+        ...previous,
+        ...edit,
+        originalName: previous.originalName,
+      };
+      continue;
+    }
     const nextKey = pendingLiveEditSubjectKey(edit);
     const index = merged.findIndex(
       (candidate) =>
@@ -251,6 +275,7 @@ export function pendingLiveTextUndoRevertValue(
 export interface PendingLiveTextEdit {
   kind: "text";
   screenId: string;
+  routePath?: string;
   filename: string;
   screenName: string;
   selector: string;
@@ -268,6 +293,7 @@ export interface PendingLiveTextEdit {
 export interface PendingLiveLayerStateEdit {
   kind: "layer-state";
   screenId: string;
+  routePath?: string;
   filename: string;
   screenName: string;
   layerId: string;
@@ -279,6 +305,23 @@ export interface PendingLiveLayerStateEdit {
   state: "hidden" | "locked";
   enabled: boolean;
   originalEnabled: boolean;
+  updatedAt: number;
+}
+
+export interface PendingLiveLayerNameEdit {
+  kind: "layer-name";
+  screenId: string;
+  routePath?: string;
+  filename: string;
+  screenName: string;
+  layerId: string;
+  selector: string;
+  sourceId?: string | null;
+  sourceAnchor?: ReactSourceAnchor;
+  tagName?: string | null;
+  classes: string[];
+  name: string;
+  originalName: string;
   updatedAt: number;
 }
 
@@ -295,6 +338,18 @@ export function pendingLiveLayerStateUndoRevertValue(
   return currentForTarget?.enabled ?? nextEdit.originalEnabled;
 }
 
+export function pendingLiveLayerNameUndoRevertValue(
+  currentEdits: readonly PendingLiveNonStyleEdit[],
+  nextEdit: PendingLiveLayerNameEdit,
+): string {
+  const currentForTarget = currentEdits.find(
+    (edit): edit is PendingLiveLayerNameEdit =>
+      edit.kind === "layer-name" &&
+      pendingLiveEditSubjectKey(edit) === pendingLiveEditSubjectKey(nextEdit),
+  );
+  return currentForTarget?.name ?? nextEdit.originalName;
+}
+
 export function shouldRedoPendingLiveNonStyleBeforeStyle(
   styleEntry: { edit: { updatedAt: number } } | undefined,
   nonStyleEntry: { edit: { updatedAt: number } } | undefined,
@@ -308,6 +363,7 @@ export function shouldRedoPendingLiveNonStyleBeforeStyle(
 export interface PendingLiveStructureEdit {
   kind: "structure";
   screenId: string;
+  routePath?: string;
   filename: string;
   screenName: string;
   selector: string;
@@ -575,6 +631,7 @@ export function reactSourceAnchorUnavailableReason(
 export type PendingLiveNonStyleEdit =
   | PendingLiveTextEdit
   | PendingLiveLayerStateEdit
+  | PendingLiveLayerNameEdit
   | PendingLiveStructureEdit;
 export type PendingVisualStyleUndoTarget = {
   edit: PendingVisualStyleEdit;
@@ -635,9 +692,15 @@ export type PendingLiveLayerStateUndoEntry = {
   edit: PendingLiveLayerStateEdit;
   revertEnabled: boolean;
 };
+export type PendingLiveLayerNameUndoEntry = {
+  kind: "layer-name";
+  edit: PendingLiveLayerNameEdit;
+  revertName: string;
+};
 export type PendingLiveNonStyleUndoEntry =
   | PendingLiveTextUndoEntry
   | PendingLiveLayerStateUndoEntry
+  | PendingLiveLayerNameUndoEntry
   | PendingLiveStructureUndoEntry;
 
 /** Coalesce consecutive same-target ticks so slider/keystroke streams stay O(1)
@@ -749,6 +812,15 @@ export function appendPendingLiveNonStyleUndoEntry(
     last.edit = entry.edit;
     return;
   }
+  if (
+    last?.kind === "layer-name" &&
+    entry.kind === "layer-name" &&
+    pendingLiveEditSubjectKey(last.edit) ===
+      pendingLiveEditSubjectKey(entry.edit)
+  ) {
+    last.edit = entry.edit;
+    return;
+  }
   stack.push(entry);
 }
 
@@ -850,6 +922,7 @@ export function pendingLiveStructureEditsMatch(
 function pendingVisualStyleEditKey(edit: PendingVisualStyleEdit): string {
   return [
     edit.screenId,
+    edit.routePath ?? "",
     edit.sourceId?.trim() || edit.selector.trim() || "unknown",
     edit.interactionState ?? "default",
   ].join("::");
@@ -947,6 +1020,7 @@ export function buildPendingVisualStyleRevertPatches(
   return edits
     .map((edit) => ({
       screenId: edit.screenId,
+      routePath: edit.routePath,
       selector: edit.selector,
       sourceId: edit.sourceId,
       // Carried, not resolved: consumers replay into the live frame (prefer the
@@ -968,6 +1042,7 @@ export function buildPendingVisualStyleRevertPatches(
 
 export type PendingVisualStyleRuntimePatch = {
   screenId: string;
+  routePath?: string;
   selector: string;
   sourceId?: string | null;
   runtimeSelector?: string | null;
@@ -1115,15 +1190,20 @@ export function formatPendingVisualStylePrompt(args: {
     (codingAgent ? args.screenRoutes?.[screenId] : undefined) ?? filename;
   const title = args.designTitle?.trim();
   const editPayload = args.edits.map((edit) => ({
+    operation: "update-style" as const,
     screenId: edit.screenId,
+    ...(edit.routePath ? { routePath: edit.routePath } : {}),
     screen: nameScreen(edit.screenId, edit.filename),
     screenName: edit.screenName,
     selector: edit.selector,
     sourceId: edit.sourceId ?? null,
     sourceAnchor: redactReactSourceAnchor(edit.sourceAnchor),
+    provenance: redactReactSourceAnchor(edit.sourceAnchor),
     tagName: edit.tagName ?? null,
     classes: edit.classes,
     styles: edit.styles,
+    before: edit.originalStyles,
+    after: edit.styles,
     ...(edit.interactionState
       ? { interactionState: edit.interactionState }
       : {}),
@@ -1157,17 +1237,22 @@ export function formatPendingVisualStylePrompt(args: {
   const liveEditPayload = (args.liveEdits ?? []).map((edit) => {
     if (edit.kind === "text") {
       return {
+        operation: "update-text" as const,
         kind: edit.kind,
         screenId: edit.screenId,
+        ...(edit.routePath ? { routePath: edit.routePath } : {}),
         screen: nameScreen(edit.screenId, edit.filename),
         screenName: edit.screenName,
         selector: edit.selector,
         sourceId: edit.sourceId ?? null,
         sourceAnchor: redactReactSourceAnchor(edit.sourceAnchor),
+        provenance: redactReactSourceAnchor(edit.sourceAnchor),
         tagName: edit.tagName ?? null,
         classes: edit.classes,
         value: edit.value,
         html: edit.html,
+        before: edit.originalValue,
+        after: edit.value,
       };
     }
     if (edit.kind === "layer-state") {
@@ -1180,21 +1265,46 @@ export function formatPendingVisualStylePrompt(args: {
           })
         : null;
       return {
+        operation: "update-layer-state" as const,
         kind: edit.kind,
         screenId: edit.screenId,
+        ...(edit.routePath ? { routePath: edit.routePath } : {}),
         screen: nameScreen(edit.screenId, edit.filename),
         screenName: edit.screenName,
         selector: edit.selector,
         sourceId: edit.sourceId ?? null,
         sourceAnchor: redactReactSourceAnchor(edit.sourceAnchor),
+        provenance: redactReactSourceAnchor(edit.sourceAnchor),
         tagName: edit.tagName ?? null,
         classes: edit.classes,
         state: edit.state,
         enabled: edit.enabled,
+        before: edit.originalEnabled,
+        after: edit.enabled,
         attributeName: `data-agent-native-${edit.state}`,
         ...(semanticHandoff?.ok
           ? { semanticHandoff: semanticHandoff.handoff }
           : {}),
+      };
+    }
+    if (edit.kind === "layer-name") {
+      return {
+        operation: "metadata" as const,
+        kind: edit.kind,
+        screenId: edit.screenId,
+        ...(edit.routePath ? { routePath: edit.routePath } : {}),
+        screen: nameScreen(edit.screenId, edit.filename),
+        screenName: edit.screenName,
+        selector: edit.selector,
+        sourceId: edit.sourceId ?? null,
+        sourceAnchor: redactReactSourceAnchor(edit.sourceAnchor),
+        provenance: redactReactSourceAnchor(edit.sourceAnchor),
+        tagName: edit.tagName ?? null,
+        classes: edit.classes,
+        metadata: "data-agent-native-layer-name",
+        before: edit.originalName,
+        after: edit.name,
+        desiredChange: `Set the source layer metadata name to ${JSON.stringify(edit.name)} for the anchored element. Preserve the existing component structure and use the project's idiomatic naming convention.`,
       };
     }
     const subjectAnchor = edit.sourceAnchor
@@ -1330,8 +1440,18 @@ export function formatPendingVisualStylePrompt(args: {
                   },
                 };
     return {
+      operation: edit.removed
+        ? "remove"
+        : edit.replaced
+          ? "replace"
+          : edit.insertedHtml
+            ? "insert"
+            : edit.placement === "inside"
+              ? "reparent"
+              : "move",
       kind: edit.kind,
       screenId: edit.screenId,
+      ...(edit.routePath ? { routePath: edit.routePath } : {}),
       screen: nameScreen(edit.screenId, edit.filename),
       screenName: edit.screenName,
       ...(edit.transactionId ? { transactionId: edit.transactionId } : {}),
@@ -1339,6 +1459,7 @@ export function formatPendingVisualStylePrompt(args: {
         ? {
             groupedEdits: edit.groupedEdits.map((member) => ({
               selector: member.selector,
+              ...(member.routePath ? { routePath: member.routePath } : {}),
               sourceId: member.sourceId ?? null,
               sourceAnchor: redactReactSourceAnchor(member.sourceAnchor),
               anchorSelector: member.anchorSelector,
@@ -1360,6 +1481,10 @@ export function formatPendingVisualStylePrompt(args: {
       selector: edit.selector,
       sourceId: edit.sourceId ?? null,
       sourceAnchor: redactReactSourceAnchor(edit.sourceAnchor),
+      provenance: {
+        subject: redactReactSourceAnchor(edit.sourceAnchor),
+        target: redactReactSourceAnchor(edit.anchorSourceAnchor),
+      },
       ...(edit.subjectSignature
         ? { subjectSignature: edit.subjectSignature }
         : {}),
@@ -1430,7 +1555,7 @@ export function formatPendingVisualStylePrompt(args: {
       : "",
     "",
     codingAgent
-      ? "These were made against the running app in a visual canvas, so the selectors and node ids below are runtime-only — they do not appear in source. Locate the component that renders each element using its tag, class names and current text, then make the change in that source file. Preserve layout, behavior, and unrelated styling."
+      ? "These were made against the running app in a visual canvas. Treat each item as a source operation: use provenance/sourceAnchor to locate the owning source, compare before with the live after, and make the smallest idiomatic source edit. Runtime selectors and node ids are correlation hints only; never hand off inline-style mutations as the final implementation. Preserve layout, behavior, and unrelated styling."
       : "Use the Design source tools to make the source match the current live canvas preview. Read each target screen, resolve source ids/selectors through the code-layer projection, then apply the style, text, layer-state, and structure changes with focused source edits. Preserve layout, behavior, and unrelated styling.",
     hasOutsideConnectedRootPaths
       ? "Some source anchors include an absolute or served path outside the connected root. Keep that sourceFile path and the `outside-connected-root` status in the diagnosis; inspect it read-only or ask for the correct connection, and never silently omit the file."

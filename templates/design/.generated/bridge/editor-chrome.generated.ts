@@ -8635,10 +8635,23 @@ export const editorChromeBridgeScript: string = `"use strict";
         return null;
       }
     }
-    function removeRuntimeTarget(selector, selectorCandidates, requestId) {
+    function removeRuntimeTarget(selector, selectorCandidates, requestId, transactionId) {
       var target = findRuntimeTarget(selector, selectorCandidates);
-      if (!target || target === document.body || target === document.documentElement)
+      if (!target || target === document.body || target === document.documentElement) {
+        if (typeof requestId === "string" && requestId) {
+          window.parent.postMessage(
+            {
+              type: "runtime-element-delete-rejected",
+              requestId,
+              transactionId,
+              routePath: window.location.pathname + window.location.search,
+              reason: "target-unresolved"
+            },
+            "*"
+          );
+        }
         return false;
+      }
       if (typeof requestId === "string" && requestId && target.parentElement) {
         pendingStructureMoves[requestId] = {
           requestId,
@@ -8653,6 +8666,20 @@ export const editorChromeBridgeScript: string = `"use strict";
       }
       if (target.parentElement) target.parentElement.removeChild(target);
       publishSourceDocumentProvenance(void 0, true);
+      if (typeof requestId === "string" && requestId) {
+        window.parent.postMessage(
+          {
+            type: "runtime-element-deleted",
+            requestId,
+            transactionId,
+            routePath: window.location.pathname + window.location.search,
+            selector: getSelector(target),
+            sourceId: getSourceId(target),
+            payload: getElementInfo(target)
+          },
+          "*"
+        );
+      }
       exitStaleTextEditSession();
       if (selectedEl === target || !document.documentElement.contains(selectedEl)) {
         selectedEl = null;
@@ -12149,6 +12176,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         type: "visual-structure-change",
         requestId,
         transactionId,
+        routePath: window.location.pathname + window.location.search,
         selector: getSelector(el),
         sourceId: getSourceId(el),
         anchorSelector: getSelector(messageAnchor),
@@ -17493,7 +17521,23 @@ export const editorChromeBridgeScript: string = `"use strict";
               type: "runtime-structure-insert-rejected",
               screenId: designCanvasScreenId,
               requestId: insertRequestId,
+              transactionId: typeof e.data.transactionId === "string" ? e.data.transactionId : void 0,
+              routePath: window.location.pathname + window.location.search,
               reason
+            },
+            "*"
+          );
+        };
+        var acknowledgeInsert = function(element) {
+          window.parent.postMessage(
+            {
+              type: "runtime-structure-insert-applied",
+              screenId: designCanvasScreenId,
+              requestId: String(insertRequestId),
+              transactionId: typeof e.data.transactionId === "string" ? e.data.transactionId : void 0,
+              routePath: window.location.pathname + window.location.search,
+              selector: getSelector(element),
+              sourceId: getSourceId(element)
             },
             "*"
           );
@@ -17576,6 +17620,7 @@ export const editorChromeBridgeScript: string = `"use strict";
               insertTarget,
               reinsertOrigin
             );
+            acknowledgeInsert(existingInsertEl);
           }
           return;
         }
@@ -17611,6 +17656,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           );
           replaceParent.removeChild(insertAnchor);
           refreshOverlays();
+          acknowledgeInsert(parsedInsertEl);
           return;
         }
         if (insertPlacement === "inside") {
@@ -17628,8 +17674,13 @@ export const editorChromeBridgeScript: string = `"use strict";
           parsedInsertEl,
           insertTarget,
           { inserted: true },
-          parsedInsertEl.outerHTML
+          parsedInsertEl.outerHTML,
+          void 0,
+          void 0,
+          void 0,
+          typeof e.data.transactionId === "string" ? e.data.transactionId : void 0
         );
+        acknowledgeInsert(parsedInsertEl);
         return;
       }
       if (e.data.type === "visual-structure-ack") {
@@ -17750,7 +17801,41 @@ export const editorChromeBridgeScript: string = `"use strict";
         removeRuntimeTarget(
           e.data.selector,
           e.data.selectorCandidates,
-          e.data.requestId
+          e.data.requestId,
+          e.data.transactionId
+        );
+        return;
+      }
+      if (e.data.type === "runtime-structure-rollback-insert") {
+        var rollbackRequestId = String(e.data.requestId || "");
+        var rollbackTarget = findUniqueRuntimeStructureTarget(
+          String(e.data.selector || ""),
+          typeof e.data.sourceId === "string" ? e.data.sourceId : ""
+        );
+        if (!rollbackRequestId || !rollbackTarget || !rollbackTarget.parentElement) {
+          window.parent.postMessage(
+            {
+              type: "runtime-structure-rollback-result",
+              requestId: rollbackRequestId,
+              transactionId: e.data.transactionId,
+              applied: false,
+              reason: "target-unresolved"
+            },
+            "*"
+          );
+          return;
+        }
+        rollbackTarget.parentElement.removeChild(rollbackTarget);
+        publishSourceDocumentProvenance(void 0, true);
+        refreshOverlays();
+        window.parent.postMessage(
+          {
+            type: "runtime-structure-rollback-result",
+            requestId: rollbackRequestId,
+            transactionId: e.data.transactionId,
+            applied: true
+          },
+          "*"
         );
         return;
       }
@@ -17768,6 +17853,48 @@ export const editorChromeBridgeScript: string = `"use strict";
         claimContentAsSource(textTarget);
         publishSourceDocumentProvenance(void 0, true);
         refreshOverlays();
+        return;
+      }
+      if (e.data.type === "request-runtime-layer-snapshot") {
+        postRuntimeLayerSnapshot();
+        return;
+      }
+      if (e.data.type === "runtime-layer-rename") {
+        if (readOnly) return;
+        var renameName = typeof e.data.name === "string" ? e.data.name.trim().slice(0, 200) : "";
+        if (!renameName) return;
+        var renameCandidates = Array.isArray(e.data.selectorCandidates) ? e.data.selectorCandidates : [];
+        if (e.data.selector && renameCandidates.indexOf(String(e.data.selector)) === -1) {
+          renameCandidates.push(String(e.data.selector));
+        }
+        if (typeof e.data.sourceId === "string" && e.data.sourceId) {
+          renameCandidates.push(
+            '[data-agent-native-node-id="' + String(e.data.sourceId).replace(/"/g, '\\\\"') + '"]'
+          );
+        }
+        var renameTarget = findRuntimeTarget(
+          String(e.data.selector || ""),
+          renameCandidates
+        );
+        if (!renameTarget) return;
+        var previousLayerName = renameTarget.getAttribute("data-agent-native-layer-name") || "";
+        renameTarget.setAttribute("data-agent-native-layer-name", renameName);
+        claimContentAsSource(renameTarget);
+        publishSourceDocumentProvenance(void 0, true);
+        postRuntimeLayerSnapshot();
+        refreshOverlays();
+        window.parent.postMessage(
+          {
+            type: "runtime-layer-name-applied",
+            requestId: Number(e.data.requestId),
+            routePath: window.location.pathname + window.location.search,
+            selector: getSelector(renameTarget),
+            sourceId: typeof e.data.sourceId === "string" ? e.data.sourceId : void 0,
+            name: renameName,
+            previousName: previousLayerName
+          },
+          "*"
+        );
         return;
       }
       if (e.data.type !== "style-change") return;
@@ -18012,7 +18139,10 @@ export const editorChromeBridgeScript: string = `"use strict";
       );
     }
     window.parent.postMessage(
-      { type: "agent-native:editor-chrome-ready" },
+      {
+        type: "agent-native:editor-chrome-ready",
+        routePath: window.location.pathname + window.location.search
+      },
       "*"
     );
   })();
