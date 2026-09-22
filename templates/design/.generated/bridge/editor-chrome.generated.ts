@@ -16278,6 +16278,16 @@ export const editorChromeBridgeScript: string = `"use strict";
       document.addEventListener(events.up, onUp, true);
     }
     selectionOverlay.addEventListener(
+      "pointerdown",
+      function(e) {
+        if (readOnly || e.button !== 0) return;
+        if (e.pointerId !== void 0 && selectionOverlay.setPointerCapture) {
+          selectionOverlay.setPointerCapture(e.pointerId);
+        }
+      },
+      true
+    );
+    selectionOverlay.addEventListener(
       "mousedown",
       function(e) {
         if (readOnly) return;
