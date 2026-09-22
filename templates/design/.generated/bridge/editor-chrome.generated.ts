@@ -4773,7 +4773,13 @@ export const editorChromeBridgeScript: string = `"use strict";
     var activeEditorDragId = "";
     var bridgeSpaceKeyPressed = false;
     var bridgeIgnoreAutoLayoutKeyPressed = false;
+    var hostIgnoreAutoLayoutAtPointerDown = false;
     var bridgeSpaceKeyConsumedByDrag = false;
+    function resetBridgeDragModifierStateOnCancel() {
+      bridgeSpaceKeyPressed = false;
+      bridgeSpaceKeyConsumedByDrag = false;
+      hostIgnoreAutoLayoutAtPointerDown = false;
+    }
     var activeCrossScreenStyleSnapshot = void 0;
     var activeCrossScreenDragIdentity = null;
     var spacingDrag = null;
@@ -10602,7 +10608,6 @@ export const editorChromeBridgeScript: string = `"use strict";
     function postCrossScreenDrag(phase, el, ev, options) {
       dndLog("post:cross-screen", { phase, el: getSelector(el ?? null) });
       if (phase === "cancel") {
-        bridgeIgnoreAutoLayoutKeyPressed = false;
         activeCrossScreenStyleSnapshot = void 0;
         activeCrossScreenDragIdentity = null;
         window.parent.postMessage(
@@ -13238,6 +13243,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           clearActiveDragCancel(onRejectedEscape2);
           shieldOverlay.style.cursor = "default";
         }, onRejectedEscape2 = function() {
+          resetBridgeDragModifierStateOnCancel();
           cleanupRejectedDrag2();
           hideTransformBadge();
           suppressNextShieldClickBriefly();
@@ -13908,6 +13914,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         }, onReorderVisibilityChange2 = function() {
           if (document.visibilityState === "hidden") onReorderEscape2();
         }, onReorderEscape2 = function() {
+          resetBridgeDragModifierStateOnCancel();
           cleanupReorderDrag2();
           hideTransformBadge();
           hideInsertionGuide();
@@ -14259,6 +14266,11 @@ export const editorChromeBridgeScript: string = `"use strict";
       var moved = false;
       dndLog("start:free", { el: getSelector(gestureEl), isGroup: isGroupDrag });
       var currentAutoLayoutTarget = null;
+      var dragIgnoreAutoLayout = hostIgnoreAutoLayoutAtPointerDown || pointerStartParam?.ignoreAutoLayout === true || isIgnoreAutoLayoutChord(e);
+      hostIgnoreAutoLayoutAtPointerDown = false;
+      function ignoreAutoLayoutHeld(ev) {
+        return dragIgnoreAutoLayout || isIgnoreAutoLayoutChordForDragPoint(ev);
+      }
       var autoLayoutTargetFrame = 0;
       var pendingAutoLayoutTargetPoint = null;
       var snapCandidateRects = collectSnapCandidateRects(dragEl, groupOthers);
@@ -14269,7 +14281,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         if (!target || target.placement !== "inside" || target.dropMode !== "flow-insert") {
           return target;
         }
-        if (ev && (isIgnoreAutoLayoutChordForDragPoint(ev) || isPlatformPrimaryChord(ev))) {
+        if (ev && (ignoreAutoLayoutHeld(ev) || isPlatformPrimaryChord(ev))) {
           return target;
         }
         var container = dropContainerForTarget(target);
@@ -14391,7 +14403,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           modifiers: {
             metaKey: !!e.metaKey,
             ctrlKey: !!e.ctrlKey,
-            ignoreAutoLayout: isIgnoreAutoLayoutChord(e),
+            ignoreAutoLayout: dragIgnoreAutoLayout,
             forceNestedAutoLayout: isPlatformPrimaryChord(e)
           }
         });
@@ -14420,7 +14432,7 @@ export const editorChromeBridgeScript: string = `"use strict";
           clientY: ev.clientY,
           metaKey: !!ev.metaKey,
           ctrlKey: !!ev.ctrlKey,
-          ignoreAutoLayout: isIgnoreAutoLayoutChord(ev),
+          ignoreAutoLayout: ignoreAutoLayoutHeld(ev),
           forceNestedAutoLayout: isPlatformPrimaryChord(ev)
         };
         if (crossScreenDragMoveScheduled) return;
@@ -14513,7 +14525,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         var rawDy = controllerMove.gesture.canvasDelta.y;
         var nextLeft = originLeft + rawDx;
         var nextTop = originTop + rawDy;
-        var snapBypass = isIgnoreAutoLayoutChord(ev) || isPlatformPrimaryChord(ev);
+        var snapBypass = ignoreAutoLayoutHeld(ev) || isPlatformPrimaryChord(ev);
         var snapResult = !snapBypass && !duplicatedForDrag ? computeMoveSnapOffset(
           {
             // snapCandidateRects are client space; nextLeft/nextTop are
@@ -14608,6 +14620,7 @@ export const editorChromeBridgeScript: string = `"use strict";
         suppressNextShieldClickBriefly();
       }
       function cancelMoveDrag() {
+        resetBridgeDragModifierStateOnCancel();
         bridgeMoveController.cancel();
         cleanupMoveDrag();
         hideTransformBadge();
@@ -14674,7 +14687,7 @@ export const editorChromeBridgeScript: string = `"use strict";
             modifiers: {
               metaKey: !!ev.metaKey,
               ctrlKey: !!ev.ctrlKey,
-              ignoreAutoLayout: isIgnoreAutoLayoutChord(ev),
+              ignoreAutoLayout: ignoreAutoLayoutHeld(ev),
               forceNestedAutoLayout: isPlatformPrimaryChord(ev)
             }
           });
@@ -14698,7 +14711,7 @@ export const editorChromeBridgeScript: string = `"use strict";
             groupOthers,
             isPlatformPrimaryChord(ev)
           );
-          if (finalAutoLayoutTarget && isIgnoreAutoLayoutChord(ev)) {
+          if (finalAutoLayoutTarget && ignoreAutoLayoutHeld(ev)) {
             finalAutoLayoutTarget = ignoreAutoLayoutForDropTarget(
               finalAutoLayoutTarget
             );
@@ -16001,6 +16014,7 @@ export const editorChromeBridgeScript: string = `"use strict";
       if (e.type === "pointerdown") lastPointerDownTimestamp = Date.now();
       stopNativeInteraction(e);
       clearGridProjectionCaches();
+      hostIgnoreAutoLayoutAtPointerDown = false;
       pendingMoveCommitRevert = null;
       if (e.button !== 0) return;
       if (activeTextEditEl && !exitStaleTextEditSession()) return;
@@ -16081,13 +16095,22 @@ export const editorChromeBridgeScript: string = `"use strict";
           suppressNextShieldClickBriefly();
           startMove(ev, groupGestureMember, {
             clientX: startX,
-            clientY: startY
+            clientY: startY,
+            ignoreAutoLayout: Boolean(
+              e.__agentNativeIgnoreAutoLayout
+            ) || isIgnoreAutoLayoutChord(ev)
           });
           return;
         }
         selectTarget(dragTarget, ev);
         suppressNextShieldClickBriefly();
-        startMove(ev, void 0, { clientX: startX, clientY: startY });
+        startMove(ev, void 0, {
+          clientX: startX,
+          clientY: startY,
+          ignoreAutoLayout: Boolean(
+            e.__agentNativeIgnoreAutoLayout
+          ) || isIgnoreAutoLayoutChord(ev)
+        });
       }
       function onUp(ev) {
         clearPendingShieldDrag();
@@ -16339,6 +16362,43 @@ export const editorChromeBridgeScript: string = `"use strict";
       },
       true
     );
+    try {
+      var parentDocument = window.parent.document;
+      var modifierListenerWindows = parentDocument.__agentNativeDesignModifierListeners || /* @__PURE__ */ new WeakMap();
+      parentDocument.__agentNativeDesignModifierListeners = modifierListenerWindows;
+      modifierListenerWindows.get(window)?.cleanup();
+      var onParentModifierKeyDown = function(e) {
+        if (!isApplePlatformBridge() && String(e.key).toLowerCase() === "s") {
+          bridgeIgnoreAutoLayoutKeyPressed = true;
+        }
+      };
+      var onParentModifierKeyUp = function(e) {
+        if (!isApplePlatformBridge() && String(e.key).toLowerCase() === "s") {
+          bridgeIgnoreAutoLayoutKeyPressed = false;
+        }
+      };
+      var cleanupParentModifierListeners = function() {
+        parentDocument.removeEventListener(
+          "keydown",
+          onParentModifierKeyDown,
+          true
+        );
+        parentDocument.removeEventListener("keyup", onParentModifierKeyUp, true);
+        if (modifierListenerWindows.get(window)?.cleanup === cleanupParentModifierListeners) {
+          modifierListenerWindows.delete(window);
+        }
+      };
+      parentDocument.addEventListener("keydown", onParentModifierKeyDown, true);
+      parentDocument.addEventListener("keyup", onParentModifierKeyUp, true);
+      modifierListenerWindows.set(window, {
+        cleanup: cleanupParentModifierListeners
+      });
+      window.addEventListener("unload", cleanupParentModifierListeners, {
+        once: true
+      });
+    } catch (_err) {
+      void _err;
+    }
     document.addEventListener(
       "keyup",
       function(e) {
@@ -16365,6 +16425,7 @@ export const editorChromeBridgeScript: string = `"use strict";
       window.setTimeout(function() {
         if (!activeDragCancel) {
           bridgeIgnoreAutoLayoutKeyPressed = false;
+          hostIgnoreAutoLayoutAtPointerDown = false;
         }
       }, 0);
     });
@@ -17196,6 +17257,22 @@ export const editorChromeBridgeScript: string = `"use strict";
         suspendedTextEditRange = null;
         textEditInspectorFocused = false;
         activateProgrammaticTextEdit(resumeTarget, false, resumeBookmark);
+        return;
+      }
+      if (e.data.type === "design-hotkey") {
+        if (!isApplePlatformBridge() && String(e.data.key).toLowerCase() === "s") {
+          bridgeIgnoreAutoLayoutKeyPressed = true;
+        }
+        return;
+      }
+      if (e.data.type === "agent-native:drag-modifiers") {
+        hostIgnoreAutoLayoutAtPointerDown = e.data.ignoreAutoLayout === true;
+        return;
+      }
+      if (e.data.type === "design-hotkey-up") {
+        if (!isApplePlatformBridge() && String(e.data.key).toLowerCase() === "s") {
+          bridgeIgnoreAutoLayoutKeyPressed = false;
+        }
         return;
       }
       if (e.data.type === "text-edit-inspector-focus") {

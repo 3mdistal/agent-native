@@ -5939,7 +5939,17 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   var activeEditorDragId = "";
   var bridgeSpaceKeyPressed = false;
   var bridgeIgnoreAutoLayoutKeyPressed = false;
+  var hostIgnoreAutoLayoutAtPointerDown = false;
   var bridgeSpaceKeyConsumedByDrag = false;
+
+  function resetBridgeDragModifierStateOnCancel(): void {
+    bridgeSpaceKeyPressed = false;
+    bridgeSpaceKeyConsumedByDrag = false;
+    // Keep a physically held non-Apple S modifier live until its keyup. The
+    // cancel path can run before that keyup and must not make the next move
+    // disagree with the host's active-key tracking.
+    hostIgnoreAutoLayoutAtPointerDown = false;
+  }
   var activeCrossScreenStyleSnapshot: unknown | undefined = undefined;
   var activeCrossScreenDragIdentity: {
     selector: string;
@@ -14497,7 +14507,9 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   ): void {
     dndLog("post:cross-screen", { phase: phase, el: getSelector(el ?? null) });
     if (phase === "cancel") {
-      bridgeIgnoreAutoLayoutKeyPressed = false;
+      // Escape/cancel can arrive while the physical S key is still held.
+      // Keep that source-side state until the matching keyup so the next drag
+      // does not silently lose Ignore Auto Layout.
       activeCrossScreenStyleSnapshot = undefined;
       activeCrossScreenDragIdentity = null;
       (window.parent as Window).postMessage(
@@ -18705,7 +18717,11 @@ declare var __INITIAL_SOURCE_HEAD__: string;
   function startMove(
     e,
     gestureElParam?: Element,
-    pointerStartParam?: { clientX: number; clientY: number },
+    pointerStartParam?: {
+      clientX: number;
+      clientY: number;
+      ignoreAutoLayout?: boolean;
+    },
   ) {
     if (readOnly) return;
     var gestureEl = gestureElParam || selectedEl;
@@ -18828,6 +18844,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         shieldOverlay.style.cursor = "default";
       }
       function onRejectedEscape() {
+        resetBridgeDragModifierStateOnCancel();
         cleanupRejectedDrag();
         hideTransformBadge();
         suppressNextShieldClickBriefly();
@@ -19868,6 +19885,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         if (document.visibilityState === "hidden") onReorderEscape();
       }
       function onReorderEscape() {
+        resetBridgeDragModifierStateOnCancel();
         cleanupReorderDrag();
         hideTransformBadge();
         hideInsertionGuide();
@@ -20270,6 +20288,16 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       needsAutoLayoutConversion?: boolean;
       conversionTarget?: Element;
     } | null = null;
+    // Preserve the modifier captured at pointerdown. Playwright and real
+    // browsers can deliver the first move/up without the held key flags.
+    var dragIgnoreAutoLayout =
+      hostIgnoreAutoLayoutAtPointerDown ||
+      pointerStartParam?.ignoreAutoLayout === true ||
+      isIgnoreAutoLayoutChord(e);
+    hostIgnoreAutoLayoutAtPointerDown = false;
+    function ignoreAutoLayoutHeld(ev): boolean {
+      return dragIgnoreAutoLayout || isIgnoreAutoLayoutChordForDragPoint(ev);
+    }
     var autoLayoutTargetFrame = 0;
     var pendingAutoLayoutTargetPoint: {
       clientX: number;
@@ -20307,10 +20335,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       ) {
         return target;
       }
-      if (
-        ev &&
-        (isIgnoreAutoLayoutChordForDragPoint(ev) || isPlatformPrimaryChord(ev))
-      ) {
+      if (ev && (ignoreAutoLayoutHeld(ev) || isPlatformPrimaryChord(ev))) {
         return target;
       }
       var container = dropContainerForTarget(target);
@@ -20468,7 +20493,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         modifiers: {
           metaKey: !!e.metaKey,
           ctrlKey: !!e.ctrlKey,
-          ignoreAutoLayout: isIgnoreAutoLayoutChord(e),
+          ignoreAutoLayout: dragIgnoreAutoLayout,
           forceNestedAutoLayout: isPlatformPrimaryChord(e),
         },
       });
@@ -20512,7 +20537,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         clientY: ev.clientY,
         metaKey: !!ev.metaKey,
         ctrlKey: !!ev.ctrlKey,
-        ignoreAutoLayout: isIgnoreAutoLayoutChord(ev),
+        ignoreAutoLayout: ignoreAutoLayoutHeld(ev),
         forceNestedAutoLayout: isPlatformPrimaryChord(ev),
       };
       if (crossScreenDragMoveScheduled) return;
@@ -20623,8 +20648,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       // (Figma behavior) and while an auto-layout flow-insert is about to
       // happen instead of a free absolute placement (handled below once
       // currentAutoLayoutTarget is known for this tick).
-      var snapBypass =
-        isIgnoreAutoLayoutChord(ev) || isPlatformPrimaryChord(ev);
+      var snapBypass = ignoreAutoLayoutHeld(ev) || isPlatformPrimaryChord(ev);
       var snapResult =
         !snapBypass && !duplicatedForDrag
           ? computeMoveSnapOffset(
@@ -20779,6 +20803,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       suppressNextShieldClickBriefly();
     }
     function cancelMoveDrag() {
+      resetBridgeDragModifierStateOnCancel();
       bridgeMoveController.cancel();
       cleanupMoveDrag();
       hideTransformBadge();
@@ -20857,7 +20882,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
           modifiers: {
             metaKey: !!ev.metaKey,
             ctrlKey: !!ev.ctrlKey,
-            ignoreAutoLayout: isIgnoreAutoLayoutChord(ev),
+            ignoreAutoLayout: ignoreAutoLayoutHeld(ev),
             forceNestedAutoLayout: isPlatformPrimaryChord(ev),
           },
         });
@@ -20884,7 +20909,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
           groupOthers,
           isPlatformPrimaryChord(ev),
         );
-        if (finalAutoLayoutTarget && isIgnoreAutoLayoutChord(ev)) {
+        if (finalAutoLayoutTarget && ignoreAutoLayoutHeld(ev)) {
           finalAutoLayoutTarget = ignoreAutoLayoutForDropTarget(
             finalAutoLayoutTarget,
           );
@@ -22558,6 +22583,9 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     if (e.type === "pointerdown") lastPointerDownTimestamp = Date.now();
     stopNativeInteraction(e);
     clearGridProjectionCaches();
+    // Consume any host handoff at pointerdown; the synthetic event carries
+    // the same value so async postMessage delivery cannot win the race.
+    hostIgnoreAutoLayoutAtPointerDown = false;
     // A new interaction starting is unambiguous proof the previous gesture is
     // over — a stale post-commit revert from it must never fire against
     // whatever this new one turns out to be.
@@ -22698,12 +22726,31 @@ declare var __INITIAL_SOURCE_HEAD__: string;
         startMove(ev, groupGestureMember, {
           clientX: startX,
           clientY: startY,
+          ignoreAutoLayout:
+            Boolean(
+              (
+                e as MouseEvent & {
+                  __agentNativeIgnoreAutoLayout?: boolean;
+                }
+              ).__agentNativeIgnoreAutoLayout,
+            ) || isIgnoreAutoLayoutChord(ev),
         });
         return;
       }
       selectTarget(dragTarget, ev);
       suppressNextShieldClickBriefly();
-      startMove(ev, undefined, { clientX: startX, clientY: startY });
+      startMove(ev, undefined, {
+        clientX: startX,
+        clientY: startY,
+        ignoreAutoLayout:
+          Boolean(
+            (
+              e as MouseEvent & {
+                __agentNativeIgnoreAutoLayout?: boolean;
+              }
+            ).__agentNativeIgnoreAutoLayout,
+          ) || isIgnoreAutoLayoutChord(ev),
+      });
     }
     function onUp(ev) {
       clearPendingShieldDrag();
@@ -23059,6 +23106,58 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     },
     true,
   );
+  // The preview iframe may not own focus when a drag begins. Mirror the
+  // host document's S modifier so a pre-pointerdown shortcut reaches the
+  // same drag state as an iframe-focused keydown.
+  try {
+    var parentDocument = window.parent.document as Document & {
+      __agentNativeDesignModifierListeners?: WeakMap<
+        Window,
+        { cleanup: () => void }
+      >;
+    };
+    var modifierListenerWindows =
+      parentDocument.__agentNativeDesignModifierListeners ||
+      new WeakMap<Window, { cleanup: () => void }>();
+    parentDocument.__agentNativeDesignModifierListeners =
+      modifierListenerWindows;
+    modifierListenerWindows.get(window)?.cleanup();
+    var onParentModifierKeyDown = function (e) {
+      if (!isApplePlatformBridge() && String(e.key).toLowerCase() === "s") {
+        bridgeIgnoreAutoLayoutKeyPressed = true;
+      }
+    };
+    var onParentModifierKeyUp = function (e) {
+      if (!isApplePlatformBridge() && String(e.key).toLowerCase() === "s") {
+        bridgeIgnoreAutoLayoutKeyPressed = false;
+      }
+    };
+    var cleanupParentModifierListeners = function () {
+      parentDocument.removeEventListener(
+        "keydown",
+        onParentModifierKeyDown,
+        true,
+      );
+      parentDocument.removeEventListener("keyup", onParentModifierKeyUp, true);
+      if (
+        modifierListenerWindows.get(window)?.cleanup ===
+        cleanupParentModifierListeners
+      ) {
+        modifierListenerWindows.delete(window);
+      }
+    };
+    parentDocument.addEventListener("keydown", onParentModifierKeyDown, true);
+    parentDocument.addEventListener("keyup", onParentModifierKeyUp, true);
+    modifierListenerWindows.set(window, {
+      cleanup: cleanupParentModifierListeners,
+    });
+    window.addEventListener("unload", cleanupParentModifierListeners, {
+      once: true,
+    });
+  } catch (_err) {
+    // coercion-ok: cross-origin previews intentionally cannot inspect the host document.
+    void _err;
+  }
 
   // Space-pan release: keydown forwarding above arms the parent's temporary
   // hand tool (see postDesignHotkey/"design-hotkey"), but the parent also
@@ -23097,6 +23196,7 @@ declare var __INITIAL_SOURCE_HEAD__: string;
     window.setTimeout(function () {
       if (!activeDragCancel) {
         bridgeIgnoreAutoLayoutKeyPressed = false;
+        hostIgnoreAutoLayoutAtPointerDown = false;
       }
     }, 0);
   });
@@ -24350,6 +24450,28 @@ declare var __INITIAL_SOURCE_HEAD__: string;
       suspendedTextEditRange = null;
       textEditInspectorFocused = false;
       activateProgrammaticTextEdit(resumeTarget, false, resumeBookmark);
+      return;
+    }
+    if (e.data.type === "design-hotkey") {
+      if (
+        !isApplePlatformBridge() &&
+        String(e.data.key).toLowerCase() === "s"
+      ) {
+        bridgeIgnoreAutoLayoutKeyPressed = true;
+      }
+      return;
+    }
+    if (e.data.type === "agent-native:drag-modifiers") {
+      hostIgnoreAutoLayoutAtPointerDown = e.data.ignoreAutoLayout === true;
+      return;
+    }
+    if (e.data.type === "design-hotkey-up") {
+      if (
+        !isApplePlatformBridge() &&
+        String(e.data.key).toLowerCase() === "s"
+      ) {
+        bridgeIgnoreAutoLayoutKeyPressed = false;
+      }
       return;
     }
     if (e.data.type === "text-edit-inspector-focus") {

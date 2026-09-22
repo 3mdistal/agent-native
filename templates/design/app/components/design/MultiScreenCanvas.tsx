@@ -1200,6 +1200,7 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
   // Track the host key state before then so a chord held during the source drag
   // is still present when that start initializes the host payload.
   const crossScreenSKeyPressedRef = useRef(false);
+  const crossScreenControlPressedRef = useRef(false);
   /** False once this canvas unmounts. Nothing may persist a drop after that.
    *  Mount-scoped on purpose: the message effect's cleanup also runs on every
    *  dependency change, and invalidating there kills live commits. */
@@ -2706,6 +2707,11 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
     const clearCrossScreenDrag = () => {
       crossScreenPreviewGenerationRef.current += 1;
       stopParentCrossScreenDrag();
+      // The parent key listeners can be removed before a held Control keyup
+      // arrives. Clear the transient handoff state at the gesture boundary so
+      // a later drag cannot inherit a modifier from this one.
+      crossScreenIgnoreAutoLayoutRef.current = false;
+      crossScreenControlPressedRef.current = false;
       clearCrossScreenPreviewGuide();
       const previousClaim = crossScreenClaimSentRef.current;
       if (previousClaim?.claimed) {
@@ -3642,13 +3648,14 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
         };
         const handleParentWindowBlur = () => {
           cancelPendingParentDrag();
-          crossScreenIgnoreAutoLayoutRef.current = false;
           // An iframe-focus handoff also emits blur on some browsers, while the
           // top document remains focused. Only a real window blur may discard
-          // the S timeline before the source end message arrives.
+          // the modifier timeline before the source end message arrives.
           if (
             shouldClearCrossScreenSKeyTimesOnWindowBlur(document.hasFocus())
           ) {
+            crossScreenIgnoreAutoLayoutRef.current = false;
+            crossScreenControlPressedRef.current = false;
             crossScreenSKeyTimesRef.current = { downAt: null, upAt: null };
           }
           clearCrossScreenDrag();
@@ -3672,6 +3679,9 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
           }
         };
         const handleParentKeyDown = (ev: KeyboardEvent) => {
+          if (isApplePlatform() && ev.key === "Control") {
+            crossScreenControlPressedRef.current = true;
+          }
           if (hostUsesSForIgnoreAutoLayout() && ev.key.toLowerCase() === "s") {
             syncHostIgnoreAutoLayout(true, ev.timeStamp);
             ev.preventDefault();
@@ -3700,6 +3710,9 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
           clearCrossScreenDrag();
         };
         const handleParentKeyUp = (ev: KeyboardEvent) => {
+          if (isApplePlatform() && ev.key === "Control") {
+            crossScreenControlPressedRef.current = false;
+          }
           if (hostUsesSForIgnoreAutoLayout() && ev.key.toLowerCase() === "s") {
             syncHostIgnoreAutoLayout(false, ev.timeStamp);
             ev.preventDefault();
@@ -3714,6 +3727,9 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
           window.removeEventListener("blur", handleParentWindowBlur, true);
           window.removeEventListener("keydown", handleParentKeyDown, true);
           window.removeEventListener("keyup", handleParentKeyUp, true);
+          // Finalization may remove this listener before Apple Control is
+          // released; never carry its transient state into the next drag.
+          crossScreenControlPressedRef.current = false;
           restorePreviewPointerEvents();
           if (crossScreenParentDragCleanupRef.current === cleanup) {
             crossScreenParentDragCleanupRef.current = null;
@@ -8158,6 +8174,7 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
           { type: "agent-native:cancel-active-drag", pressedAt },
           "*",
         );
+        crossScreenControlPressedRef.current = false;
       };
       boardElementResizeCancel.current = cancelResize;
       installDragListeners(handleMouseMove, handleMouseUp, () => {
@@ -8214,22 +8231,26 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
           altKey: boolean;
           metaKey: boolean;
           ctrlKey: boolean;
+          ignoreAutoLayout?: boolean;
         },
         buttons: number,
       ) => {
-        target.dispatchEvent(
-          new MouseEvent(type, {
-            clientX: point.x,
-            clientY: point.y,
-            shiftKey: source.shiftKey,
-            altKey: source.altKey,
-            metaKey: source.metaKey,
-            ctrlKey: source.ctrlKey,
-            buttons,
-            bubbles: true,
-            cancelable: true,
-          }),
-        );
+        const event = new MouseEvent(type, {
+          clientX: point.x,
+          clientY: point.y,
+          shiftKey: source.shiftKey,
+          altKey: source.altKey,
+          metaKey: source.metaKey,
+          ctrlKey: source.ctrlKey,
+          buttons,
+          bubbles: true,
+          cancelable: true,
+        });
+        Object.defineProperty(event, "__agentNativeIgnoreAutoLayout", {
+          configurable: true,
+          value: source.ignoreAutoLayout === true,
+        });
+        target.dispatchEvent(event);
       };
 
       const pressModifiers = {
@@ -8242,11 +8263,24 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
       const startBridgeDrag = () => {
         if (bridgeDragStarted) return;
         bridgeDragStarted = true;
+        const ignoreAutoLayout =
+          crossScreenIgnoreAutoLayoutRef.current ||
+          crossScreenControlPressedRef.current ||
+          (isApplePlatform() &&
+            pressModifiers.ctrlKey &&
+            !pressModifiers.metaKey);
+        iframe.contentWindow?.postMessage(
+          {
+            type: "agent-native:drag-modifiers",
+            ignoreAutoLayout,
+          },
+          "*",
+        );
         dispatchAt(
           selectionOverlay,
           "mousedown",
           toIframePoint(e.clientX, e.clientY),
-          pressModifiers,
+          { ...pressModifiers, ignoreAutoLayout },
           1,
         );
       };
@@ -8264,11 +8298,18 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
         );
       };
       const cancelMove = (pressedAt: number) => {
+        crossScreenIgnoreAutoLayoutRef.current = false;
+        crossScreenControlPressedRef.current = false;
         if (!bridgeDragStarted) return;
         iframe.contentWindow?.postMessage(
           { type: "agent-native:cancel-active-drag", pressedAt },
           "*",
         );
+        iframe.contentWindow?.postMessage(
+          { type: "agent-native:drag-modifiers", ignoreAutoLayout: false },
+          "*",
+        );
+        crossScreenControlPressedRef.current = false;
       };
       const handleMouseUp = (ev: MouseEvent) => {
         if (!bridgeDragStarted) {
@@ -8300,6 +8341,10 @@ export const MultiScreenCanvas = memo(function MultiScreenCanvas({
             toIframePoint(ev.clientX, ev.clientY),
             ev,
             0,
+          );
+          iframe.contentWindow?.postMessage(
+            { type: "agent-native:drag-modifiers", ignoreAutoLayout: false },
+            "*",
           );
         }
         finishDrag();
