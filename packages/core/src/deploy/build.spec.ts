@@ -2608,7 +2608,7 @@ describe("copyInstalledExternalSsrPackages", () => {
     }
   });
 
-  it("ships externally required React with the generated function manifest", () => {
+  it("ships externally required SSR packages with the generated function manifest", () => {
     const root = fs.mkdtempSync(
       path.join(process.cwd(), ".tmp-external-ssr-test-"),
     );
@@ -2616,8 +2616,26 @@ describe("copyInstalledExternalSsrPackages", () => {
     const nodeModules = path.join(root, "node_modules");
     const reactDir = path.join(nodeModules, "react");
     const looseEnvifyDir = path.join(nodeModules, "loose-envify");
+    const reactRouterDir = path.join(nodeModules, "react-router");
+    const cookieEsDir = path.join(nodeModules, "cookie-es");
+    const reactQueryDir = path.join(nodeModules, "@tanstack", "react-query");
+    const queryCoreDir = path.join(nodeModules, "@tanstack", "query-core");
+    const queryCodemodsDir = path.join(
+      reactQueryDir,
+      "build",
+      "query-codemods",
+    );
+    const queryCodemodsBuildDir = path.join(reactQueryDir, "build", "codemods");
+    const queryModernDir = path.join(reactQueryDir, "build", "modern");
     fs.mkdirSync(reactDir, { recursive: true });
     fs.mkdirSync(looseEnvifyDir, { recursive: true });
+    fs.mkdirSync(reactRouterDir, { recursive: true });
+    fs.mkdirSync(cookieEsDir, { recursive: true });
+    fs.mkdirSync(reactQueryDir, { recursive: true });
+    fs.mkdirSync(queryCoreDir, { recursive: true });
+    fs.mkdirSync(queryCodemodsDir, { recursive: true });
+    fs.mkdirSync(queryCodemodsBuildDir, { recursive: true });
+    fs.mkdirSync(queryModernDir, { recursive: true });
     fs.writeFileSync(
       path.join(reactDir, "package.json"),
       JSON.stringify({
@@ -2630,6 +2648,39 @@ describe("copyInstalledExternalSsrPackages", () => {
       path.join(looseEnvifyDir, "package.json"),
       JSON.stringify({ name: "loose-envify", version: "1.4.0" }),
     );
+    fs.writeFileSync(
+      path.join(reactRouterDir, "package.json"),
+      JSON.stringify({
+        name: "react-router",
+        version: "8.1.0",
+        dependencies: { "cookie-es": "3.1.1" },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(cookieEsDir, "package.json"),
+      JSON.stringify({ name: "cookie-es", version: "3.1.1" }),
+    );
+    fs.writeFileSync(
+      path.join(reactQueryDir, "package.json"),
+      JSON.stringify({
+        name: "@tanstack/react-query",
+        version: "5.101.2",
+        dependencies: { "@tanstack/query-core": "5.101.2" },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(queryCoreDir, "package.json"),
+      JSON.stringify({ name: "@tanstack/query-core", version: "5.101.2" }),
+    );
+    fs.writeFileSync(
+      path.join(queryCodemodsDir, "root.eslint.config.js"),
+      'import "@vitest/runner";\n',
+    );
+    fs.writeFileSync(
+      path.join(queryCodemodsBuildDir, "transform.cjs"),
+      'require("@vitest/runner");\n',
+    );
+    fs.writeFileSync(path.join(queryModernDir, "index.js.map"), "source map");
 
     const serverDir = path.join(root, "server");
     fs.mkdirSync(serverDir, { recursive: true });
@@ -2642,12 +2693,18 @@ describe("copyInstalledExternalSsrPackages", () => {
     expect(fs.existsSync(path.join(serverDir, "node_modules"))).toBe(false);
     fs.writeFileSync(
       path.join(serverDir, "chunk.mjs"),
-      "const react = require(`react`); export { react };",
+      "throw Error(`Did you accidentally import `RouterProvider` from `react-router`?`);",
+    );
+    expect(copyInstalledExternalSsrPackages(serverDir, root)).toBe(0);
+    expect(fs.existsSync(path.join(serverDir, "node_modules"))).toBe(false);
+    fs.writeFileSync(
+      path.join(serverDir, "chunk.mjs"),
+      'const react = require(`react`);\nexport { Link } from "react-router";\nexport * from "@tanstack/react-query";\nexport { react };',
     );
 
     expect(
       copyInstalledExternalSsrPackages(serverDir, root),
-    ).toBeGreaterThanOrEqual(2);
+    ).toBeGreaterThanOrEqual(6);
     expect(
       fs.existsSync(
         path.join(serverDir, "node_modules", "react", "package.json"),
@@ -2659,9 +2716,82 @@ describe("copyInstalledExternalSsrPackages", () => {
       ),
     ).toBe(true);
     expect(
+      fs.existsSync(
+        path.join(serverDir, "node_modules", "react-router", "package.json"),
+      ),
+    ).toBe(true);
+    expect(
+      fs.existsSync(
+        path.join(serverDir, "node_modules", "cookie-es", "package.json"),
+      ),
+    ).toBe(true);
+    expect(
+      fs.existsSync(
+        path.join(
+          serverDir,
+          "node_modules",
+          "@tanstack",
+          "react-query",
+          "package.json",
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      fs.existsSync(
+        path.join(
+          serverDir,
+          "node_modules",
+          "@tanstack",
+          "react-query",
+          "build",
+          "query-codemods",
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      fs.existsSync(
+        path.join(
+          serverDir,
+          "node_modules",
+          "@tanstack",
+          "react-query",
+          "build",
+          "codemods",
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      fs.existsSync(
+        path.join(
+          serverDir,
+          "node_modules",
+          "@tanstack",
+          "react-query",
+          "build",
+          "modern",
+          "index.js.map",
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      fs.existsSync(
+        path.join(
+          serverDir,
+          "node_modules",
+          "@tanstack",
+          "query-core",
+          "package.json",
+        ),
+      ),
+    ).toBe(true);
+    expect(
       JSON.parse(fs.readFileSync(path.join(serverDir, "package.json"), "utf8"))
         .dependencies,
-    ).toEqual({ react: "19.2.7" });
+    ).toEqual({
+      react: "19.2.7",
+      "react-router": "8.1.0",
+      "@tanstack/react-query": "5.101.2",
+    });
   });
 
   it("also ships react-router and react-query so the SSR provider and consumer share one instance", () => {
