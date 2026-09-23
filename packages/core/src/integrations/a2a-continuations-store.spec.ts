@@ -634,6 +634,47 @@ describe("A2A continuations store", () => {
     ]);
   });
 
+  it("does not exhaust the remote polling budget through repeated runtime pauses", async () => {
+    const state = continuationRow({ status: "pending", attempts: 0 });
+    executeMock.mockImplementation(
+      async (query: string | { sql: string; args?: unknown[] }) => {
+        const sql = querySql(query);
+        if (sql.includes("attempts = attempts + 1")) {
+          if (state.status !== "pending") return { rows: [] };
+          state.status = "processing";
+          state.attempts = Number(state.attempts) + 1;
+          return { rows: [{ ...state }] };
+        }
+        if (sql.includes("attempts = attempts - 1")) {
+          const expected = queryArgs(query).at(-1);
+          if (state.status !== "processing" || state.attempts !== expected) {
+            return { rows: [] };
+          }
+          state.status = "pending";
+          state.attempts = Number(state.attempts) - 1;
+          return { rows: [{ id: state.id }] };
+        }
+        return { rows: [] };
+      },
+    );
+    const { claimA2AContinuation, pauseA2AContinuationForRuntime } =
+      await loadStore();
+
+    for (let pause = 0; pause < 35; pause += 1) {
+      const claimed = await claimA2AContinuation("cont-1");
+      expect(claimed?.attempts).toBe(1);
+      await expect(
+        pauseA2AContinuationForRuntime("cont-1", claimed!.attempts, 20_000),
+      ).resolves.toBe(true);
+    }
+
+    expect(state.attempts).toBe(0);
+    await expect(claimA2AContinuation("cont-1")).resolves.toMatchObject({
+      attempts: 1,
+      a2aTaskId: "a2a-task-1",
+    });
+  });
+
   it("terminalizes all active A2A rows for a disabled durable task", async () => {
     const { failA2AContinuationsForIntegrationTask } = await loadStore();
     executeMock.mockResolvedValue({ rows: [], rowsAffected: 2 });
