@@ -609,7 +609,35 @@ describe("A2A continuations store", () => {
     expect(querySql(joinedReads[0]![0])).toContain(
       "ORDER BY has_pending_confirmed_delivery DESC",
     );
+    expect(querySql(joinedReads[0]![0])).toContain("MIN(c.next_check_at) ASC");
     expect(queryArgs(joinedReads[0]![0]).at(-1)).toBe(10);
+  });
+
+  it("defers only due unconfirmed continuations without spending a claim", async () => {
+    const { deferA2AContinuationsForRuntime } = await loadStore();
+    executeMock.mockResolvedValue({ rows: [], rowsAffected: 2 });
+
+    await deferA2AContinuationsForRuntime(["task-1", "task-2"], 120_000);
+
+    const update = executeMock.mock.calls.find(([query]) =>
+      querySql(query).includes("SET next_check_at = ?"),
+    )?.[0];
+    expect(querySql(update!)).toContain(
+      "terminal_delivery_confirmed_at IS NULL",
+    );
+    expect(querySql(update!)).toContain("status = 'processing'");
+    expect(querySql(update!)).toContain("status = 'delivering'");
+    expect(querySql(update!)).not.toContain("attempts = attempts + 1");
+    expect(queryArgs(update!)).toEqual([
+      expect.any(Number),
+      expect.any(Number),
+      "task-1",
+      "task-2",
+      expect.any(Number),
+      expect.any(Number),
+      expect.any(Number),
+      expect.any(Number),
+    ]);
   });
 
   it("returns the claim attempt when runtime pauses before remote polling", async () => {

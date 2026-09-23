@@ -29,6 +29,7 @@ import {
   hasOnlyLegacyFailedA2AContinuationsForIntegrationTask,
   hasPendingConfirmedA2ADeliveryForIntegrationTask,
   listRecoverableA2AIntegrationTasks,
+  deferA2AContinuationsForRuntime,
   recoverDueA2AContinuationIds,
   recordA2ATerminalDeliveryReceipt,
   retainA2AUnconfirmedDeliveryClaim,
@@ -331,6 +332,7 @@ export async function recoverDueA2AContinuations(options?: {
   const candidateTasks = await listRecoverableA2AIntegrationTasks(200);
   const eligibleTaskIds: string[] = [];
   const confirmedHistoryTaskIds: string[] = [];
+  const unavailableTaskIds: string[] = [];
   for (const task of candidateTasks) {
     const enabled = isIntegrationDurableDispatchEnabledForTask({
       platform: task.platform,
@@ -353,9 +355,12 @@ export async function recoverDueA2AContinuations(options?: {
       })
     ) {
       await failDisabledDurableA2ATask(task);
+    } else {
+      unavailableTaskIds.push(task.id);
     }
     if (eligibleTaskIds.length + confirmedHistoryTaskIds.length >= limit) break;
   }
+  await deferA2AContinuationsForRuntime(unavailableTaskIds, 2 * 60_000);
   const ids = await recoverDueA2AContinuationIds(limit, eligibleTaskIds);
   const remaining = Math.max(0, limit - ids.length);
   const confirmedHistoryIds =
