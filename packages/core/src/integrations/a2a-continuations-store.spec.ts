@@ -606,7 +606,32 @@ describe("A2A continuations store", () => {
       querySql(query).includes("INNER JOIN integration_pending_tasks"),
     );
     expect(joinedReads).toHaveLength(1);
+    expect(querySql(joinedReads[0]![0])).toContain(
+      "ORDER BY has_pending_confirmed_delivery DESC",
+    );
     expect(queryArgs(joinedReads[0]![0]).at(-1)).toBe(10);
+  });
+
+  it("returns the claim attempt when runtime pauses before remote polling", async () => {
+    const { pauseA2AContinuationForRuntime } = await loadStore();
+    executeMock.mockResolvedValue({ rows: [{ id: "cont-1" }] });
+
+    await expect(
+      pauseA2AContinuationForRuntime("cont-1", 31, 20_000),
+    ).resolves.toBe(true);
+
+    const update = executeMock.mock.calls.find(([query]) =>
+      querySql(query).includes("attempts = attempts - 1"),
+    )?.[0];
+    expect(querySql(update!)).toContain(
+      "status = 'processing' AND attempts = ?",
+    );
+    expect(queryArgs(update!)).toEqual([
+      expect.any(Number),
+      expect.any(Number),
+      "cont-1",
+      31,
+    ]);
   });
 
   it("terminalizes all active A2A rows for a disabled durable task", async () => {

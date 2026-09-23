@@ -41,6 +41,7 @@ const failA2AContinuationMock = vi.hoisted(() => vi.fn());
 const failA2AContinuationsForIntegrationTaskMock = vi.hoisted(() => vi.fn());
 const getA2AContinuationMock = vi.hoisted(() => vi.fn());
 const rescheduleA2AContinuationMock = vi.hoisted(() => vi.fn());
+const pauseA2AContinuationForRuntimeMock = vi.hoisted(() => vi.fn());
 const saveA2AVerifiedArtifactCheckpointMock = vi.hoisted(() => vi.fn());
 const getTaskMock = vi.hoisted(() => vi.fn());
 const signA2ATokenMock = vi.hoisted(() =>
@@ -74,6 +75,7 @@ vi.mock("./a2a-continuations-store.js", () => ({
   recordA2ATerminalDeliveryReceipt: recordA2ATerminalDeliveryReceiptMock,
   retainA2AUnconfirmedDeliveryClaim: retainA2AUnconfirmedDeliveryClaimMock,
   rescheduleA2AContinuation: rescheduleA2AContinuationMock,
+  pauseA2AContinuationForRuntime: pauseA2AContinuationForRuntimeMock,
   saveA2AVerifiedArtifactCheckpoint: saveA2AVerifiedArtifactCheckpointMock,
 }));
 
@@ -226,6 +228,7 @@ describe("A2A continuation processor", () => {
     );
     retainA2AUnconfirmedDeliveryClaimMock.mockResolvedValue(undefined);
     rescheduleA2AContinuationMock.mockResolvedValue(undefined);
+    pauseA2AContinuationForRuntimeMock.mockResolvedValue(true);
     saveA2AVerifiedArtifactCheckpointMock.mockImplementation(
       async (_id: string, checkpoint: string) => checkpoint,
     );
@@ -719,8 +722,9 @@ describe("A2A continuation processor", () => {
       adapters,
     });
 
-    expect(rescheduleA2AContinuationMock).toHaveBeenCalledWith(
+    expect(pauseA2AContinuationForRuntimeMock).toHaveBeenCalledWith(
       claimed.id,
+      claimed.attempts,
       20_000,
     );
     expect(failA2AContinuationsForIntegrationTaskMock).not.toHaveBeenCalled();

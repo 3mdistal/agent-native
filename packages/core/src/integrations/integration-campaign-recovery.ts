@@ -3,6 +3,7 @@ import {
   getIntegrationCampaign,
   failDisabledIntegrationCampaignTask,
   listDueIntegrationCampaignIds,
+  deferIntegrationCampaignForRuntime,
 } from "./integration-campaigns-store.js";
 import {
   dispatchPendingIntegrationTask,
@@ -87,6 +88,7 @@ export async function recoverDueIntegrationCampaigns(options: {
               : undefined,
           })
         ) {
+          await deferIntegrationCampaignForRuntime(campaign.id, 60_000);
           result.skipped += 1;
           continue;
         }

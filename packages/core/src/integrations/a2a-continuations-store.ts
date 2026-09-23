@@ -782,7 +782,7 @@ export async function listRecoverableA2AIntegrationTasks(
              OR (c.status = 'delivering' AND
                  ((c.terminal_delivery_confirmed_at IS NOT NULL AND c.next_check_at <= ?)
                    OR c.updated_at <= ?)))
-          ORDER BY c.integration_task_id ASC
+          ORDER BY has_pending_confirmed_delivery DESC, c.integration_task_id ASC
           LIMIT ?`,
     args: [
       now,
@@ -835,6 +835,24 @@ export async function rescheduleA2AContinuation(
           WHERE id = ? AND status IN ('processing', 'delivering')`,
     args: ["pending", now + delayMs, now, id],
   });
+}
+
+export async function pauseA2AContinuationForRuntime(
+  id: string,
+  claimedAttempts: number,
+  delayMs: number,
+): Promise<boolean> {
+  await ensureTable();
+  const now = Date.now();
+  const result = await getDbExec().execute({
+    sql: `UPDATE integration_a2a_continuations
+          SET status = 'pending', attempts = attempts - 1,
+              next_check_at = ?, updated_at = ?
+          WHERE id = ? AND status = 'processing' AND attempts = ?
+          RETURNING id`,
+    args: [now + delayMs, now, id, claimedAttempts],
+  });
+  return (result.rows?.length ?? 0) > 0;
 }
 
 export async function retainA2AUnconfirmedDeliveryClaim(

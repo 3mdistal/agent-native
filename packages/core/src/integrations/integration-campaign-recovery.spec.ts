@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const listDueMock = vi.hoisted(() => vi.fn());
+const deferRuntimeMock = vi.hoisted(() => vi.fn());
 const getCampaignMock = vi.hoisted(() => vi.fn());
 const getTaskMock = vi.hoisted(() => vi.fn());
 const dispatchMock = vi.hoisted(() => vi.fn());
@@ -12,6 +13,7 @@ const getA2AContinuationTaskOutcomeMock = vi.hoisted(() => vi.fn());
 
 vi.mock("./integration-campaigns-store.js", () => ({
   listDueIntegrationCampaignIds: listDueMock,
+  deferIntegrationCampaignForRuntime: deferRuntimeMock,
   getIntegrationCampaign: getCampaignMock,
   failDisabledIntegrationCampaignTask: failDisabledMock,
 }));
@@ -36,6 +38,7 @@ describe("integration campaign recovery", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     listDueMock.mockResolvedValue(["campaign-1"]);
+    deferRuntimeMock.mockResolvedValue(true);
     getCampaignMock.mockResolvedValue({
       id: "campaign-1",
       integrationTaskId: "task-1",
@@ -149,6 +152,53 @@ describe("integration campaign recovery", () => {
     });
     expect(failDisabledMock).not.toHaveBeenCalled();
     expect(dispatchMock).not.toHaveBeenCalled();
+    expect(deferRuntimeMock).toHaveBeenCalledWith("campaign-1", 60_000);
+  });
+
+  it("clears a full paused scan window before a confirmed delivery", async () => {
+    const pausedIds = Array.from(
+      { length: 20 },
+      (_, index) => `paused-${index}`,
+    );
+    listDueMock
+      .mockResolvedValueOnce(pausedIds)
+      .mockResolvedValueOnce(["receipt"]);
+    getCampaignMock.mockImplementation(async (id: string) => ({
+      id,
+      integrationTaskId: id,
+    }));
+    getTaskMock.mockImplementation(async (id: string) => ({
+      id,
+      platform: "slack",
+      externalThreadId: "slack:team:C123:1",
+      dispatchScope: "C123",
+      status: "processing",
+      payload: JSON.stringify(
+        id === "receipt"
+          ? {
+              kind: "response-delivery",
+              deliveryReceipt: { status: "delivered" },
+            }
+          : { incoming: { text: "continue" } },
+      ),
+    }));
+    durableEnabledMock.mockReturnValue(false);
+    durableExplicitlyDisabledMock.mockReturnValue(false);
+    const { recoverDueIntegrationCampaigns } =
+      await import("./integration-campaign-recovery.js");
+
+    await expect(recoverDueIntegrationCampaigns({})).resolves.toMatchObject({
+      selected: 20,
+      skipped: 20,
+    });
+    expect(deferRuntimeMock).toHaveBeenCalledTimes(20);
+    await expect(recoverDueIntegrationCampaigns({})).resolves.toMatchObject({
+      selected: 1,
+      dispatched: 1,
+    });
+    expect(dispatchMock).toHaveBeenCalledWith(
+      expect.objectContaining({ taskId: "receipt" }),
+    );
   });
 
   it("still wakes confirmed receipt reconciliation after scope is disabled", async () => {

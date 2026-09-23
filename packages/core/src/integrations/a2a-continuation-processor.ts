@@ -33,6 +33,7 @@ import {
   recordA2ATerminalDeliveryReceipt,
   retainA2AUnconfirmedDeliveryClaim,
   rescheduleA2AContinuation,
+  pauseA2AContinuationForRuntime,
   saveA2AVerifiedArtifactCheckpoint,
   type A2AContinuation,
   type A2ATerminalDeliveryKind,
@@ -596,7 +597,11 @@ async function durableContinuationScopeStillEnabled(
         : undefined,
     })
   ) {
-    await rescheduleA2AContinuation(continuation.id, RESCHEDULE_DELAY_MS);
+    await pauseA2AContinuationForRuntime(
+      continuation.id,
+      continuation.attempts,
+      RESCHEDULE_DELAY_MS,
+    );
     console.warn(
       `[integrations] A2A continuation ${continuation.id} paused: durable dispatch runtime unavailable`,
       integrationDurableDispatchRuntimeUnavailableReasons(),
