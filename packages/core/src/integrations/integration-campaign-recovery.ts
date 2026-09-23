@@ -7,6 +7,7 @@ import {
 import {
   dispatchPendingIntegrationTask,
   isIntegrationDurableDispatchEnabledForTask,
+  isIntegrationDurableDispatchExplicitlyDisabledForTask,
 } from "./integration-durable-dispatch.js";
 import {
   getNextPendingTaskForThread,
@@ -77,6 +78,18 @@ export async function recoverDueIntegrationCampaigns(options: {
         hasConfirmedDeliveryReceipt(task.payload) ||
         (await getA2AContinuationTaskOutcome(task.id)) === "terminal-delivered";
       if (!durableDispatchEnabled && !confirmedReceipt) {
+        if (
+          !isIntegrationDurableDispatchExplicitlyDisabledForTask({
+            platform: task.platform,
+            externalThreadId: task.externalThreadId,
+            platformContext: task.dispatchScope
+              ? { channelId: task.dispatchScope }
+              : undefined,
+          })
+        ) {
+          result.skipped += 1;
+          continue;
+        }
         await failDisabledIntegrationCampaignTask(task.id);
         const nextTask = await getNextPendingTaskForThread(
           task.platform,

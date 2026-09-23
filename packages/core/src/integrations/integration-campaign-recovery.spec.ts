@@ -5,6 +5,7 @@ const getCampaignMock = vi.hoisted(() => vi.fn());
 const getTaskMock = vi.hoisted(() => vi.fn());
 const dispatchMock = vi.hoisted(() => vi.fn());
 const durableEnabledMock = vi.hoisted(() => vi.fn());
+const durableExplicitlyDisabledMock = vi.hoisted(() => vi.fn());
 const failDisabledMock = vi.hoisted(() => vi.fn());
 const getNextTaskMock = vi.hoisted(() => vi.fn());
 const getA2AContinuationTaskOutcomeMock = vi.hoisted(() => vi.fn());
@@ -23,6 +24,8 @@ vi.mock("./pending-tasks-store.js", () => ({
 vi.mock("./integration-durable-dispatch.js", () => ({
   dispatchPendingIntegrationTask: dispatchMock,
   isIntegrationDurableDispatchEnabledForTask: durableEnabledMock,
+  isIntegrationDurableDispatchExplicitlyDisabledForTask:
+    durableExplicitlyDisabledMock,
 }));
 
 vi.mock("./a2a-continuations-store.js", () => ({
@@ -47,6 +50,7 @@ describe("integration campaign recovery", () => {
     });
     dispatchMock.mockResolvedValue("background-acknowledged");
     durableEnabledMock.mockReturnValue(true);
+    durableExplicitlyDisabledMock.mockReturnValue(true);
     getNextTaskMock.mockResolvedValue(null);
     getA2AContinuationTaskOutcomeMock.mockResolvedValue("missing");
   });
@@ -129,6 +133,22 @@ describe("integration campaign recovery", () => {
     });
     expect(dispatchMock).not.toHaveBeenCalled();
     expect(failDisabledMock).toHaveBeenCalledWith("task-1");
+  });
+
+  it("leaves a due campaign recoverable when runtime prerequisites are unavailable", async () => {
+    durableEnabledMock.mockReturnValueOnce(false);
+    durableExplicitlyDisabledMock.mockReturnValueOnce(false);
+    const { recoverDueIntegrationCampaigns } =
+      await import("./integration-campaign-recovery.js");
+
+    await expect(recoverDueIntegrationCampaigns({})).resolves.toEqual({
+      selected: 1,
+      dispatched: 0,
+      skipped: 1,
+      failed: 0,
+    });
+    expect(failDisabledMock).not.toHaveBeenCalled();
+    expect(dispatchMock).not.toHaveBeenCalled();
   });
 
   it("still wakes confirmed receipt reconciliation after scope is disabled", async () => {

@@ -13,6 +13,7 @@ const recoverDueA2AContinuationIdsMock = vi.hoisted(() => vi.fn());
 const listRecoverableA2ATasksMock = vi.hoisted(() => vi.fn());
 const getPendingTaskMock = vi.hoisted(() => vi.fn());
 const durableDispatchEnabledMock = vi.hoisted(() => vi.fn());
+const durableDispatchExplicitlyDisabledMock = vi.hoisted(() => vi.fn());
 const dispatchPendingIntegrationTaskMock = vi.hoisted(() => vi.fn());
 const getNextPendingTaskForThreadMock = vi.hoisted(() => vi.fn());
 const getIntegrationCampaignForTaskMock = vi.hoisted(() => vi.fn());
@@ -83,6 +84,11 @@ vi.mock("./pending-tasks-store.js", () => ({
 
 vi.mock("./integration-durable-dispatch.js", () => ({
   isIntegrationDurableDispatchEnabledForTask: durableDispatchEnabledMock,
+  isIntegrationDurableDispatchExplicitlyDisabledForTask:
+    durableDispatchExplicitlyDisabledMock,
+  integrationDurableDispatchRuntimeUnavailableReasons: () => [
+    "background-route-unavailable",
+  ],
   dispatchPendingIntegrationTask: dispatchPendingIntegrationTaskMock,
 }));
 
@@ -263,6 +269,7 @@ describe("A2A continuation processor", () => {
       status: "processing",
     });
     durableDispatchEnabledMock.mockReturnValue(true);
+    durableDispatchExplicitlyDisabledMock.mockReturnValue(true);
     getIntegrationCampaignForTaskMock.mockResolvedValue(null);
     getNextPendingTaskForThreadMock.mockResolvedValue(null);
     dispatchPendingIntegrationTaskMock.mockResolvedValue(
@@ -578,6 +585,22 @@ describe("A2A continuation processor", () => {
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 
+  it("keeps due continuations intact while the runtime prerequisite is unavailable", async () => {
+    durableDispatchEnabledMock.mockReturnValue(false);
+    durableDispatchExplicitlyDisabledMock.mockReturnValue(false);
+    recoverDueA2AContinuationIdsMock.mockResolvedValue([]);
+    const { recoverDueA2AContinuations } =
+      await import("./a2a-continuation-processor.js");
+
+    await expect(recoverDueA2AContinuations()).resolves.toEqual({
+      dispatched: 0,
+      failed: 0,
+    });
+    expect(failA2AContinuationsForIntegrationTaskMock).not.toHaveBeenCalled();
+    expect(failDisabledIntegrationCampaignTaskMock).not.toHaveBeenCalled();
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
   it("still wakes receipt-confirmed history when the rollout scope is disabled", async () => {
     durableDispatchEnabledMock.mockReturnValue(false);
     listRecoverableA2ATasksMock.mockResolvedValueOnce([
@@ -669,6 +692,48 @@ describe("A2A continuation processor", () => {
         platformContext: { channelId: "C999" },
       },
     });
+  });
+
+  it("reschedules an already-started Content continuation without repeating its edit", async () => {
+    const claimed = continuation();
+    const sendResponse = vi.fn(async () => ({ status: "delivered" as const }));
+    claimA2AContinuationMock.mockResolvedValue(claimed);
+    getIntegrationCampaignForTaskMock.mockResolvedValue({
+      id: "campaign-1",
+      status: "waiting",
+    });
+    getPendingTaskMock.mockResolvedValue({
+      id: claimed.integrationTaskId,
+      platform: "slack",
+      externalThreadId: claimed.externalThreadId,
+      dispatchScope: "C123",
+      status: "processing",
+    });
+    durableDispatchEnabledMock.mockReturnValueOnce(false);
+    durableDispatchExplicitlyDisabledMock.mockReturnValueOnce(false);
+    const { processA2AContinuationById } =
+      await import("./a2a-continuation-processor.js");
+    const adapters = new Map([["slack", adapter(sendResponse)]]);
+
+    await processA2AContinuationById(claimed.id, {
+      adapters,
+    });
+
+    expect(rescheduleA2AContinuationMock).toHaveBeenCalledWith(
+      claimed.id,
+      20_000,
+    );
+    expect(failA2AContinuationsForIntegrationTaskMock).not.toHaveBeenCalled();
+    expect(failDisabledIntegrationCampaignTaskMock).not.toHaveBeenCalled();
+    expect(getTaskMock).not.toHaveBeenCalled();
+    expect(dispatchPendingIntegrationTaskMock).not.toHaveBeenCalled();
+
+    await processA2AContinuationById(claimed.id, { adapters });
+
+    expect(getTaskMock).toHaveBeenCalledWith(claimed.a2aTaskId);
+    expect(A2AClientMock).toHaveBeenCalledOnce();
+    expect(sendResponse).toHaveBeenCalledOnce();
+    expect(dispatchPendingIntegrationTaskMock).not.toHaveBeenCalled();
   });
 
   it("cancels only an unconfirmed sibling while confirmed history still owns custody", async () => {

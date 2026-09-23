@@ -47,7 +47,9 @@ import {
 } from "./integration-campaigns-store.js";
 import {
   dispatchPendingIntegrationTask,
+  integrationDurableDispatchRuntimeUnavailableReasons,
   isIntegrationDurableDispatchEnabledForTask,
+  isIntegrationDurableDispatchExplicitlyDisabledForTask,
 } from "./integration-durable-dispatch.js";
 import { signInternalToken } from "./internal-token.js";
 import {
@@ -340,7 +342,15 @@ export async function recoverDueA2AContinuations(options?: {
       eligibleTaskIds.push(task.id);
     } else if (task.hasPendingConfirmedDelivery) {
       confirmedHistoryTaskIds.push(task.id);
-    } else {
+    } else if (
+      isIntegrationDurableDispatchExplicitlyDisabledForTask({
+        platform: task.platform,
+        externalThreadId: task.externalThreadId,
+        platformContext: task.dispatchScope
+          ? { channelId: task.dispatchScope }
+          : undefined,
+      })
+    ) {
       await failDisabledDurableA2ATask(task);
     }
     if (eligibleTaskIds.length + confirmedHistoryTaskIds.length >= limit) break;
@@ -577,6 +587,24 @@ async function durableContinuationScopeStillEnabled(
   if (enabled) return true;
 
   if (
+    task?.status === "processing" &&
+    !isIntegrationDurableDispatchExplicitlyDisabledForTask({
+      platform: task.platform,
+      externalThreadId: task.externalThreadId,
+      platformContext: task.dispatchScope
+        ? { channelId: task.dispatchScope }
+        : undefined,
+    })
+  ) {
+    await rescheduleA2AContinuation(continuation.id, RESCHEDULE_DELAY_MS);
+    console.warn(
+      `[integrations] A2A continuation ${continuation.id} paused: durable dispatch runtime unavailable`,
+      integrationDurableDispatchRuntimeUnavailableReasons(),
+    );
+    return false;
+  }
+
+  if (
     await hasPendingConfirmedA2ADeliveryForIntegrationTask(
       continuation.integrationTaskId,
     )
@@ -650,6 +678,17 @@ export async function reconcileTerminalA2AParentIfDisabled(
   if (
     !task ||
     isIntegrationDurableDispatchEnabledForTask({
+      platform: task.platform,
+      externalThreadId: task.externalThreadId,
+      platformContext: task.dispatchScope
+        ? { channelId: task.dispatchScope }
+        : undefined,
+    })
+  ) {
+    return false;
+  }
+  if (
+    !isIntegrationDurableDispatchExplicitlyDisabledForTask({
       platform: task.platform,
       externalThreadId: task.externalThreadId,
       platformContext: task.dispatchScope
